@@ -77,11 +77,38 @@ superhost/
 
 ---
 
+## Feature Surface (v1)
+
+| Area | Key technologies |
+|---|---|
+| Authentication | bcrypt, JWT/Redis, TOTP, **FIDO2/WebAuthn** |
+| Server management | Agent daemon, mTLS, heartbeat, metrics |
+| Performance viewer | Real-time SSE graphs, 30-day history |
+| Process manager | Live process list, kill via UI |
+| Log viewer | SSE log streaming, regex filter, per-source |
+| Firewall | nftables / ufw, atomic rule apply, IP blocklist |
+| Domain & DNS | PowerDNS HTTP API, all common record types |
+| SSL | Let's Encrypt (HTTP-01 + DNS-01), custom certs |
+| Web hosting | Nginx, PHP-FPM multi-version, speed limits |
+| Databases | MySQL/MariaDB, namespaced, backups, **phpMyAdmin SSO** |
+| Email | Postfix + Dovecot + Rspamd + **Roundcube** + **ClamAV** |
+| File manager | Browser-based, chunked upload, Monaco editor |
+| App installer | **WordPress** one-click (extensible module) |
+| Billing | Plans, quotas, **Stripe**, PDF invoices |
+| Customer portal | Self-service orders, invoices, cancellation |
+| Network | Virtual interfaces, public IP pool, iproute2/netplan |
+| Backup & restore | Files + databases, S3, partial restore, SSE progress |
+| Account import | **cPanel importer**, **Control Web Panel importer** |
+| Themes | CSS-var themes, white-label name/logo |
+| Modularity | Every feature = isolated module, manifest-driven |
+| Long-running tasks | SSE progress on every async job |
+| HA | Stateless panel nodes, Redis sessions, BullMQ dedup |
+
 ## Non-Goals (v1)
 
 - Kubernetes / container orchestration — this is for VM/bare-metal homelab servers
 - Multi-datacenter replication of managed data (only the panel itself is HA)
 - Windows server management
 - Reseller / WHMCS-style multi-tier billing
-- Built-in monitoring / alerting (Prometheus exporters are fine, but a full
-  observability stack is out of scope for v1)
+- Built-in Prometheus/Grafana stack (exporters ship; dashboards are v2)
+- Additional one-click app installers beyond WordPress (Joomla, Ghost, etc. — v2)
