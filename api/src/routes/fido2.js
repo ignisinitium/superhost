@@ -4,13 +4,11 @@ import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 import jwt from 'jsonwebtoken';
 const router = express.Router();
-const RP_ID = process.env.RP_ID;
-if (!RP_ID) {
-    console.error('FATAL: RP_ID environment variable is not set');
-    process.exit(1);
-}
-const RP_NAME = 'Superhost';
-const ORIGIN = `https://${RP_ID}`;
+// RP_ID is the domain used for WebAuthn. Defaults to the hostname if not set.
+// Set RP_ID in .env to your panel's actual domain for production use.
+const RP_ID = process.env.RP_ID || 'localhost';
+const RP_NAME = process.env.RP_NAME || 'Superhost';
+const ORIGIN = process.env.RP_ORIGIN || `https://${RP_ID}`;
 function getJwtSecret() {
     const secret = process.env.JWT_SECRET;
     if (!secret)
