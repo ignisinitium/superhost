@@ -6,10 +6,13 @@ After=network.target postgresql.service
 Type=simple
 User=jonathan
 WorkingDirectory=/home/jonathan/superhost/api
-ExecStart=/usr/bin/node dist/index.js
+ExecStart=/usr/bin/node \
+  --require /home/jonathan/superhost/api/node_modules/tsx/dist/preflight.cjs \
+  --import file:///home/jonathan/superhost/api/node_modules/tsx/dist/loader.mjs \
+  src/index.ts
 Restart=always
+RestartSec=5
 Environment=NODE_ENV=production
-# Inject .env values here or use EnvironmentFile
 EnvironmentFile=/home/jonathan/superhost/api/.env
 
 [Install]
