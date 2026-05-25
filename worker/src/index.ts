@@ -79,6 +79,15 @@ async function handleTask(task: Task) {
       case 'INSTALL_WORDPRESS':
         await handleInstallWordPress(task.payload);
         break;
+      case 'SETUP_APP_RUNTIME':
+        await handleSetupAppRuntime(task.payload);
+        break;
+      case 'MANAGE_APP_RUNTIME':
+        await handleManageAppRuntime(task.payload);
+        break;
+      case 'DELETE_APP_RUNTIME':
+        await handleDeleteAppRuntime(task.payload);
+        break;
       case 'SCAN_MALWARE':
         await handleScanMalware(task.payload, task.id);
         break;
@@ -603,6 +612,81 @@ async function handleInstallWordPress(payload: any) {
     console.log(`WordPress successfully installed for ${domainName}.`);
   } catch (err) {
     console.error(`Error installing WordPress for ${domainName}:`, err);
+    throw err;
+  }
+}
+
+async function handleSetupAppRuntime(payload: any) {
+  const { appId, username, domainName, type, port, startupScript } = payload;
+  const appPath = `/home/${username}/public_html`;
+  const appName = `app_${appId}`;
+
+  try {
+    // 1. Configure Nginx Proxy
+    let config = await fs.readFile(path.join(process.cwd(), 'src/templates/nginx.conf.tplt'), 'utf8');
+    
+    const proxyBlock = `
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }`;
+
+    config = config
+      .replace(/{{DOMAIN}}/g, domainName)
+      .replace(/{{DOC_ROOT}}/g, appPath)
+      .replace(/{{PHP_VERSION}}/g, '8.5')
+      .replace(/{{LIMIT_RATE}}/g, '')
+      .replace('{{REVERSE_PROXY_BLOCK}}', proxyBlock)
+      .replace(/location \/ {[\s\S]*?}/, ''); // Remove default location / block
+
+    await fs.writeFile(`/etc/nginx/sites-available/${domainName}`, config);
+    await execPromise('sudo nginx -t');
+    await execPromise('sudo systemctl reload nginx');
+
+    // 2. Start via PM2
+    let command = '';
+    if (type === 'node') {
+      command = `pm2 start ${startupScript || 'index.js'} --name ${appName} --interpreter node --cwd ${appPath}`;
+    } else if (type === 'python') {
+      command = `pm2 start ${startupScript || 'app.py'} --name ${appName} --interpreter python3 --cwd ${appPath}`;
+    }
+
+    await execPromise(`sudo -u ${username} bash -c "cd ${appPath} && ${command}"`);
+    console.log(`App ${appName} (${type}) setup on port ${port}`);
+  } catch (err) {
+    console.error('Failed to setup app runtime:', err);
+    throw err;
+  }
+}
+
+async function handleManageAppRuntime(payload: any) {
+  const { username, action, appId } = payload;
+  const appName = `app_${appId}`;
+  try {
+    await execPromise(`sudo -u ${username} pm2 ${action} ${appName}`);
+    console.log(`App ${appName} ${action}ed.`);
+  } catch (err) {
+    console.error(`Failed to ${action} app:`, err);
+    throw err;
+  }
+}
+
+async function handleDeleteAppRuntime(payload: any) {
+  const { username, domainName, appId } = payload;
+  const appName = `app_${appId}`;
+  try {
+    // 1. Delete from PM2
+    await execPromise(`sudo -u ${username} pm2 delete ${appName}`).catch(() => {});
+    
+    // 2. Revert Nginx to standard
+    await handleCreateDomain({ username, domainName, phpVersion: '8.5' });
+    console.log(`App ${appName} deleted and domain ${domainName} reverted to standard.`);
+  } catch (err) {
+    console.error('Failed to delete app runtime:', err);
     throw err;
   }
 }
