@@ -19,6 +19,7 @@ import ClientEmailPage from './pages/ClientEmail';
 import ClientAppsPage from './pages/ClientApps';
 import ClientBillingPage from './pages/ClientBilling';
 import ClientBackupsPage from './pages/ClientBackups';
+import ClientFileManager from './pages/ClientFileManager';
 import SecurityPage from './pages/Security';
 import NetworkPage from './pages/Network';
 import ThemeEnginePage from './pages/ThemeEngine';
@@ -118,6 +119,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                   <Route path="databases" element={<ClientDatabasesPage />} />
                   <Route path="email" element={<ClientEmailPage />} />
                   <Route path="apps" element={<ClientAppsPage />} />
+                  <Route path="files" element={<ClientFileManager />} />
                   <Route path="billing" element={<ClientBillingPage />} />
                   <Route path="backups" element={<ClientBackupsPage />} />
                 </>

@@ -130,6 +130,24 @@ async function handleTask(task: Task) {
       case 'MANAGE_AUTO_UPDATES':
         await handleManageAutoUpdates(task.payload);
         break;
+      case 'LIST_FILES':
+        await handleListFiles(task.payload, task.id);
+        break;
+      case 'READ_FILE_CONTENT':
+        await handleReadFile(task.payload, task.id);
+        break;
+      case 'WRITE_FILE_CONTENT':
+        await handleWriteFile(task.payload);
+        break;
+      case 'DELETE_FILE':
+        await handleDeleteFile(task.payload);
+        break;
+      case 'ZIP_FILES':
+        await handleZipFiles(task.payload);
+        break;
+      case 'UNZIP_FILE':
+        await handleUnzipFile(task.payload);
+        break;
       default:
         throw new Error(`Unknown command: ${task.command}`);
     }
@@ -879,6 +897,75 @@ async function handleSyncClusterConfig(payload: any) {
     console.error(`Failed to sync with node ${ipAddress}:`, err);
     throw err;
   }
+}
+
+async function handleListFiles(payload: any, taskId: number) {
+  const { username, path: relativePath = '' } = payload;
+  if (!username) throw new Error('username is required');
+
+  const baseDir = `/home/${username}/public_html`;
+  const absolutePath = path.join(baseDir, relativePath);
+
+  if (!absolutePath.startsWith(baseDir)) throw new Error('Access denied');
+
+  try {
+    const files = await fs.readdir(absolutePath);
+    const result = await Promise.all(files.map(async (file) => {
+      const filePath = path.join(absolutePath, file);
+      const fileStats = await fs.stat(filePath);
+      return {
+        name: file,
+        isDirectory: fileStats.isDirectory(),
+        size: fileStats.size,
+        mtime: fileStats.mtime,
+        permissions: (fileStats.mode & 0o777).toString(8)
+      };
+    }));
+    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result }), taskId]);
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function handleReadFile(payload: any, taskId: number) {
+  const { username, filePath: relativePath } = payload;
+  const baseDir = `/home/${username}/public_html`;
+  const absolutePath = path.join(baseDir, relativePath);
+  if (!absolutePath.startsWith(baseDir)) throw new Error('Access denied');
+  const content = await fs.readFile(absolutePath, 'utf8');
+  await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: content }), taskId]);
+}
+
+async function handleWriteFile(payload: any) {
+  const { username, filePath: relativePath, content } = payload;
+  const baseDir = `/home/${username}/public_html`;
+  const absolutePath = path.join(baseDir, relativePath);
+  if (!absolutePath.startsWith(baseDir)) throw new Error('Access denied');
+  await fs.writeFile(absolutePath, content);
+  await execPromise(`sudo chown ${username}:${username} ${absolutePath}`);
+}
+
+async function handleDeleteFile(payload: any) {
+  const { username, filePath: relativePath } = payload;
+  const baseDir = `/home/${username}/public_html`;
+  const absolutePath = path.join(baseDir, relativePath);
+  if (!absolutePath.startsWith(baseDir)) throw new Error('Access denied');
+  await fs.rm(absolutePath, { recursive: true, force: true });
+}
+
+async function handleZipFiles(payload: any) {
+  const { username, zipName, files, basePath = '' } = payload;
+  const baseDir = `/home/${username}/public_html`;
+  const dirPath = path.join(baseDir, basePath);
+  await execPromise(`cd ${dirPath} && zip -r ${zipName} ${files.join(' ')}`);
+  await execPromise(`sudo chown ${username}:${username} ${path.join(dirPath, zipName)}`);
+}
+
+async function handleUnzipFile(payload: any) {
+  const { username, zipName, targetPath = '' } = payload;
+  const baseDir = `/home/${username}/public_html`;
+  await execPromise(`cd ${baseDir} && unzip -o ${zipName} -d ${targetPath}`);
+  await execPromise(`sudo chown -R ${username}:${username} ${path.join(baseDir, targetPath)}`);
 }
 
 async function start() {
