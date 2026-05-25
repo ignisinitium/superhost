@@ -103,6 +103,9 @@ async function handleTask(task: Task) {
       case 'SYNC_CLUSTER_CONFIG':
         await handleSyncClusterConfig(task.payload);
         break;
+      case 'GET_MASTER_SSH_KEY':
+        await handleGetMasterSshKey(task.id);
+        break;
       case 'GET_SYSTEM_STATS':
         await handleGetSystemStats(task.id);
         break;
@@ -849,6 +852,16 @@ async function handleCheckNodeHealth(payload: any) {
     await client.query('UPDATE cluster_nodes SET status = $1 WHERE id = $2', ['offline', nodeId]);
   }
 }
+async function handleGetMasterSshKey(taskId: number) {
+  try {
+    const { stdout } = await execPromise('sudo cat /root/.ssh/id_ed25519.pub');
+    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: stdout.trim() }), taskId]);
+    console.log('Master SSH key retrieved.');
+  } catch (err) {
+    console.error('Failed to get master SSH key:', err);
+    throw err;
+  }
+}
 
 async function handleSyncClusterConfig(payload: any) {
   const { ipAddress } = payload;
@@ -856,140 +869,14 @@ async function handleSyncClusterConfig(payload: any) {
 
   try {
     console.log(`Starting cluster config sync for node ${ipAddress}...`);
-    // Simulated sync delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    // 1. Push Nginx configurations via rsync
+    await execPromise(`sudo rsync -az -e "ssh -o StrictHostKeyChecking=no" /etc/nginx/sites-available/ root@${ipAddress}:/etc/nginx/sites-available/`);
+    // 2. Reload Nginx on remote node via SSH
+    await execPromise(`sudo ssh -o StrictHostKeyChecking=no root@${ipAddress} "systemctl reload nginx"`);
+
     console.log(`Successfully synchronized with node ${ipAddress}.`);
   } catch (err) {
     console.error(`Failed to sync with node ${ipAddress}:`, err);
-    throw err;
-  }
-}
-
-async function handleGetSystemStats(taskId: number) {
-  try {
-    const { stdout: uptime } = await execPromise("uptime -p");
-    const { stdout: os } = await execPromise("lsb_release -ds");
-    const { stdout: kernel } = await execPromise("uname -r");
-    const { stdout: ip } = await execPromise("hostname -I | awk '{print $1}'");
-    const { stdout: load } = await execPromise("cat /proc/loadavg | awk '{print $1 \", \" $2 \", \" $3}'");
-
-    const stats = {
-      uptime: uptime.trim().replace('up ', ''),
-      os: os.trim().replace(/"/g, ''),
-      kernel: kernel.trim(),
-      ip: ip.trim(),
-      loadAvg: load.trim()
-    };
-
-    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: stats }), taskId]);
-    console.log('System stats fetched.');
-  } catch (err) {
-    console.error('Failed to fetch system stats:', err);
-    throw err;
-  }
-}
-
-async function handleFirewallBlockIp(payload: any) {
-  const { ipAddress } = payload;
-  if (!ipAddress) throw new Error('IP address is required');
-  // Use insert 1 to ensure it's at the top of the rules
-  await execPromise(`sudo ufw insert 1 deny from ${ipAddress}`);
-  console.log(`IP ${ipAddress} blocked at firewall.`);
-}
-
-async function handleFirewallUnblockIp(payload: any) {
-  const { ipAddress } = payload;
-  if (!ipAddress) throw new Error('IP address is required');
-  await execPromise(`sudo ufw delete deny from ${ipAddress}`);
-  console.log(`IP ${ipAddress} unblocked at firewall.`);
-}
-
-async function handleGetServicesStatus(taskId: number) {
-  const services = [
-    'nginx', 'mariadb', 'postfix', 'dovecot', 
-    'clamav-daemon', 'postgresql', 'opendkim'
-  ];
-  
-  const results = [];
-  for (const service of services) {
-    try {
-      // is-active returns 0 if active, 3 if inactive
-      const active = await execPromise(`systemctl is-active ${service}`).then(() => true).catch(() => false);
-      const { stdout: enabledOut } = await execPromise(`systemctl is-enabled ${service}`);
-      results.push({
-        name: service,
-        status: active ? 'active' : 'inactive',
-        autostart: enabledOut.trim() === 'enabled'
-      });
-    } catch (err) {
-      results.push({ name: service, status: 'inactive', autostart: false });
-    }
-  }
-
-  await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: results }), taskId]);
-}
-
-async function handleManageService(payload: any) {
-  const { service, action } = payload;
-  if (!service || !action) throw new Error('Service and action are required');
-
-  const validActions = ['start', 'stop', 'restart', 'enable', 'disable'];
-  if (!validActions.includes(action)) throw new Error('Invalid action');
-
-  await execPromise(`sudo systemctl ${action} ${service}`);
-  console.log(`Service ${service} ${action}ed.`);
-}
-
-async function handleGetUpdates(taskId: number) {
-  try {
-    await execPromise('sudo apt-get update');
-    const { stdout } = await execPromise('apt list --upgradable');
-    
-    // Parse output (skipping the "Listing..." header)
-    const lines = stdout.split('\n').filter(line => line.includes('/') && !line.includes('Listing...'));
-    const updates = lines.map(line => {
-      const [namePart, info] = line.split(' ');
-      const name = namePart.split('/')[0];
-      return { name, info };
-    });
-
-    // Check if auto-updates are enabled
-    const { stdout: autoStatus } = await execPromise('cat /etc/apt/apt.conf.d/20auto-upgrades').catch(() => ({ stdout: '0' }));
-    const isAutoEnabled = autoStatus.includes('1');
-
-    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: { updates, isAutoEnabled } }), taskId]);
-    console.log(`Found ${updates.length} updates.`);
-  } catch (err) {
-    console.error('Failed to get updates:', err);
-    throw err;
-  }
-}
-
-async function handleInstallUpdates(taskId: number) {
-  try {
-    console.log('Installing system updates...');
-    const { stdout } = await execPromise('sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y');
-    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: stdout }), taskId]);
-    console.log('Updates installed successfully.');
-  } catch (err) {
-    console.error('Failed to install updates:', err);
-    throw err;
-  }
-}
-
-async function handleManageAutoUpdates(payload: any) {
-  const { enabled } = payload;
-  const value = enabled ? '1' : '0';
-  const config = `APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "${value}";\n`;
-  
-  try {
-    const tempFile = `/tmp/20auto-upgrades`;
-    await fs.writeFile(tempFile, config);
-    await execPromise(`sudo mv ${tempFile} /etc/apt/apt.conf.d/20auto-upgrades`);
-    await execPromise('sudo systemctl restart unattended-upgrades');
-    console.log(`Automatic updates ${enabled ? 'enabled' : 'disabled'}.`);
-  } catch (err) {
-    console.error('Failed to manage auto-updates:', err);
     throw err;
   }
 }

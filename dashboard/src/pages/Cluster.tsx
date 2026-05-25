@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { Server, Plus, Trash2, RefreshCw, Activity, ShieldCheck } from 'lucide-react';
+import { Server, Plus, Trash2, RefreshCw, Activity, ShieldCheck, Key, Copy } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface ClusterNode {
@@ -21,6 +21,46 @@ const ClusterPage: React.FC = () => {
   const [ipAddress, setIpAddress] = useState('');
   const [role, setRole] = useState('edge');
   const [sshPort, setSshPort] = useState('22');
+  const [masterKey, setMasterKey] = useState<string | null>(null);
+  const [isKeyLoading, setIsKeyLoading] = useState(false);
+
+  const fetchMasterKey = async () => {
+    setIsKeyLoading(true);
+    try {
+      const res = await api.get('/cluster/master-key');
+      const { taskId } = res.data;
+      
+      const interval = setInterval(async () => {
+        try {
+          const taskRes = await api.get(`/tasks/${taskId}`);
+          if (taskRes.data.status === 'completed') {
+            setMasterKey(taskRes.data.payload.result);
+            setIsKeyLoading(false);
+            clearInterval(interval);
+          } else if (taskRes.data.status === 'failed') {
+            toast.error('Failed to retrieve master key');
+            setIsKeyLoading(false);
+            clearInterval(interval);
+          }
+        } catch (e) {
+          clearInterval(interval);
+          setIsKeyLoading(false);
+        }
+      }, 1000);
+    } catch (err) {
+      toast.error('Failed to request master key');
+      setIsKeyLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchMasterKey();
+  }, []);
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    toast.success('Key copied to clipboard');
+  };
 
   const { data: nodes, isLoading } = useQuery<ClusterNode[]>({
     queryKey: ['clusterNodes'],
@@ -136,6 +176,47 @@ const ClusterPage: React.FC = () => {
         </div>
       </div>
 
+      {/* Master SSH Key Section */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+        <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Key className="text-orange-600" size={20} />
+            <h2 className="text-lg font-bold text-slate-800">Cluster Security Trust</h2>
+          </div>
+          <button 
+            onClick={fetchMasterKey}
+            disabled={isKeyLoading}
+            className="text-[10px] font-bold text-orange-600 hover:text-orange-700 uppercase tracking-widest flex items-center gap-1"
+          >
+            <RefreshCw size={12} className={isKeyLoading ? 'animate-spin' : ''} />
+            Refresh Key
+          </button>
+        </div>
+        <div className="p-6">
+          <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 mt-1.5 shrink-0" />
+              <p className="text-xs text-slate-600 leading-relaxed">
+                To enable **High Availability Synchronization**, you must copy the Master Public Key below and add it to the <code>/root/.ssh/authorized_keys</code> file on every Edge Node in your cluster.
+              </p>
+            </div>
+            
+            <div className="flex items-center gap-3">
+              <code className="flex-1 bg-white border border-slate-200 rounded-lg p-3 text-[10px] font-mono text-slate-500 break-all min-h-[48px] flex items-center">
+                {masterKey || (isKeyLoading ? 'Retrieving cluster-wide cryptographic identity...' : 'Master key not found.')}
+              </code>
+              <button 
+                onClick={() => masterKey && copyToClipboard(masterKey)}
+                disabled={!masterKey}
+                className="p-3 bg-white border border-slate-200 rounded-lg text-slate-400 hover:text-orange-600 hover:border-orange-200 transition-all shadow-sm"
+              >
+                <Copy size={18} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
         <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -152,14 +233,13 @@ const ClusterPage: React.FC = () => {
                 <th className="px-6 py-4 uppercase tracking-wider text-[10px] font-bold">IP Address</th>
                 <th className="px-6 py-4 uppercase tracking-wider text-[10px] font-bold">Role</th>
                 <th className="px-6 py-4 uppercase tracking-wider text-[10px] font-bold">Status</th>
-                <th className="px-6 py-4 uppercase tracking-wider text-[10px] font-bold">Last Seen</th>
                 <th className="px-6 py-4 uppercase tracking-wider text-[10px] font-bold text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {isLoading ? (
                 <tr>
-                  <td colSpan={6} className="px-6 py-8 text-center text-slate-400">Loading cluster topology...</td>
+                  <td colSpan={5} className="px-6 py-8 text-center text-slate-400">Loading cluster topology...</td>
                 </tr>
               ) : nodes && nodes.length > 0 ? (
                 nodes.map((node) => (
@@ -183,9 +263,6 @@ const ClusterPage: React.FC = () => {
                          </span>
                       )}
                     </td>
-                    <td className="px-6 py-4 text-slate-400 text-[10px]">
-                      {node.last_seen ? new Date(node.last_seen).toLocaleTimeString() : 'Never'}
-                    </td>
                     <td className="px-6 py-4 text-right">
                        <button 
                          onClick={() => deleteNodeMutation.mutate(node.id)}
@@ -200,7 +277,7 @@ const ClusterPage: React.FC = () => {
                 ))
               ) : (
                 <tr>
-                  <td colSpan={6} className="px-6 py-12 text-center text-slate-400 italic">No edge nodes configured. Your cluster is running in standalone mode.</td>
+                  <td colSpan={5} className="px-6 py-12 text-center text-slate-400 italic">No edge nodes configured. Your cluster is running in standalone mode.</td>
                 </tr>
               )}
             </tbody>
