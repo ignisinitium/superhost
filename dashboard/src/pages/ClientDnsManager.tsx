@@ -1,313 +1,389 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { 
-  Globe, Plus, Trash2, Search, Edit2
-} from 'lucide-react';
+import { Globe, Plus, Trash2, Edit2, Copy, CheckCheck, ChevronRight, Server } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { DnsZone, DnsRecord } from '../../../shared/types';
 
+// ── Record type metadata ──────────────────────────────────────────────────────
+const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA'] as const;
+type RecordType = typeof RECORD_TYPES[number];
+
+const TYPE_META: Record<RecordType, { color: string; badge: string; placeholder: string; hint: string }> = {
+  A:     { color: 'bg-blue-50 text-blue-700 border-blue-100',    badge: 'bg-blue-600',    placeholder: '203.0.113.10',              hint: 'IPv4 address' },
+  AAAA:  { color: 'bg-violet-50 text-violet-700 border-violet-100', badge: 'bg-violet-600', placeholder: '2001:db8::1',              hint: 'IPv6 address' },
+  CNAME: { color: 'bg-cyan-50 text-cyan-700 border-cyan-100',    badge: 'bg-cyan-600',    placeholder: 'target.example.com.',      hint: 'Canonical hostname (include trailing dot)' },
+  MX:    { color: 'bg-orange-50 text-orange-700 border-orange-100', badge: 'bg-orange-500', placeholder: 'mail.example.com.',       hint: 'Mail server hostname — set Priority below' },
+  TXT:   { color: 'bg-emerald-50 text-emerald-700 border-emerald-100', badge: 'bg-emerald-600', placeholder: 'v=spf1 include:... ~all', hint: 'Arbitrary text — SPF, DKIM, verification' },
+  NS:    { color: 'bg-slate-100 text-slate-600 border-slate-200', badge: 'bg-slate-500',  placeholder: 'ns1.example.com.',         hint: 'Nameserver hostname (include trailing dot)' },
+  SRV:   { color: 'bg-pink-50 text-pink-700 border-pink-100',    badge: 'bg-pink-600',    placeholder: '10 5060 sip.example.com.', hint: 'weight port target — set Priority below' },
+  CAA:   { color: 'bg-amber-50 text-amber-700 border-amber-100', badge: 'bg-amber-600',   placeholder: '0 issue "letsencrypt.org"', hint: 'Certificate Authority Authorization' },
+};
+
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return (
+    <button onClick={copy} className="p-1 text-slate-300 hover:text-slate-500 transition-colors" title="Copy value">
+      {copied ? <CheckCheck size={12} className="text-emerald-500" /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 const ClientDnsManager: React.FC = () => {
   const queryClient = useQueryClient();
   const [selectedZone, setSelectedZone] = useState<DnsZone | null>(null);
-  const [isRecordModalOpen, setIsRecordModalOpen] = useState(false);
+  const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingRecord, setEditingRecord] = useState<DnsRecord | null>(null);
 
-  // Form State
-  const [name, setName] = useState('');
-  const [type, setType] = useState('A');
-  const [content, setContent] = useState('');
-  const [priority, setPriority] = useState('');
-  const [ttl, setTtl] = useState('');
+  const [name, setName]         = useState('@');
+  const [type, setType]         = useState<RecordType>('A');
+  const [content, setContent]   = useState('');
+  const [priority, setPriority] = useState('10');
+  const [ttl, setTtl]           = useState('3600');
 
-  const { data: zones, isLoading: isLoadingZones } = useQuery<DnsZone[]>({
+  // ── Data ──────────────────────────────────────────────────────────────────
+  const { data: zones = [], isLoading: isLoadingZones } = useQuery<DnsZone[]>({
     queryKey: ['userDnsZones'],
-    queryFn: async () => {
-      const res = await api.get('/client/dns/zones');
-      return res.data;
-    }
+    queryFn: async () => (await api.get('/client/dns/zones')).data,
   });
 
-  const { data: records, isLoading: isLoadingRecords } = useQuery<DnsRecord[]>({
+  const { data: records = [], isLoading: isLoadingRecords } = useQuery<DnsRecord[]>({
     queryKey: ['dnsRecords', selectedZone?.id],
     queryFn: async () => {
       if (!selectedZone) return [];
-      const res = await api.get(`/client/dns/zones/${selectedZone.id}/records`);
-      return res.data;
+      return (await api.get(`/client/dns/zones/${selectedZone.id}/records`)).data;
     },
-    enabled: !!selectedZone
+    enabled: !!selectedZone,
+    refetchInterval: false,
   });
 
+  // ── Mutations ─────────────────────────────────────────────────────────────
   const saveRecordMutation = useMutation({
     mutationFn: async () => {
-      const payload = { 
-        name, 
-        type, 
-        content, 
-        priority: priority ? parseInt(priority) : null, 
-        ttl: ttl ? parseInt(ttl) : null 
+      const payload = {
+        name: name || '@',
+        type,
+        content,
+        priority: (type === 'MX' || type === 'SRV') ? parseInt(priority) : null,
+        ttl: parseInt(ttl) || 3600,
       };
-      
       if (editingRecord) {
-        const res = await api.put(`/client/dns/zones/${selectedZone?.id}/records/${editingRecord.id}`, payload);
-        return res.data;
-      } else {
-        const res = await api.post(`/client/dns/zones/${selectedZone?.id}/records`, payload);
-        return res.data;
+        return (await api.put(`/client/dns/zones/${selectedZone?.id}/records/${editingRecord.id}`, payload)).data;
       }
+      return (await api.post(`/client/dns/zones/${selectedZone?.id}/records`, payload)).data;
     },
     onSuccess: () => {
-      toast.success(editingRecord ? 'Record updated!' : 'Record added!');
-      setIsRecordModalOpen(false);
-      resetForm();
+      toast.success(editingRecord ? 'Record updated — syncing zone…' : 'Record added — syncing zone…');
+      closeModal();
       queryClient.invalidateQueries({ queryKey: ['dnsRecords', selectedZone?.id] });
     },
-    onError: (err: any) => {
-      toast.error(err.response?.data?.message || 'Failed to save record');
-    }
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to save record'),
   });
 
   const deleteRecordMutation = useMutation({
-    mutationFn: async (id: number) => {
-      const res = await api.delete(`/client/dns/zones/${selectedZone?.id}/records/${id}`);
-      return res.data;
-    },
+    mutationFn: async (id: number) =>
+      (await api.delete(`/client/dns/zones/${selectedZone?.id}/records/${id}`)).data,
     onSuccess: () => {
-      toast.success('Record deleted');
+      toast.success('Record deleted — syncing zone…');
       queryClient.invalidateQueries({ queryKey: ['dnsRecords', selectedZone?.id] });
-    }
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to delete record'),
   });
 
-  const resetForm = () => {
-    setName('');
-    setType('A');
-    setContent('');
-    setPriority('');
-    setTtl('');
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const closeModal = () => {
+    setIsModalOpen(false);
     setEditingRecord(null);
+    setName('@'); setType('A'); setContent(''); setPriority('10'); setTtl('3600');
   };
 
-  const openEditModal = (record: DnsRecord) => {
+  const openAdd = () => { closeModal(); setIsModalOpen(true); };
+
+  const openEdit = (record: DnsRecord) => {
     setEditingRecord(record);
     setName(record.name);
-    setType(record.type);
+    setType((record.type as RecordType) || 'A');
     setContent(record.content);
-    setPriority(record.priority?.toString() || '');
-    setTtl(record.ttl?.toString() || '');
-    setIsRecordModalOpen(true);
+    setPriority(record.priority?.toString() ?? '10');
+    setTtl(record.ttl?.toString() ?? '3600');
+    setIsModalOpen(true);
   };
 
+  const confirmDelete = (record: DnsRecord) => {
+    if (window.confirm(`Delete ${record.type} record "${record.name}"?`)) {
+      deleteRecordMutation.mutate(record.id);
+    }
+  };
+
+  // Group records by type for display
+  const grouped = RECORD_TYPES.reduce<Record<string, DnsRecord[]>>((acc, t) => {
+    const recs = records.filter(r => r.type === t);
+    if (recs.length) acc[t] = recs;
+    return acc;
+  }, {});
+
+  const needsPriority = type === 'MX' || type === 'SRV';
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="max-w-6xl mx-auto space-y-6 animate-in fade-in duration-500">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-800 flex items-center gap-3">
-             <Globe className="text-cyan-600" size={28} />
-             DNS Zone Manager
-          </h1>
-          <p className="text-slate-500 mt-1 ml-1">Configure DNS records and routing for your domains.</p>
-        </div>
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-bold text-slate-800 flex items-center gap-3">
+          <Globe className="text-cyan-600" size={26} />
+          DNS Zone Manager
+        </h1>
+        <p className="text-slate-500 mt-1">Configure DNS records for your domains. Changes sync to BIND automatically.</p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Zones Sidebar */}
-        <div className="lg:col-span-1 space-y-4">
-           <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm">
-              <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 px-2">Your Domains</h2>
-              <div className="space-y-1">
-                 {isLoadingZones ? (
-                    <div className="p-4 text-center text-slate-400 text-xs italic">Loading zones...</div>
-                 ) : zones && zones.length > 0 ? (
-                    zones.map(zone => (
-                       <button
-                         key={zone.id}
-                         onClick={() => setSelectedZone(zone)}
-                         className={`w-full text-left px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                            selectedZone?.id === zone.id 
-                            ? 'bg-cyan-50 text-cyan-700 border border-cyan-100' 
-                            : 'hover:bg-slate-50 text-slate-600 border border-transparent'
-                         }`}
-                       >
-                          {zone.domain_name}
-                       </button>
-                    ))
-                 ) : (
-                    <div className="p-4 text-center text-slate-400 text-xs italic">No domains found.</div>
-                 )}
-              </div>
-           </div>
+        {/* Sidebar — zone list */}
+        <div className="lg:col-span-1">
+          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <div className="px-4 py-3 bg-slate-50 border-b border-slate-100">
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Your Domains</span>
+            </div>
+            <div className="p-2 space-y-0.5">
+              {isLoadingZones ? (
+                <div className="p-4 text-center text-slate-400 text-xs italic">Loading…</div>
+              ) : zones.length === 0 ? (
+                <div className="p-4 text-center text-slate-400 text-xs italic">No domains found.</div>
+              ) : (
+                zones.map(zone => {
+                  const isActive = selectedZone?.id === zone.id;
+                  return (
+                    <button
+                      key={zone.id}
+                      onClick={() => setSelectedZone(zone)}
+                      className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm transition-all ${
+                        isActive
+                          ? 'bg-cyan-50 text-cyan-700 border border-cyan-100'
+                          : 'hover:bg-slate-50 text-slate-600 border border-transparent'
+                      }`}
+                    >
+                      <span className="font-medium truncate">{zone.domain_name}</span>
+                      <ChevronRight size={14} className={isActive ? 'text-cyan-500' : 'text-slate-300'} />
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
         </div>
 
-        {/* Records View */}
+        {/* Main — records */}
         <div className="lg:col-span-3">
-           {selectedZone ? (
-              <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm animate-in slide-in-from-right-4 duration-300">
-                <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
-                  <div>
-                    <h2 className="text-lg font-bold text-slate-800">{selectedZone.domain_name}</h2>
-                    <p className="text-xs text-slate-500">Default TTL: {selectedZone.ttl}s</p>
+          {!selectedZone ? (
+            <div className="h-full min-h-[400px] flex flex-col items-center justify-center bg-white border-2 border-dashed border-slate-200 rounded-2xl p-12 text-center">
+              <div className="w-16 h-16 bg-slate-50 rounded-2xl flex items-center justify-center text-slate-300 mb-4">
+                <Globe size={32} />
+              </div>
+              <h3 className="text-base font-bold text-slate-700">No Zone Selected</h3>
+              <p className="text-sm text-slate-400 max-w-xs mt-2">
+                Select a domain from the sidebar to manage its DNS records.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4 animate-in fade-in duration-300">
+              {/* Zone header */}
+              <div className="bg-white border border-slate-200 rounded-2xl px-6 py-4 shadow-sm flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-800">{selectedZone.domain_name}</h2>
+                  <div className="flex items-center gap-3 mt-1">
+                    <span className="text-[11px] text-slate-400">Default TTL: <strong>{selectedZone.ttl}s</strong></span>
+                    <span className="text-slate-200">|</span>
+                    <span className="text-[11px] text-slate-400"><strong>{records.length}</strong> record{records.length !== 1 ? 's' : ''}</span>
                   </div>
-                  <button
-                    onClick={() => { resetForm(); setIsRecordModalOpen(true); }}
-                    className="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-xl font-bold transition-all text-xs flex items-center gap-2"
-                  >
-                    <Plus size={14} />
-                    Add Record
-                  </button>
                 </div>
-                
-                <div className="overflow-x-auto">
-                   <table className="w-full text-left text-sm">
-                      <thead className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200 uppercase tracking-widest text-[10px]">
-                        <tr>
-                          <th className="px-6 py-4">Name</th>
-                          <th className="px-6 py-4">Type</th>
-                          <th className="px-6 py-4">Content</th>
-                          <th className="px-6 py-4">TTL</th>
-                          <th className="px-6 py-4 text-right">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                         {isLoadingRecords ? (
-                            <tr><td colSpan={5} className="px-6 py-8 text-center text-slate-400">Loading records...</td></tr>
-                         ) : records && records.length > 0 ? (
-                            records.map(record => (
-                               <tr key={record.id} className="hover:bg-slate-50/50 transition-colors group">
-                                  <td className="px-6 py-4 font-mono text-xs text-slate-700">
-                                     {record.name}
-                                  </td>
-                                  <td className="px-6 py-4">
-                                     <span className="px-2 py-1 rounded bg-slate-100 text-slate-600 font-bold text-[10px] border border-slate-200">
-                                        {record.type}
-                                     </span>
-                                  </td>
-                                  <td className="px-6 py-4 font-mono text-xs text-slate-600 break-all max-w-xs">
-                                     {record.priority && <span className="text-amber-600 mr-2">[{record.priority}]</span>}
-                                     {record.content}
-                                  </td>
-                                  <td className="px-6 py-4 text-slate-400 text-xs">
-                                     {record.ttl || 'Default'}
-                                  </td>
-                                  <td className="px-6 py-4 text-right">
-                                     <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <button 
-                                          onClick={() => openEditModal(record)}
-                                          className="p-2 text-slate-400 hover:text-cyan-600 hover:bg-cyan-50 rounded-lg transition-all"
-                                        >
-                                           <Edit2 size={14} />
-                                        </button>
-                                        <button 
-                                          onClick={() => { if(window.confirm('Delete this record?')) deleteRecordMutation.mutate(record.id); }}
-                                          className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
-                                        >
-                                           <Trash2 size={14} />
-                                        </button>
-                                     </div>
-                                  </td>
-                               </tr>
-                            ))
-                         ) : (
-                            <tr><td colSpan={5} className="px-6 py-12 text-center text-slate-400 italic">No custom records found.</td></tr>
-                         )}
-                      </tbody>
-                   </table>
+                <button
+                  onClick={openAdd}
+                  className="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-xl font-bold transition-all text-sm flex items-center gap-2 shadow-sm shadow-cyan-900/10"
+                >
+                  <Plus size={15} />
+                  Add Record
+                </button>
+              </div>
+
+              {/* Records grouped by type */}
+              {isLoadingRecords ? (
+                <div className="bg-white border border-slate-200 rounded-2xl p-12 text-center text-slate-400 italic">
+                  Loading records…
                 </div>
-              </div>
-           ) : (
-              <div className="h-full min-h-[400px] flex flex-col items-center justify-center bg-slate-50/50 border-2 border-dashed border-slate-200 rounded-3xl p-12 text-center">
-                 <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center text-slate-300 shadow-sm mb-4">
-                    <Search size={32} />
-                 </div>
-                 <h3 className="text-lg font-bold text-slate-800">No Zone Selected</h3>
-                 <p className="text-sm text-slate-500 max-w-xs mt-2">
-                    Select a domain from the sidebar to manage its DNS records and global routing.
-                 </p>
-              </div>
-           )}
+              ) : records.length === 0 ? (
+                <div className="bg-white border-2 border-dashed border-slate-200 rounded-2xl p-12 text-center">
+                  <Server size={28} className="text-slate-300 mx-auto mb-3" />
+                  <p className="text-slate-400 text-sm italic">No records yet. Click <strong>Add Record</strong> to get started.</p>
+                </div>
+              ) : (
+                Object.entries(grouped).map(([recordType, recs]) => {
+                  const meta = TYPE_META[recordType as RecordType];
+                  return (
+                    <div key={recordType} className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                      <div className="px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex items-center gap-2.5">
+                        <span className={`w-2 h-2 rounded-full ${meta?.badge ?? 'bg-slate-400'}`} />
+                        <span className="text-xs font-bold text-slate-600 uppercase tracking-widest">{recordType} Records</span>
+                        <span className="text-[10px] text-slate-400 font-medium">{meta?.hint}</span>
+                        <span className="ml-auto text-[10px] font-bold text-slate-400">{recs.length}</span>
+                      </div>
+                      <table className="w-full text-left text-sm">
+                        <thead className="border-b border-slate-100 bg-slate-50/30">
+                          <tr className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                            <th className="px-5 py-2.5">Name</th>
+                            {(recordType === 'MX' || recordType === 'SRV') && <th className="px-5 py-2.5">Priority</th>}
+                            <th className="px-5 py-2.5">Value</th>
+                            <th className="px-5 py-2.5">TTL</th>
+                            <th className="px-5 py-2.5 text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {recs.map(record => (
+                            <tr key={record.id} className="group hover:bg-slate-50/50 transition-colors">
+                              <td className="px-5 py-3 font-mono text-xs font-semibold text-slate-700">{record.name}</td>
+                              {(recordType === 'MX' || recordType === 'SRV') && (
+                                <td className="px-5 py-3 text-xs font-bold text-amber-600">{record.priority ?? '—'}</td>
+                              )}
+                              <td className="px-5 py-3 font-mono text-xs text-slate-600 max-w-xs">
+                                <div className="flex items-center gap-1">
+                                  <span className="truncate">{record.content}</span>
+                                  <CopyButton value={record.content} />
+                                </div>
+                              </td>
+                              <td className="px-5 py-3 text-[11px] text-slate-400">{record.ttl ? `${record.ttl}s` : 'Default'}</td>
+                              <td className="px-5 py-3 text-right">
+                                <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <button onClick={() => openEdit(record)} className="p-1.5 text-slate-400 hover:text-cyan-600 hover:bg-cyan-50 rounded-lg transition-all" title="Edit">
+                                    <Edit2 size={13} />
+                                  </button>
+                                  <button onClick={() => confirmDelete(record)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="Delete">
+                                    <Trash2 size={13} />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
         </div>
       </div>
 
-      {isRecordModalOpen && (
+      {/* ── Modal: Add / Edit Record ─────────────────────────────────────── */}
+      {isModalOpen && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-200">
             <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
-              <h2 className="text-lg font-bold text-slate-800">
-                 {editingRecord ? 'Edit DNS Record' : 'Add New DNS Record'}
+              <h2 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                {editingRecord ? <Edit2 size={16} className="text-cyan-600" /> : <Plus size={16} className="text-cyan-600" />}
+                {editingRecord ? 'Edit DNS Record' : 'Add DNS Record'}
               </h2>
-              <button onClick={() => setIsRecordModalOpen(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+              <button onClick={closeModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">✕</button>
             </div>
-            
+
             <form onSubmit={(e) => { e.preventDefault(); saveRecordMutation.mutate(); }} className="p-6 space-y-4">
-              <div className="grid grid-cols-3 gap-4">
-                 <div className="col-span-2 space-y-1">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Name / Host</label>
-                   <input 
-                     type="text" 
-                     className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono" 
-                     value={name} 
-                     onChange={(e) => setName(e.target.value)} 
-                     placeholder="e.g. www or @" 
-                     required 
-                   />
-                 </div>
-                 <div className="space-y-1">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Type</label>
-                   <select 
-                     className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-bold text-cyan-700"
-                     value={type}
-                     onChange={(e) => setType(e.target.value)}
-                   >
-                      <option value="A">A</option>
-                      <option value="AAAA">AAAA</option>
-                      <option value="CNAME">CNAME</option>
-                      <option value="MX">MX</option>
-                      <option value="TXT">TXT</option>
-                      <option value="NS">NS</option>
-                      <option value="SRV">SRV</option>
-                   </select>
-                 </div>
+              {/* Type selector */}
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Record Type</label>
+                <div className="flex flex-wrap gap-2">
+                  {RECORD_TYPES.map(t => {
+                    const meta = TYPE_META[t];
+                    return (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setType(t)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                          type === t ? meta.color + ' shadow-sm' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    );
+                  })}
+                </div>
+                {type && (
+                  <p className="text-[11px] text-slate-400 ml-1">{TYPE_META[type].hint}</p>
+                )}
               </div>
 
+              {/* Name + TTL */}
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Name / Host</label>
+                  <input
+                    type="text"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="@ or www"
+                    required
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">TTL (seconds)</label>
+                  <select
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                    value={ttl}
+                    onChange={(e) => setTtl(e.target.value)}
+                  >
+                    <option value="300">300 (5 min)</option>
+                    <option value="900">900 (15 min)</option>
+                    <option value="3600">3600 (1 hr)</option>
+                    <option value="86400">86400 (1 day)</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Content */}
               <div className="space-y-1">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Content / Value</label>
-                <input 
-                  type="text" 
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono" 
-                  value={content} 
-                  onChange={(e) => setContent(e.target.value)} 
-                  placeholder={type === 'A' ? '1.2.3.4' : 'Target value'} 
-                  required 
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Value / Content</label>
+                <input
+                  type="text"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                  value={content}
+                  onChange={(e) => setContent(e.target.value)}
+                  placeholder={TYPE_META[type].placeholder}
+                  required
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                 <div className="space-y-1">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Priority (MX/SRV)</label>
-                    <input 
-                      type="number" 
-                      disabled={type !== 'MX' && type !== 'SRV'}
-                      className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm disabled:opacity-30" 
-                      value={priority} 
-                      onChange={(e) => setPriority(e.target.value)} 
-                      placeholder="10" 
-                    />
-                 </div>
-                 <div className="space-y-1">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">TTL (Seconds)</label>
-                    <input 
-                      type="number" 
-                      className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm" 
-                      value={ttl} 
-                      onChange={(e) => setTtl(e.target.value)} 
-                      placeholder="3600" 
-                    />
-                 </div>
-              </div>
+              {/* Priority (MX / SRV only) */}
+              {needsPriority && (
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Priority</label>
+                  <input
+                    type="number"
+                    min="0"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                    value={priority}
+                    onChange={(e) => setPriority(e.target.value)}
+                    placeholder="10"
+                  />
+                </div>
+              )}
 
-              <div className="pt-4 flex gap-3">
-                <button type="button" onClick={() => setIsRecordModalOpen(false)} className="flex-1 px-4 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 text-sm transition-all">Cancel</button>
-                <button type="submit" disabled={saveRecordMutation.isPending} className="flex-1 px-4 py-3 rounded-xl font-bold text-white bg-cyan-600 hover:bg-cyan-700 shadow-md shadow-cyan-900/10 text-sm transition-all disabled:opacity-50">
-                  {saveRecordMutation.isPending ? 'Saving...' : 'Save Record'}
+              <div className="flex gap-3 pt-2">
+                <button type="button" onClick={closeModal} className="flex-1 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 text-sm transition-all">
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={saveRecordMutation.isPending}
+                  className="flex-1 py-3 rounded-xl font-bold text-white bg-cyan-600 hover:bg-cyan-700 text-sm transition-all shadow-md shadow-cyan-900/10 disabled:opacity-50"
+                >
+                  {saveRecordMutation.isPending ? 'Saving…' : editingRecord ? 'Update Record' : 'Add Record'}
                 </button>
               </div>
             </form>

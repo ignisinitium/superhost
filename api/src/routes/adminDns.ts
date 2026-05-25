@@ -22,6 +22,77 @@ router.get('/zones', async (req: AuthRequest, res) => {
   }
 });
 
+// Get all records for any zone (admin — no user restriction)
+router.get('/zones/:id/records', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  try {
+    const zoneRes = await query('SELECT id FROM dns_zones WHERE id = $1', [id]);
+    if (zoneRes.rowCount === 0) return res.status(404).json({ message: 'Zone not found' });
+    const result = await query('SELECT * FROM dns_records WHERE zone_id = $1 ORDER BY type ASC, name ASC', [id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Add a record to any zone (admin)
+router.post('/zones/:id/records', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  const { name, type, content, priority, ttl } = req.body;
+  try {
+    const zoneRes = await query('SELECT id, domain_name FROM dns_zones WHERE id = $1', [id]);
+    if (zoneRes.rowCount === 0) return res.status(404).json({ message: 'Zone not found' });
+    const { domain_name } = zoneRes.rows[0];
+
+    const result = await query(
+      'INSERT INTO dns_records (zone_id, name, type, content, priority, ttl) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [id, name, type.toUpperCase(), content, priority ?? null, ttl ?? null]
+    );
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_DNS_ZONE', { zoneId: id, domainName: domain_name }]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Update a record in any zone (admin)
+router.put('/zones/:id/records/:recordId', async (req: AuthRequest, res) => {
+  const { id, recordId } = req.params;
+  const { name, type, content, priority, ttl } = req.body;
+  try {
+    const zoneRes = await query('SELECT id, domain_name FROM dns_zones WHERE id = $1', [id]);
+    if (zoneRes.rowCount === 0) return res.status(404).json({ message: 'Zone not found' });
+    const { domain_name } = zoneRes.rows[0];
+
+    const result = await query(
+      'UPDATE dns_records SET name=$1, type=$2, content=$3, priority=$4, ttl=$5 WHERE id=$6 AND zone_id=$7 RETURNING *',
+      [name, type.toUpperCase(), content, priority ?? null, ttl ?? null, recordId, id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ message: 'Record not found' });
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_DNS_ZONE', { zoneId: id, domainName: domain_name }]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Delete a record from any zone (admin)
+router.delete('/zones/:id/records/:recordId', async (req: AuthRequest, res) => {
+  const { id, recordId } = req.params;
+  try {
+    const zoneRes = await query('SELECT id, domain_name FROM dns_zones WHERE id = $1', [id]);
+    if (zoneRes.rowCount === 0) return res.status(404).json({ message: 'Zone not found' });
+    const { domain_name } = zoneRes.rows[0];
+
+    const result = await query('DELETE FROM dns_records WHERE id=$1 AND zone_id=$2 RETURNING id', [recordId, id]);
+    if (result.rowCount === 0) return res.status(404).json({ message: 'Record not found' });
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_DNS_ZONE', { zoneId: id, domainName: domain_name }]);
+    res.json({ message: 'Record deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // Delete any DNS zone
 router.delete('/zones/:id', async (req: AuthRequest, res) => {
   const { id } = req.params;
