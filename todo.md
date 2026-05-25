@@ -17,6 +17,8 @@ This document tracks the implementation of the "Functional Specification: Modula
 - [x] **Advanced Process Manager**: API/Worker support to filter by user and safely issue `SIGTERM`/`SIGKILL` to user-owned processes.
 - [x] **Log Viewer**: Live streaming and historical viewer for system, NGINX, PHP-FPM, mail, and security logs.
 - [x] **Virtual Networking**: Dynamically add virtual ethernet adapters, configure subnets/routing, attach public IPs to virtual hosts.
+- [x] **Service Management**: Start, stop, and configure autostart for all system daemons directly from the dashboard.
+- [x] **Server Updates**: Monitor and install system updates (APT), and configure automated security patching.
 
 ## Phase 5: Database & Applications
 - [x] **Database Engine**: Create, delete, and manage MySQL/MariaDB databases and users via API/Worker.

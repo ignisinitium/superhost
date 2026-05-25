@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation } from '@tanstack/react-query';
 import api from '../api/client';
-import { Shield, ShieldCheck, Plus, RefreshCw, Activity, Trash2, Hash } from 'lucide-react';
+import { ShieldCheck, Plus, RefreshCw, Activity, Trash2, Hash } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { useTaskMonitor } from '../hooks/useTaskMonitor';
 
 const FirewallPage: React.FC = () => {
-  const queryClient = useQueryClient();
-  const { monitorTask } = useTaskMonitor();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [port, setPort] = useState('');
   const [protocol, setProtocol] = useState('tcp');
@@ -24,7 +21,6 @@ const FirewallPage: React.FC = () => {
 
   useEffect(() => {
     if (statusData?.taskId) {
-      // We poll for the task result which contains the UFW output
       const interval = setInterval(async () => {
         try {
           const taskRes = await api.get(`/tasks/${statusData.taskId}`);
@@ -49,7 +45,7 @@ const FirewallPage: React.FC = () => {
       const res = await api.post('/firewall/allow', data);
       return res.data;
     },
-    onSuccess: (data) => {
+    onSuccess: () => {
       setIsModalOpen(false);
       setPort('');
       toast.success('Port allowance task created');
@@ -74,7 +70,11 @@ const FirewallPage: React.FC = () => {
     }
   });
 
-  // Simple parser for ufw status numbered output
+  const handleAllowPort = (e: React.FormEvent) => {
+    e.preventDefault();
+    allowPortMutation.mutate({ port, protocol });
+  };
+
   const parseRules = (output: string) => {
     const lines = output.split('\n');
     const rules: { number: number, to: string, action: string, from: string }[] = [];
@@ -123,7 +123,6 @@ const FirewallPage: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Status Card */}
         <div className="lg:col-span-1 bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col items-center text-center">
             <div className={`w-16 h-16 rounded-full flex items-center justify-center mb-4 ${rawOutput.includes('active') ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>
               <ShieldCheck size={32} />
@@ -137,12 +136,9 @@ const FirewallPage: React.FC = () => {
                 {rawOutput.includes('active') ? 'Active' : 'Offline'}
               </span>
             </div>
-            <p className="text-[10px] text-slate-400 italic mt-auto">
-              Controlled via root worker daemon
-            </p>
+            <p className="text-[10px] text-slate-400 italic mt-auto">Controlled via root worker daemon</p>
         </div>
 
-        {/* Rules Table */}
         <div className="lg:col-span-3 bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
           <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
             <Activity size={20} className="text-orange-600" />
@@ -216,7 +212,6 @@ const FirewallPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Allow Port Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
@@ -224,7 +219,6 @@ const FirewallPage: React.FC = () => {
               <h2 className="text-lg font-bold text-slate-800">Allow Incoming Port</h2>
               <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-slate-600 transition-colors">✕</button>
             </div>
-
             <form onSubmit={handleAllowPort} className="p-6 space-y-5">
               <div className="space-y-2">
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Port Number</label>
@@ -240,36 +234,13 @@ const FirewallPage: React.FC = () => {
               <div className="space-y-2">
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Protocol</label>
                 <div className="grid grid-cols-2 gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setProtocol('tcp')}
-                    className={`py-3 rounded-xl border font-bold transition-all text-sm ${protocol === 'tcp' ? 'bg-slate-800 border-slate-800 text-white shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
-                  >
-                    TCP
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setProtocol('udp')}
-                    className={`py-3 rounded-xl border font-bold transition-all text-sm ${protocol === 'udp' ? 'bg-slate-800 border-slate-800 text-white shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
-                  >
-                    UDP
-                  </button>
+                  <button type="button" onClick={() => setProtocol('tcp')} className={`py-3 rounded-xl border font-bold transition-all text-sm ${protocol === 'tcp' ? 'bg-slate-800 border-slate-800 text-white shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>TCP</button>
+                  <button type="button" onClick={() => setProtocol('udp')} className={`py-3 rounded-xl border font-bold transition-all text-sm ${protocol === 'udp' ? 'bg-slate-800 border-slate-800 text-white shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>UDP</button>
                 </div>
               </div>
-
               <div className="flex gap-3 pt-4">
-                <button 
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 py-3 rounded-xl font-bold transition-all text-sm"
-                >
-                  Cancel
-                </button>
-                <button 
-                  type="submit"
-                  disabled={allowPortMutation.isPending}
-                  className="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-3 rounded-xl font-bold transition-all shadow-md shadow-orange-900/20 text-sm disabled:opacity-50"
-                >
+                <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 py-3 rounded-xl font-bold transition-all text-sm">Cancel</button>
+                <button type="submit" disabled={allowPortMutation.isPending} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-3 rounded-xl font-bold transition-all shadow-md shadow-orange-900/20 text-sm disabled:opacity-50">
                   {allowPortMutation.isPending ? 'Processing...' : 'Create Rule'}
                 </button>
               </div>

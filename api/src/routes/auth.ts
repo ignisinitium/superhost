@@ -33,10 +33,10 @@ router.post('/login', checkIpBlock, async (req, res) => {
     await logLoginAttempt(ip, username, true);
 
     if (admin.two_factor_enabled) {
-...
+      return res.json({ require2FA: true, adminId: admin.id });
     }
 
-    const token = jwt.sign({ id: admin.id }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    const token = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
     res.json({ token, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -59,7 +59,7 @@ router.post('/verify-2fa', async (req, res) => {
 
     if (!verified) return res.status(401).json({ message: 'Invalid 2FA token' });
 
-    const jwtToken = jwt.sign({ id: admin.id }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
     res.json({ token: jwtToken, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

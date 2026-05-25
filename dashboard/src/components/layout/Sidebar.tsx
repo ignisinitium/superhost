@@ -2,7 +2,7 @@ import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { 
   Server, Users, Box, Settings, Shield, Database, 
-  Home, Folder, Globe, Mail, Lock, Zap, LogOut, Terminal, Activity, ShieldAlert, CreditCard, Paintbrush
+  Home, Folder, Globe, Mail, Lock, Zap, LogOut, Terminal, Activity, ShieldAlert, CreditCard, Paintbrush, Power, Download
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -16,8 +16,11 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const adminMenuItems = [
     { label: 'Server Overview', icon: Server, path: '/' },
     { label: 'Account Management', icon: Users, path: '/users' },
+    { label: 'Global Databases', icon: Database, path: '/databases' },
     { label: 'Packages & Features', icon: Box, path: '/packages' },
     { label: 'Service Configs', icon: Settings, path: '/settings' },
+    { label: 'Service Manager', icon: Power, path: '/services' },
+    { label: 'Server Updates', icon: Download, path: '/updates' },
     { label: 'Security & Firewall', icon: Shield, path: '/firewall' },
     { label: 'Virtual Networking', icon: Globe, path: '/network' },
     { label: 'Anti-Malware', icon: ShieldAlert, path: '/security' },

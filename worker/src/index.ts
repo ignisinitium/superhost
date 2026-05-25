@@ -112,6 +112,21 @@ async function handleTask(task: Task) {
       case 'FIREWALL_UNBLOCK_IP':
         await handleFirewallUnblockIp(task.payload);
         break;
+      case 'GET_SERVICES_STATUS':
+        await handleGetServicesStatus(task.id);
+        break;
+      case 'MANAGE_SERVICE':
+        await handleManageService(task.payload);
+        break;
+      case 'GET_UPDATES':
+        await handleGetUpdates(task.id);
+        break;
+      case 'INSTALL_UPDATES':
+        await handleInstallUpdates(task.id);
+        break;
+      case 'MANAGE_AUTO_UPDATES':
+        await handleManageAutoUpdates(task.payload);
+        break;
       default:
         throw new Error(`Unknown command: ${task.command}`);
     }
@@ -889,6 +904,96 @@ async function handleFirewallUnblockIp(payload: any) {
   console.log(`IP ${ipAddress} unblocked at firewall.`);
 }
 
+async function handleGetServicesStatus(taskId: number) {
+  const services = [
+    'nginx', 'mariadb', 'postfix', 'dovecot', 
+    'clamav-daemon', 'postgresql', 'opendkim'
+  ];
+  
+  const results = [];
+  for (const service of services) {
+    try {
+      // is-active returns 0 if active, 3 if inactive
+      const active = await execPromise(`systemctl is-active ${service}`).then(() => true).catch(() => false);
+      const { stdout: enabledOut } = await execPromise(`systemctl is-enabled ${service}`);
+      results.push({
+        name: service,
+        status: active ? 'active' : 'inactive',
+        autostart: enabledOut.trim() === 'enabled'
+      });
+    } catch (err) {
+      results.push({ name: service, status: 'inactive', autostart: false });
+    }
+  }
+
+  await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: results }), taskId]);
+}
+
+async function handleManageService(payload: any) {
+  const { service, action } = payload;
+  if (!service || !action) throw new Error('Service and action are required');
+
+  const validActions = ['start', 'stop', 'restart', 'enable', 'disable'];
+  if (!validActions.includes(action)) throw new Error('Invalid action');
+
+  await execPromise(`sudo systemctl ${action} ${service}`);
+  console.log(`Service ${service} ${action}ed.`);
+}
+
+async function handleGetUpdates(taskId: number) {
+  try {
+    await execPromise('sudo apt-get update');
+    const { stdout } = await execPromise('apt list --upgradable');
+    
+    // Parse output (skipping the "Listing..." header)
+    const lines = stdout.split('\n').filter(line => line.includes('/') && !line.includes('Listing...'));
+    const updates = lines.map(line => {
+      const [namePart, info] = line.split(' ');
+      const name = namePart.split('/')[0];
+      return { name, info };
+    });
+
+    // Check if auto-updates are enabled
+    const { stdout: autoStatus } = await execPromise('cat /etc/apt/apt.conf.d/20auto-upgrades').catch(() => ({ stdout: '0' }));
+    const isAutoEnabled = autoStatus.includes('1');
+
+    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: { updates, isAutoEnabled } }), taskId]);
+    console.log(`Found ${updates.length} updates.`);
+  } catch (err) {
+    console.error('Failed to get updates:', err);
+    throw err;
+  }
+}
+
+async function handleInstallUpdates(taskId: number) {
+  try {
+    console.log('Installing system updates...');
+    const { stdout } = await execPromise('sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y');
+    await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ result: stdout }), taskId]);
+    console.log('Updates installed successfully.');
+  } catch (err) {
+    console.error('Failed to install updates:', err);
+    throw err;
+  }
+}
+
+async function handleManageAutoUpdates(payload: any) {
+  const { enabled } = payload;
+  const value = enabled ? '1' : '0';
+  const config = `APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "${value}";\n`;
+  
+  try {
+    const tempFile = `/tmp/20auto-upgrades`;
+    await fs.writeFile(tempFile, config);
+    await execPromise(`sudo mv ${tempFile} /etc/apt/apt.conf.d/20auto-upgrades`);
+    await execPromise('sudo systemctl restart unattended-upgrades');
+    console.log(`Automatic updates ${enabled ? 'enabled' : 'disabled'}.`);
+  } catch (err) {
+    console.error('Failed to manage auto-updates:', err);
+    throw err;
+  }
+}
+
 async function start() {
   await client.connect();
   console.log('Worker connected to database.');
@@ -925,6 +1030,59 @@ async function start() {
   // Run every 5 minutes
   setInterval(collectMetrics, 5 * 60 * 1000);
   collectMetrics(); // Run immediately on start
+
+  // --- System Security Log Monitor (SSH Brute Force Protection) ---
+  const watchAuthLogs = async () => {
+    console.log('Starting system security log monitor...');
+    const { spawn } = await import('child_process');
+    // We tail the log and process line by line
+    const tail = spawn('sudo', ['tail', '-f', '-n', '0', '/var/log/auth.log']);
+
+    tail.stdout.on('data', async (data) => {
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        // Match: Failed password for root from 1.2.3.4 ...
+        // Match: Failed password for invalid user admin from 1.2.3.4 ...
+        const match = line.match(/Failed password for (?:invalid user )?(\S+) from ([\d\.]+) port/);
+        if (match) {
+          const username = match[1];
+          const ipAddress = match[2];
+          console.log(`SECURITY: Detected failed SSH login for ${username} from ${ipAddress}`);
+          
+          try {
+             await client.query(
+               'INSERT INTO login_attempts (ip_address, username, success) VALUES ($1, $2, $3)',
+               [ipAddress, `ssh:${username}`, false]
+             );
+
+             const checkRes = await client.query(
+               'SELECT count(*) FROM login_attempts WHERE ip_address = $1 AND success = false AND created_at > NOW() - INTERVAL \'15 minutes\'',
+               [ipAddress]
+             );
+
+             if (parseInt(checkRes.rows[0].count) >= 5) {
+               console.warn(`SECURITY: Brute force detected from ${ipAddress}. Blocking...`);
+               
+               await client.query(
+                 'INSERT INTO blocked_ips (ip_address, reason, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'24 hours\') ON CONFLICT (ip_address) DO NOTHING',
+                 [ipAddress, 'Automatic block: SSH brute-force detected']
+               );
+
+               await handleFirewallBlockIp({ ipAddress });
+             }
+          } catch (e) {
+            console.error('Failed to process security log entry:', e);
+          }
+        }
+      }
+    });
+
+    tail.stderr.on('data', (data) => {
+      console.error('Auth log monitor error:', data.toString());
+    });
+  };
+
+  watchAuthLogs();
 
   // --- Task Listener ---
   await client.query('LISTEN new_task');

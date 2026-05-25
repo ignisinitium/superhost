@@ -1,0 +1,64 @@
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { query } from '../db.js';
+import { authenticateClient } from '../middleware/auth.js';
+import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
+const router = express.Router();
+router.post('/login', checkIpBlock, async (req, res) => {
+    const { username, password } = req.body;
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    try {
+        const result = await query('SELECT * FROM users WHERE username = $1', [username]);
+        if (result.rows.length === 0) {
+            await logLoginAttempt(ip, username, false);
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+        const user = result.rows[0];
+        if (!user.password_hash) {
+            return res.status(401).json({ message: 'Account not set up for login. Contact support.' });
+        }
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            await logLoginAttempt(ip, username, false);
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+        // Success
+        await logLoginAttempt(ip, username, true);
+        const token = jwt.sign({ id: user.id, role: 'client' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+        res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+router.get('/profile', authenticateClient, async (req, res) => {
+    try {
+        const result = await query('SELECT id, username, email, disk_limit_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb FROM users WHERE id = $1', [req.userId]);
+        if (result.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+router.put('/profile', authenticateClient, async (req, res) => {
+    const { email, password } = req.body;
+    try {
+        if (password) {
+            const passwordHash = await bcrypt.hash(password, 10);
+            await query('UPDATE users SET email = $1, password_hash = $2 WHERE id = $3', [email, passwordHash, req.userId]);
+        }
+        else {
+            await query('UPDATE users SET email = $1 WHERE id = $2', [email, req.userId]);
+        }
+        const result = await query('SELECT id, username, email, disk_limit_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb FROM users WHERE id = $1', [req.userId]);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+export default router;
+//# sourceMappingURL=clientAuth.js.map

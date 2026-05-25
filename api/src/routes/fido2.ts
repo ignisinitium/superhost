@@ -20,10 +20,8 @@ const RP_ID = process.env.RP_ID || 'web02.qc.fyi';
 const RP_NAME = 'Superhost';
 const ORIGIN = `https://${RP_ID}`;
 
-// In-memory store for challenges (should be in Redis or DB session for production)
+// In-memory store for challenges
 const currentChallenges: Map<number, string> = new Map();
-
-// --- Registration ---
 
 router.post('/register-options', authenticateAdmin, async (req: AuthRequest, res) => {
   try {
@@ -31,7 +29,6 @@ router.post('/register-options', authenticateAdmin, async (req: AuthRequest, res
     const adminRes = await query('SELECT username FROM admins WHERE id = $1', [adminId]);
     const admin = adminRes.rows[0];
 
-    // Get existing credentials to exclude them
     const credsRes = await query('SELECT credential_id FROM admin_fido_credentials WHERE admin_id = $1', [adminId]);
     const excludeCredentials = credsRes.rows.map(row => ({
       id: row.credential_id,
@@ -41,7 +38,7 @@ router.post('/register-options', authenticateAdmin, async (req: AuthRequest, res
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: RP_ID,
-      userID: adminId.toString(),
+      userID: new TextEncoder().encode(adminId.toString()),
       userName: admin.username,
       attestationType: 'none',
       excludeCredentials,
@@ -64,7 +61,7 @@ router.post('/register-verify', authenticateAdmin, async (req: AuthRequest, res)
   const expectedChallenge = currentChallenges.get(adminId);
 
   if (!expectedChallenge) {
-    return res.status(400).json({ message: 'No challenge found for this registration' });
+    return res.status(400).json({ message: 'No challenge found' });
   }
 
   try {
@@ -76,28 +73,25 @@ router.post('/register-verify', authenticateAdmin, async (req: AuthRequest, res)
     });
 
     if (verification.verified && verification.registrationInfo) {
-      const { credentialPublicKey, credentialID, counter } = verification.registrationInfo;
+      const { credential } = verification.registrationInfo;
 
       await query(
         'INSERT INTO admin_fido_credentials (admin_id, credential_id, public_key, counter) VALUES ($1, $2, $3, $4)',
-        [adminId, credentialID, Buffer.from(credentialPublicKey), counter]
+        [adminId, credential.id, Buffer.from(credential.publicKey), credential.counter]
       );
 
       currentChallenges.delete(adminId);
       res.json({ verified: true });
     } else {
-      res.status(400).json({ verified: false, message: 'Verification failed' });
+      res.status(400).json({ verified: false });
     }
   } catch (err) {
     res.status(400).json({ message: (err as Error).message });
   }
 });
 
-// --- Authentication ---
-
 router.post('/login-options', async (req, res) => {
   const { username } = req.body;
-
   try {
     const adminRes = await query('SELECT id FROM admins WHERE username = $1', [username]);
     if (adminRes.rows.length === 0) return res.status(404).json({ message: 'Admin not found' });
@@ -126,9 +120,7 @@ router.post('/login-verify', async (req, res) => {
   const { body, adminId }: { body: AuthenticationResponseJSON, adminId: number } = req.body;
   const expectedChallenge = currentChallenges.get(adminId);
 
-  if (!expectedChallenge) {
-    return res.status(400).json({ message: 'No challenge found for this login' });
-  }
+  if (!expectedChallenge) return res.status(400).json({ message: 'No challenge found' });
 
   try {
     const credRes = await query('SELECT * FROM admin_fido_credentials WHERE credential_id = $1 AND admin_id = $2', [body.id, adminId]);
@@ -140,9 +132,9 @@ router.post('/login-verify', async (req, res) => {
       expectedChallenge,
       expectedOrigin: ORIGIN,
       expectedRPID: RP_ID,
-      authenticator: {
-        credentialID: dbCred.credential_id,
-        credentialPublicKey: dbCred.public_key,
+      credential: {
+        id: dbCred.credential_id,
+        publicKey: dbCred.public_key,
         counter: dbCred.counter,
       },
     });
@@ -153,12 +145,11 @@ router.post('/login-verify', async (req, res) => {
       const adminRes = await query('SELECT id, username FROM admins WHERE id = $1', [adminId]);
       const admin = adminRes.rows[0];
 
-      const token = jwt.sign({ id: admin.id }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
-      
+      const token = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
       currentChallenges.delete(adminId);
       res.json({ verified: true, token, admin: { id: admin.id, username: admin.username } });
     } else {
-      res.status(400).json({ verified: false, message: 'Authentication failed' });
+      res.status(400).json({ verified: false });
     }
   } catch (err) {
     res.status(400).json({ message: (err as Error).message });

@@ -25,6 +25,9 @@ import ThemeEnginePage from './pages/ThemeEngine';
 import UserSettingsPage from './pages/UserSettings';
 import ClusterPage from './pages/Cluster';
 import PackagesPage from './pages/Packages';
+import DatabasesPage from './pages/Databases';
+import ServiceManagerPage from './pages/ServiceManager';
+import UpdatesPage from './pages/Updates';
 
 const ProtectedRoute = ({ children, role }: { children: React.ReactElement, role?: 'admin' | 'client' }) => {
   const token = localStorage.getItem('token');
@@ -95,6 +98,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                   <Route path="users" element={<UsersPage />} />
                   <Route path="users/:id/settings" element={<UserSettingsPage />} />
                   <Route path="packages" element={<PackagesPage />} />
+                  <Route path="databases" element={<DatabasesPage />} />
                   <Route path="domains" element={<DomainsPage />} />
                   <Route path="firewall" element={<FirewallPage />} />
                   <Route path="processes" element={<ProcessesPage />} />
@@ -103,6 +107,8 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="themes" element={<ThemeEnginePage />} />
                   <Route path="cluster" element={<ClusterPage />} />
+                  <Route path="services" element={<ServiceManagerPage />} />
+                  <Route path="updates" element={<UpdatesPage />} />
                   <Route path="settings" element={<SettingsPage />} />
                 </>
               ) : (

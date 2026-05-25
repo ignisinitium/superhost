@@ -23,6 +23,9 @@ import networkRoutes from './routes/network.js';
 import metricsRoutes from './routes/metrics.js';
 import themesRoutes from './routes/themes.js';
 import clusterRoutes from './routes/cluster.js';
+import servicesRoutes from './routes/services.js';
+import adminDatabaseRoutes from './routes/adminDatabases.js';
+import updateRoutes from './routes/updates.js';
 
 dotenv.config();
 
@@ -53,6 +56,9 @@ app.use('/api/network', networkRoutes);
 app.use('/api/metrics', metricsRoutes);
 app.use('/api/themes', themesRoutes);
 app.use('/api/cluster', clusterRoutes);
+app.use('/api/services', servicesRoutes);
+app.use('/api/admin/databases', adminDatabaseRoutes);
+app.use('/api/admin/updates', updateRoutes);
 
 app.get('/health', async (req, res) => {
   try {

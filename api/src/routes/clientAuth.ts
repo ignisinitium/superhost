@@ -36,7 +36,6 @@ router.post('/login', checkIpBlock, async (req, res) => {
     const token = jwt.sign({ id: user.id, role: 'client' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
     res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
   } catch (err) {
-...
     res.status(500).json({ message: (err as Error).message });
   }
 });
