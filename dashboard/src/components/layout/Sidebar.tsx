@@ -1,8 +1,13 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { 
-  Server, Users, Box, Settings, Shield, Database, 
-  Home, Folder, Globe, Mail, Lock, Zap, LogOut, Terminal, Activity, ShieldAlert, CreditCard, Paintbrush, Power, Download, GitBranch, Clock, Briefcase, Palette
+import {
+  LayoutDashboard, Users, Package, Briefcase, Palette,
+  Power, Download, Layers, BarChart2,
+  Globe, Database, Clock, FolderOpen, HardDrive,
+  ShieldCheck, ShieldAlert, Mail,
+  Network, Terminal, Cpu, Paintbrush, Settings,
+  Zap, GitBranch, CreditCard,
+  Server, LogOut,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -10,119 +15,204 @@ interface SidebarProps {
   userRole: 'admin' | 'client';
 }
 
+type MenuItem  = { label: string; icon: React.ElementType; path: string };
+type MenuGroup = { section: string; items: MenuItem[] };
+
+// ── Admin navigation ──────────────────────────────────────────────────────────
+const adminGroups: MenuGroup[] = [
+  {
+    section: 'Overview',
+    items: [
+      { label: 'Dashboard',     icon: LayoutDashboard, path: '/' },
+    ],
+  },
+  {
+    section: 'Accounts',
+    items: [
+      { label: 'Users',          icon: Users,     path: '/users' },
+      { label: 'Packages',       icon: Package,   path: '/packages' },
+      { label: 'Resellers',      icon: Briefcase, path: '/resellers' },
+      { label: 'White-Label',    icon: Palette,   path: '/branding' },
+    ],
+  },
+  {
+    section: 'Server',
+    items: [
+      { label: 'Services',       icon: Power,     path: '/services' },
+      { label: 'Updates',        icon: Download,  path: '/updates' },
+      { label: 'HA Cluster',     icon: Layers,    path: '/cluster' },
+      { label: 'Monitoring',     icon: BarChart2, path: '/monitoring' },
+    ],
+  },
+  {
+    section: 'Hosting',
+    items: [
+      { label: 'Domains',        icon: Globe,     path: '/domains' },
+      { label: 'DNS Zones',      icon: Network,   path: '/dns' },
+      { label: 'Databases',      icon: Database,  path: '/databases' },
+      { label: 'FTP Manager',    icon: FolderOpen, path: '/ftp' },
+      { label: 'Cron Jobs',      icon: Clock,     path: '/cron' },
+    ],
+  },
+  {
+    section: 'Security',
+    items: [
+      { label: 'Firewall',       icon: ShieldCheck,  path: '/firewall' },
+      { label: 'Malware Scan',   icon: ShieldAlert,  path: '/security' },
+      { label: 'Spam Manager',   icon: Mail,         path: '/spam' },
+    ],
+  },
+  {
+    section: 'System',
+    items: [
+      { label: 'Networking',     icon: Globe,       path: '/network' },
+      { label: 'Logs',           icon: Terminal,    path: '/logs' },
+      { label: 'Processes',      icon: Cpu,         path: '/processes' },
+      { label: 'Theme Engine',   icon: Paintbrush,  path: '/themes' },
+      { label: 'Settings',       icon: Settings,    path: '/settings' },
+    ],
+  },
+];
+
+// ── Client navigation ─────────────────────────────────────────────────────────
+const clientGroups: MenuGroup[] = [
+  {
+    section: 'Overview',
+    items: [
+      { label: 'Dashboard',      icon: LayoutDashboard, path: '/client' },
+    ],
+  },
+  {
+    section: 'Files & Storage',
+    items: [
+      { label: 'File Manager',   icon: FolderOpen,  path: '/client/files' },
+      { label: 'FTP Accounts',   icon: Server,      path: '/client/ftp' },
+      { label: 'Backups',        icon: HardDrive,   path: '/client/backups' },
+    ],
+  },
+  {
+    section: 'Hosting',
+    items: [
+      { label: 'DNS Manager',    icon: Network,     path: '/client/dns' },
+      { label: 'Databases',      icon: Database,    path: '/client/databases' },
+      { label: 'Cron Jobs',      icon: Clock,       path: '/client/cron' },
+    ],
+  },
+  {
+    section: 'Deploy',
+    items: [
+      { label: '1-Click Apps',   icon: Zap,         path: '/client/apps' },
+      { label: 'Git Deploy',     icon: GitBranch,   path: '/client/git' },
+    ],
+  },
+  {
+    section: 'Email',
+    items: [
+      { label: 'Email Accounts', icon: Mail,        path: '/client/email' },
+      { label: 'Spam Filter',    icon: ShieldAlert, path: '/client/spam' },
+    ],
+  },
+  {
+    section: 'Account',
+    items: [
+      { label: 'Billing',        icon: CreditCard,  path: '/client/billing' },
+      { label: 'Settings',       icon: Settings,    path: '/client/settings' },
+    ],
+  },
+];
+
+// ── Sidebar component ─────────────────────────────────────────────────────────
 const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const navigate = useNavigate();
-  
-  const adminMenuItems = [
-    { label: 'Server Overview', icon: Server, path: '/' },
-    { label: 'Account Management', icon: Users, path: '/users' },
-    { label: 'Reseller Tiers', icon: Briefcase, path: '/resellers' },
-    { label: 'White-Label Config', icon: Palette, path: '/branding' },
-    { label: 'Global Databases', icon: Database, path: '/databases' },
-    { label: 'Packages & Features', icon: Box, path: '/packages' },
-    { label: 'Service Configs', icon: Settings, path: '/settings' },
-    { label: 'Service Manager', icon: Power, path: '/services' },
-    { label: 'Server Updates', icon: Download, path: '/updates' },
-    { label: 'Enterprise Monitoring', icon: Activity, path: '/monitoring' },
-    { label: 'Global Spam Manager', icon: ShieldAlert, path: '/spam' },
-    { label: 'Security & Firewall', icon: Shield, path: '/firewall' },
-    { label: 'Virtual Networking', icon: Globe, path: '/network' },
-    { label: 'Anti-Malware', icon: ShieldAlert, path: '/security' },
-    { label: 'Theme Engine', icon: Paintbrush, path: '/themes' },
-    { label: 'HA Cluster', icon: Server, path: '/cluster' },
-    { label: 'Logs', icon: Terminal, path: '/logs' },
-    { label: 'Processes', icon: Activity, path: '/processes' },
-    { label: 'System Cron Jobs', icon: Clock, path: '/cron' },
-    { label: 'System FTP Manager', icon: Folder, path: '/ftp' },
-    { label: 'System DNS Zones', icon: Globe, path: '/dns' },
-    { label: 'Backup Orchestration', icon: Database, path: '/backups' }
-  ];
-
-  const userMenuItems = [
-    { label: 'My Dashboard', icon: Home, path: '/client' },
-    { label: 'File Manager', icon: Folder, path: '/client/files' },
-    { label: 'FTP Accounts', icon: Folder, path: '/client/ftp' },
-    { label: 'Git Deployment', icon: GitBranch, path: '/client/git' },
-    { label: 'Databases', icon: Database, path: '/client/databases' },
-    { label: 'Domains & DNS', icon: Globe, path: '/client/domains' },
-    { label: 'DNS Zone Manager', icon: Globe, path: '/client/dns' },
-    { label: 'Email Accounts', icon: Mail, path: '/client/email' },
-    { label: 'Spam Dashboard', icon: ShieldAlert, path: '/client/spam' },
-    { label: 'Cron Job Manager', icon: Clock, path: '/client/cron' },
-    { label: 'SSL Certificates', icon: Lock, path: '/client/ssl' },
-    { label: '1-Click Apps', icon: Zap, path: '/client/apps' },
-    { label: 'Billing & Services', icon: CreditCard, path: '/client/billing' },
-    { label: 'Account Settings', icon: Settings, path: '/client/settings' }
-  ];
-
-  const activeMenu = userRole === 'admin' ? adminMenuItems : userMenuItems;
+  const groups = userRole === 'admin' ? adminGroups : clientGroups;
 
   const handleLogout = () => {
-    localStorage.setItem('token', '');
     localStorage.removeItem('token');
     localStorage.removeItem('role');
     localStorage.removeItem('user');
+    localStorage.removeItem('admin');
     navigate(userRole === 'admin' ? '/login' : '/client/login');
   };
 
   return (
     <aside className={`
       fixed lg:static inset-y-0 left-0 z-40
-      w-64 bg-slate-900 text-slate-300 transition-transform duration-300 ease-in-out
+      w-60 bg-slate-900 text-slate-300 flex flex-col
+      border-r border-slate-800 shadow-2xl
+      transition-transform duration-300 ease-in-out
       ${isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
-      flex flex-col border-r border-slate-800 shadow-2xl
     `}>
-      <div className="h-16 flex items-center px-6 border-b border-slate-800 bg-slate-950">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center shadow-lg shadow-orange-500/20">
-            <Server className="w-5 h-5 text-white" />
+      {/* Logo */}
+      <div className="h-14 flex items-center px-5 border-b border-slate-800 bg-slate-950 flex-shrink-0">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center shadow-lg shadow-orange-500/20 flex-shrink-0">
+            <Server className="w-4 h-4 text-white" />
           </div>
-          <span className="text-xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-amber-400">
-            Super Host
+          <span className="text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-amber-400 tracking-tight">
+            Superhost
           </span>
         </div>
       </div>
 
-      <nav className="flex-1 overflow-y-auto py-4">
-        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 px-6">Management</div>
-        <ul className="space-y-1 px-3">
-          {activeMenu.map((item, idx) => (
-            <li key={idx}>
-              <NavLink 
-                to={item.path} 
-                className={({ isActive }) => `
-                  flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors
-                  ${isActive 
-                    ? 'bg-orange-500/10 text-orange-400 border border-orange-500/20' 
-                    : 'hover:bg-slate-800 hover:text-white border border-transparent'}
-                `}
-              >
-                <item.icon className="w-4 h-4" />
-                {item.label}
-              </NavLink>
-            </li>
-          ))}
-        </ul>
+      {/* Navigation */}
+      <nav className="flex-1 overflow-y-auto py-3 space-y-4">
+        {groups.map((group) => (
+          <div key={group.section}>
+            {/* Section label — hide for single-item "Overview" group */}
+            {group.items.length > 1 && (
+              <div className="px-4 mb-1">
+                <span className="text-[9px] font-bold text-slate-600 uppercase tracking-[0.15em]">
+                  {group.section}
+                </span>
+              </div>
+            )}
+            <ul className="space-y-0.5 px-2">
+              {group.items.map((item) => (
+                <li key={item.path}>
+                  <NavLink
+                    to={item.path}
+                    end={item.path === '/' || item.path === '/client'}
+                    className={({ isActive }) =>
+                      `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150 ${
+                        isActive
+                          ? 'bg-orange-500/15 text-orange-400 border border-orange-500/20'
+                          : 'text-slate-400 hover:bg-slate-800 hover:text-slate-100 border border-transparent'
+                      }`
+                    }
+                  >
+                    <item.icon className="w-4 h-4 flex-shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </NavLink>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
       </nav>
 
-      <div className="p-4 border-t border-slate-800 bg-slate-900/50">
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center border-2 border-slate-600">
-            <span className="text-sm font-bold text-white uppercase">{userRole === 'admin' ? 'ROOT' : 'USR'}</span>
+      {/* Footer */}
+      <div className="flex-shrink-0 p-3 border-t border-slate-800">
+        <div className="flex items-center gap-2.5 px-2 mb-2.5">
+          <div className="w-7 h-7 rounded-full bg-slate-700 border border-slate-600 flex items-center justify-center flex-shrink-0">
+            <span className="text-[10px] font-bold text-slate-300">
+              {userRole === 'admin' ? 'A' : 'U'}
+            </span>
           </div>
-          <div>
-            <div className="text-sm font-medium text-white truncate w-32">
-              {userRole === 'admin' ? 'System Admin' : 'Client User'}
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-200 truncate">
+              {userRole === 'admin' ? 'Administrator' : 'Client Account'}
             </div>
-            <div className="text-xs text-slate-500">Connected</div>
+            <div className="text-[10px] text-slate-500">
+              {userRole === 'admin' ? 'Root Access' : 'Standard'}
+            </div>
           </div>
         </div>
-        <button 
+        <button
           onClick={handleLogout}
-          className="w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors text-sm font-medium"
+          className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors text-xs font-semibold border border-red-500/10 hover:border-red-500/20"
         >
-          <LogOut className="w-4 h-4" />
-          Secure Logout
+          <LogOut className="w-3.5 h-3.5" />
+          Sign Out
         </button>
       </div>
     </aside>
