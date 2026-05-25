@@ -4,11 +4,35 @@ import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 import jwt from 'jsonwebtoken';
 const router = express.Router();
-const RP_ID = process.env.RP_ID || 'web02.qc.fyi';
+const RP_ID = process.env.RP_ID;
+if (!RP_ID) {
+    console.error('FATAL: RP_ID environment variable is not set');
+    process.exit(1);
+}
 const RP_NAME = 'Superhost';
 const ORIGIN = `https://${RP_ID}`;
-// In-memory store for challenges
-const currentChallenges = new Map();
+function getJwtSecret() {
+    const secret = process.env.JWT_SECRET;
+    if (!secret)
+        throw new Error('FATAL: JWT_SECRET is not set');
+    return secret;
+}
+// Challenges stored in PostgreSQL with TTL — survives restarts, works in clusters
+async function storeChallenge(adminId, challenge) {
+    await query(`INSERT INTO fido2_challenges (admin_id, challenge, expires_at)
+     VALUES ($1, $2, NOW() + INTERVAL '5 minutes')
+     ON CONFLICT (admin_id) DO UPDATE
+       SET challenge = EXCLUDED.challenge, expires_at = EXCLUDED.expires_at`, [adminId, challenge]);
+}
+async function getChallenge(adminId) {
+    const result = await query(`DELETE FROM fido2_challenges
+     WHERE admin_id = $1 AND expires_at > NOW()
+     RETURNING challenge`, [adminId]);
+    return result.rows[0]?.challenge ?? null;
+}
+async function clearExpiredChallenges() {
+    await query('DELETE FROM fido2_challenges WHERE expires_at <= NOW()');
+}
 router.post('/register-options', authenticateAdmin, async (req, res) => {
     try {
         const adminId = req.adminId;
@@ -31,7 +55,7 @@ router.post('/register-options', authenticateAdmin, async (req, res) => {
                 userVerification: 'preferred',
             },
         });
-        currentChallenges.set(adminId, options.challenge);
+        await storeChallenge(adminId, options.challenge);
         res.json(options);
     }
     catch (err) {
@@ -41,7 +65,7 @@ router.post('/register-options', authenticateAdmin, async (req, res) => {
 router.post('/register-verify', authenticateAdmin, async (req, res) => {
     const { body } = req;
     const adminId = req.adminId;
-    const expectedChallenge = currentChallenges.get(adminId);
+    const expectedChallenge = await getChallenge(adminId);
     if (!expectedChallenge) {
         return res.status(400).json({ message: 'No challenge found' });
     }
@@ -55,7 +79,7 @@ router.post('/register-verify', authenticateAdmin, async (req, res) => {
         if (verification.verified && verification.registrationInfo) {
             const { credential } = verification.registrationInfo;
             await query('INSERT INTO admin_fido_credentials (admin_id, credential_id, public_key, counter) VALUES ($1, $2, $3, $4)', [adminId, credential.id, Buffer.from(credential.publicKey), credential.counter]);
-            currentChallenges.delete(adminId);
+            // Challenge already consumed by getChallenge (DELETE-RETURNING pattern)
             res.json({ verified: true });
         }
         else {
@@ -83,7 +107,8 @@ router.post('/login-options', async (req, res) => {
             allowCredentials,
             userVerification: 'preferred',
         });
-        currentChallenges.set(adminId, options.challenge);
+        await storeChallenge(adminId, options.challenge);
+        await clearExpiredChallenges(); // Housekeeping
         res.json({ options, adminId });
     }
     catch (err) {
@@ -92,7 +117,7 @@ router.post('/login-options', async (req, res) => {
 });
 router.post('/login-verify', async (req, res) => {
     const { body, adminId } = req.body;
-    const expectedChallenge = currentChallenges.get(adminId);
+    const expectedChallenge = await getChallenge(adminId);
     if (!expectedChallenge)
         return res.status(400).json({ message: 'No challenge found' });
     try {
@@ -115,8 +140,8 @@ router.post('/login-verify', async (req, res) => {
             await query('UPDATE admin_fido_credentials SET counter = $1 WHERE id = $2', [verification.authenticationInfo.newCounter, dbCred.id]);
             const adminRes = await query('SELECT id, username FROM admins WHERE id = $1', [adminId]);
             const admin = adminRes.rows[0];
-            const token = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
-            currentChallenges.delete(adminId);
+            const token = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
+            // Challenge was already consumed atomically by getChallenge
             res.json({ verified: true, token, admin: { id: admin.id, username: admin.username } });
         }
         else {

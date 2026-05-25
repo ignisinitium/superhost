@@ -40,6 +40,12 @@ router.post('/', async (req, res) => {
       ['CREATE_DOMAIN', { domainName, username, phpVersion: domain.php_version }]
     );
 
+    // 4. Auto-create DNS Zone
+    await query(
+      'INSERT INTO dns_zones (user_id, domain_name) VALUES ($1, $2) ON CONFLICT (domain_name) DO NOTHING',
+      [userId, domainName]
+    );
+
     res.status(201).json({ ...domain, taskId: taskRes.rows[0].id });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

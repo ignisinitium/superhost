@@ -2,7 +2,7 @@ import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { 
   Server, Users, Box, Settings, Shield, Database, 
-  Home, Folder, Globe, Mail, Lock, Zap, LogOut, Terminal, Activity, ShieldAlert, CreditCard, Paintbrush, Power, Download, GitBranch
+  Home, Folder, Globe, Mail, Lock, Zap, LogOut, Terminal, Activity, ShieldAlert, CreditCard, Paintbrush, Power, Download, GitBranch, Clock, Briefcase, Palette
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -16,11 +16,15 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const adminMenuItems = [
     { label: 'Server Overview', icon: Server, path: '/' },
     { label: 'Account Management', icon: Users, path: '/users' },
+    { label: 'Reseller Tiers', icon: Briefcase, path: '/resellers' },
+    { label: 'White-Label Config', icon: Palette, path: '/branding' },
     { label: 'Global Databases', icon: Database, path: '/databases' },
     { label: 'Packages & Features', icon: Box, path: '/packages' },
     { label: 'Service Configs', icon: Settings, path: '/settings' },
     { label: 'Service Manager', icon: Power, path: '/services' },
     { label: 'Server Updates', icon: Download, path: '/updates' },
+    { label: 'Enterprise Monitoring', icon: Activity, path: '/monitoring' },
+    { label: 'Global Spam Manager', icon: ShieldAlert, path: '/spam' },
     { label: 'Security & Firewall', icon: Shield, path: '/firewall' },
     { label: 'Virtual Networking', icon: Globe, path: '/network' },
     { label: 'Anti-Malware', icon: ShieldAlert, path: '/security' },
@@ -28,16 +32,23 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
     { label: 'HA Cluster', icon: Server, path: '/cluster' },
     { label: 'Logs', icon: Terminal, path: '/logs' },
     { label: 'Processes', icon: Activity, path: '/processes' },
+    { label: 'System Cron Jobs', icon: Clock, path: '/cron' },
+    { label: 'System FTP Manager', icon: Folder, path: '/ftp' },
+    { label: 'System DNS Zones', icon: Globe, path: '/dns' },
     { label: 'Backup Orchestration', icon: Database, path: '/backups' }
   ];
 
   const userMenuItems = [
     { label: 'My Dashboard', icon: Home, path: '/client' },
     { label: 'File Manager', icon: Folder, path: '/client/files' },
+    { label: 'FTP Accounts', icon: Folder, path: '/client/ftp' },
     { label: 'Git Deployment', icon: GitBranch, path: '/client/git' },
     { label: 'Databases', icon: Database, path: '/client/databases' },
     { label: 'Domains & DNS', icon: Globe, path: '/client/domains' },
+    { label: 'DNS Zone Manager', icon: Globe, path: '/client/dns' },
     { label: 'Email Accounts', icon: Mail, path: '/client/email' },
+    { label: 'Spam Dashboard', icon: ShieldAlert, path: '/client/spam' },
+    { label: 'Cron Job Manager', icon: Clock, path: '/client/cron' },
     { label: 'SSL Certificates', icon: Lock, path: '/client/ssl' },
     { label: '1-Click Apps', icon: Zap, path: '/client/apps' },
     { label: 'Billing & Services', icon: CreditCard, path: '/client/billing' },

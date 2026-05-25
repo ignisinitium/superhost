@@ -6,6 +6,12 @@ import QRCode from 'qrcode';
 import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
+function getJwtSecret() {
+    const secret = process.env.JWT_SECRET;
+    if (!secret)
+        throw new Error('FATAL: JWT_SECRET is not set');
+    return secret;
+}
 const router = express.Router();
 router.post('/login', checkIpBlock, async (req, res) => {
     const { username, password } = req.body;
@@ -27,7 +33,7 @@ router.post('/login', checkIpBlock, async (req, res) => {
         if (admin.two_factor_enabled) {
             return res.json({ require2FA: true, adminId: admin.id });
         }
-        const token = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+        const token = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
         res.json({ token, admin: { id: admin.id, username: admin.username } });
     }
     catch (err) {
@@ -48,7 +54,7 @@ router.post('/verify-2fa', async (req, res) => {
         });
         if (!verified)
             return res.status(401).json({ message: 'Invalid 2FA token' });
-        const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+        const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
         res.json({ token: jwtToken, admin: { id: admin.id, username: admin.username } });
     }
     catch (err) {

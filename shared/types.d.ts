@@ -33,4 +33,83 @@ export interface UserPort {
     domain_id: number;
     created_at: string;
 }
+export interface CronJob {
+    id: number;
+    user_id: number;
+    minute: string;
+    hour: string;
+    day: string;
+    month: string;
+    weekday: string;
+    command: string;
+    description?: string;
+    created_at: string;
+}
+export interface FtpAccount {
+    id: number;
+    user_id: number;
+    ftp_username: string;
+    homedir: string;
+    created_at: string;
+    owner_username?: string;
+}
+export interface DnsZone {
+    id: number;
+    user_id: number | null;
+    domain_name: string;
+    ttl: number;
+    created_at: string;
+    username?: string;
+}
+export interface DnsRecord {
+    id: number;
+    zone_id: number;
+    name: string;
+    type: string;
+    content: string;
+    priority: number | null;
+    ttl: number | null;
+    created_at: string;
+}
+export interface MailUser {
+    id: number;
+    domain_id: number;
+    email: string;
+    quota: number;
+    spam_filter_enabled: boolean;
+    spam_digest_enabled: boolean;
+    created_at: string;
+    domain_name?: string;
+}
+export interface MailForwarder {
+    id: number;
+    domain_id: number;
+    source: string;
+    destination: string;
+    created_at: string;
+    domain_name?: string;
+}
+export interface MailAutoresponder {
+    id: number;
+    mail_user_id: number;
+    message: string;
+    enabled: boolean;
+    created_at: string;
+}
+export interface MailQuarantine {
+    id: number;
+    mail_user_id: number;
+    sender: string;
+    subject: string;
+    spam_score: number;
+    file_path: string;
+    created_at: string;
+}
+export interface MailAccessControl {
+    id: number;
+    mail_user_id: number;
+    sender_pattern: string;
+    access_type: 'allow' | 'block';
+    created_at: string;
+}
 //# sourceMappingURL=types.d.ts.map

@@ -14,21 +14,20 @@ const router = express.Router();
 // --- PUBLIC WEBHOOK ROUTE (Do not authenticate) ---
 router.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   const sig = req.headers['stripe-signature'];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET || 'whsec_dummy';
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  // Require proper Stripe configuration — never accept unverified webhook payloads
+  if (!process.env.STRIPE_SECRET_KEY || !endpointSecret) {
+    console.error('Stripe webhook received but STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET is not configured');
+    return res.status(503).json({ message: 'Stripe webhooks not configured' });
+  }
 
   let event;
 
   try {
-    // Note: To actually verify signatures, req.body must be the raw buffer.
-    // In a real setup, ensure express.raw() handles this route correctly before standard json parsers.
-    // For this demo, we'll try/catch the constructEvent.
-    if (process.env.STRIPE_SECRET_KEY) {
-      event = stripe.webhooks.constructEvent(req.body, sig as string, endpointSecret);
-    } else {
-      // Dummy mode
-      event = JSON.parse(req.body.toString());
-    }
+    event = stripe.webhooks.constructEvent(req.body, sig as string, endpointSecret);
   } catch (err: any) {
+    console.error('Stripe webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 

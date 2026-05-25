@@ -26,6 +26,8 @@ router.post('/', async (req, res) => {
         const domain = result.rows[0];
         // 3. Insert Task for Worker
         const taskRes = await query('INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id', ['CREATE_DOMAIN', { domainName, username, phpVersion: domain.php_version }]);
+        // 4. Auto-create DNS Zone
+        await query('INSERT INTO dns_zones (user_id, domain_name) VALUES ($1, $2) ON CONFLICT (domain_name) DO NOTHING', [userId, domainName]);
         res.status(201).json({ ...domain, taskId: taskRes.rows[0].id });
     }
     catch (err) {

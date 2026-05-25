@@ -3,6 +3,16 @@ import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 const router = express.Router();
 router.use(authenticateAdmin);
+router.get('/master-key', async (req, res) => {
+    try {
+        // Request the worker to read the public key
+        const taskRes = await query('INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id', ['GET_MASTER_SSH_KEY', {}]);
+        res.json({ taskId: taskRes.rows[0].id });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 router.get('/nodes', async (req, res) => {
     try {
         const result = await query('SELECT * FROM cluster_nodes ORDER BY hostname ASC');

@@ -8,6 +8,12 @@ import { authenticateAdmin } from '../middleware/auth.js';
 import type { AuthRequest } from '../middleware/auth.js';
 import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
 
+function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('FATAL: JWT_SECRET is not set');
+  return secret;
+}
+
 const router = express.Router();
 
 router.post('/login', checkIpBlock, async (req, res) => {
@@ -36,7 +42,7 @@ router.post('/login', checkIpBlock, async (req, res) => {
       return res.json({ require2FA: true, adminId: admin.id });
     }
 
-    const token = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    const token = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
     res.json({ token, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -59,7 +65,7 @@ router.post('/verify-2fa', async (req, res) => {
 
     if (!verified) return res.status(401).json({ message: 'Invalid 2FA token' });
 
-    const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
     res.json({ token: jwtToken, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

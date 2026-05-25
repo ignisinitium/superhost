@@ -1,7 +1,9 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import helmet from 'helmet';
 import { query } from './db.js';
+import { globalErrorHandler } from './middleware/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import clientAuthRoutes from './routes/clientAuth.js';
 import clientDomainsRoutes from './routes/clientDomains.js';
@@ -28,14 +30,70 @@ import adminDatabaseRoutes from './routes/adminDatabases.js';
 import updateRoutes from './routes/updates.js';
 import filesRoutes from './routes/files.js';
 import gitRoutes from './routes/git.js';
+import cronRoutes from './routes/cron.js';
+import adminCronRoutes from './routes/adminCron.js';
+import ftpRoutes from './routes/ftp.js';
+import adminFtpRoutes from './routes/adminFtp.js';
+import dnsRoutes from './routes/dns.js';
+import adminDnsRoutes from './routes/adminDns.js';
+import resellerRoutes from './routes/reseller.js';
 
 dotenv.config();
 
-const app = express();
-const port = process.env.PORT || 3001;
+// Validate critical environment variables at startup
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start.');
+  process.exit(1);
+}
 
-app.use(cors());
-app.use(express.json());
+const app = express();
+const port = process.env.PORT ?? 3001;
+
+// Security headers (must be before routes)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
+  },
+}));
+
+// CORS — restrict to known origins
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['http://localhost:5173', 'http://localhost:4173'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (server-to-server, curl, mobile apps)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Stripe webhook needs raw body — mount BEFORE express.json()
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
+
+// Body parsing with size limits
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// ── Routes ────────────────────────────────────────────────────────────────────
 
 app.use('/api/auth', authRoutes);
 app.use('/api/client/auth', clientAuthRoutes);
@@ -46,32 +104,45 @@ app.use('/api/ports', portRoutes);
 app.use('/api/firewall', firewallRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/processes', processRoutes);
-app.use('/api/fido2', fido2Routes);
 app.use('/api/logs', logRoutes);
-app.use('/api/client/databases', databaseRoutes);
-app.use('/api/client/email', emailRoutes);
-app.use('/api/client/apps', appsRoutes);
+app.use('/api/databases', databaseRoutes);
+app.use('/api/email', emailRoutes);
+app.use('/api/apps', appsRoutes);
 app.use('/api/security', securityRoutes);
 app.use('/api/billing', billingRoutes);
-app.use('/api/client/backups', backupRoutes);
+app.use('/api/backups', backupRoutes);
 app.use('/api/network', networkRoutes);
 app.use('/api/metrics', metricsRoutes);
 app.use('/api/themes', themesRoutes);
 app.use('/api/cluster', clusterRoutes);
 app.use('/api/services', servicesRoutes);
+
 app.use('/api/admin/databases', adminDatabaseRoutes);
 app.use('/api/admin/updates', updateRoutes);
+app.use('/api/admin/cron', adminCronRoutes);
+app.use('/api/admin/ftp', adminFtpRoutes);
+app.use('/api/admin/dns', adminDnsRoutes);
+app.use('/api/admin/reseller', resellerRoutes);
+
 app.use('/api/client/files', filesRoutes);
 app.use('/api/client/git', gitRoutes);
+app.use('/api/client/cron', cronRoutes);
+app.use('/api/client/ftp', ftpRoutes);
+app.use('/api/client/dns', dnsRoutes);
 
-app.get('/health', async (req, res) => {
+app.use('/api/fido2', fido2Routes);
+
+app.get('/health', async (_req, res) => {
   try {
     const result = await query('SELECT NOW()');
-    res.json({ status: 'ok', time: result.rows[0].now });
+    res.json({ status: 'ok', time: result.rows[0]?.now });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: (err as Error).message });
+    res.status(500).json({ status: 'error', message: 'Database unavailable' });
   }
 });
+
+// ── Global error handler (must be last) ──────────────────────────────────────
+app.use(globalErrorHandler);
 
 app.listen(port, () => {
   console.log(`Superhost API running on port ${port}`);

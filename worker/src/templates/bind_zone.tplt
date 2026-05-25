@@ -1,0 +1,12 @@
+$TTL {{TTL}}
+@       IN      SOA     ns1.{{MASTER_DOMAIN}}. admin.{{MASTER_DOMAIN}}. (
+                        {{SERIAL}}      ; Serial
+                        3600            ; Refresh
+                        1800            ; Retry
+                        604800          ; Expire
+                        86400 )         ; Minimum TTL
+
+@       IN      NS      ns1.{{MASTER_DOMAIN}}.
+@       IN      NS      ns2.{{MASTER_DOMAIN}}.
+
+{{RECORDS}}

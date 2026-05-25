@@ -44,9 +44,10 @@ This document tracks the implementation of the "Functional Specification: Modula
 - [x] **Web-Based File Manager**: Sleek React-based explorer to manage, zip, and edit files in the browser.
 - [x] **Advanced App Runtimes**: Manager for Node.js, Python, and Ruby applications.
 - [x] **Git Auto-Deployment**: Webhook-based updates from GitHub/GitLab repositories.
-- [ ] **Cron Job Manager**: Visual interface to schedule recurring system and user tasks.
-- [ ] **FTP / SFTP Accounts**: Manage isolated file upload accounts.
-- [ ] **DNS Zone Manager**: Host and manage local name servers (Bind/PowerDNS).
-- [ ] **Email Advanced Features**: Forwarders, Auto-responders, and SpamAssassin integration.
-- [ ] **Enterprise Monitoring**: Slack/Telegram alerts for server health and detailed traffic analytics.
-- [ ] **White-Label & Reseller Support**: Reseller tiers and API key management.
+- [x] **Cron Job Manager**: Visual interface to schedule recurring system and user tasks.
+- [x] **FTP / SFTP Accounts**: Manage isolated file upload accounts.
+- [x] **DNS Zone Manager**: Host and manage local name servers (Bind/PowerDNS).
+- [x] **Email Advanced Features**: Forwarders, Auto-responders, and SpamAssassin integration (with Quarantine Dashboard & Daily Digest).
+- [x] **Enterprise Monitoring**: Slack/Telegram alerts for server health and detailed traffic analytics.
+- [x] **White-Label & Reseller Support**: Reseller tiers and API key management.
+

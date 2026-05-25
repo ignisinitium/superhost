@@ -4,6 +4,12 @@ import jwt from 'jsonwebtoken';
 import { query } from '../db.js';
 import { authenticateClient } from '../middleware/auth.js';
 import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
+function getJwtSecret() {
+    const secret = process.env.JWT_SECRET;
+    if (!secret)
+        throw new Error('FATAL: JWT_SECRET is not set');
+    return secret;
+}
 const router = express.Router();
 router.post('/login', checkIpBlock, async (req, res) => {
     const { username, password } = req.body;
@@ -25,7 +31,7 @@ router.post('/login', checkIpBlock, async (req, res) => {
         }
         // Success
         await logLoginAttempt(ip, username, true);
-        const token = jwt.sign({ id: user.id, role: 'client' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+        const token = jwt.sign({ id: user.id, role: 'client' }, getJwtSecret(), { expiresIn: '8h' });
         res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
     }
     catch (err) {

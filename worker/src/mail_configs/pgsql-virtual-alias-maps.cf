@@ -1,0 +1,5 @@
+user = superhost
+password = superhost_pass
+hosts = localhost
+dbname = superhost
+query = SELECT destination FROM mail_forwarders WHERE source='%s'

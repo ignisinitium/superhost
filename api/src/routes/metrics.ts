@@ -53,4 +53,68 @@ router.get('/system', authenticateAdmin, async (req, res) => {
   }
 });
 
+// --- Enterprise Monitoring Endpoints ---
+
+// Get Notification Settings
+router.get('/notifications', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM notification_settings WHERE id = 1');
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Update Notification Settings
+router.put('/notifications', authenticateAdmin, async (req, res) => {
+  const { slackWebhookUrl, telegramBotToken, telegramChatId, cpuThreshold, ramThreshold, diskThreshold, isEnabled } = req.body;
+  try {
+    const result = await query(`
+      UPDATE notification_settings 
+      SET slack_webhook_url = COALESCE($1, slack_webhook_url),
+          telegram_bot_token = COALESCE($2, telegram_bot_token),
+          telegram_chat_id = COALESCE($3, telegram_chat_id),
+          cpu_threshold = COALESCE($4, cpu_threshold),
+          ram_threshold = COALESCE($5, ram_threshold),
+          disk_threshold = COALESCE($6, disk_threshold),
+          is_enabled = COALESCE($7, is_enabled),
+          updated_at = NOW()
+      WHERE id = 1
+      RETURNING *
+    `, [slackWebhookUrl, telegramBotToken, telegramChatId, cpuThreshold, ramThreshold, diskThreshold, isEnabled]);
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Get Alert Logs
+router.get('/alerts', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM alert_log ORDER BY created_at DESC LIMIT 50');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Get Domain Traffic Stats
+router.get('/traffic', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT domain_name, 
+             SUM(bytes_sent) as sent, 
+             SUM(bytes_received) as received 
+      FROM domain_traffic_stats 
+      WHERE recorded_date >= NOW() - INTERVAL '30 days'
+      GROUP BY domain_name
+      ORDER BY sent DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 export default router;

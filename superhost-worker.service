@@ -6,7 +6,7 @@ After=network.target postgresql.service mariadb.service
 Type=simple
 User=root
 WorkingDirectory=/home/jonathan/superhost/worker
-ExecStart=/usr/bin/node --require /home/jonathan/superhost/worker/node_modules/tsx/dist/preflight.cjs --import file:///home/jonathan/superhost/worker/node_modules/tsx/dist/loader.mjs src/index.ts
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
 Environment=NODE_ENV=production
 EnvironmentFile=/home/jonathan/superhost/worker/.env
