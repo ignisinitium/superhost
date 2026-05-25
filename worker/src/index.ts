@@ -213,7 +213,7 @@ async function handleTask(task: Task) {
         await handleGetServicesStatus(task.id);
         break;
       case 'MANAGE_SERVICE':
-        await handleManageService(task.payload);
+        await handleManageService(task.id, task.payload);
         break;
       case 'GET_UPDATES':
         await handleGetUpdates(task.id);
@@ -1759,26 +1759,68 @@ async function handleFirewallUnblockIp(payload: any) {
 }
 
 async function handleGetServicesStatus(taskId: number) {
-   const services = ['nginx', 'postfix', 'dovecot', 'postgresql', 'mysql', 'bind9'];
-   const status: any = {};
-   for (const s of services) {
+  // Full list of services to probe — skips silently if not installed
+  const candidates = [
+    'nginx', 'apache2',
+    'php8.1-fpm', 'php8.2-fpm', 'php8.3-fpm', 'php8.4-fpm',
+    'mysql', 'mariadb', 'postgresql',
+    'postfix', 'dovecot', 'opendkim', 'spamassassin',
+    'bind9', 'proftpd', 'vsftpd',
+    'redis', 'memcached',
+    'clamav-daemon', 'fail2ban', 'ufw',
+    'superhost-api', 'superhost-worker',
+  ];
+
+  const result: { name: string; status: string; autostart: boolean }[] = [];
+
+  for (const svc of candidates) {
+    try {
+      const { stdout: activeOut } = await execPromise(
+        `systemctl is-active ${shellEscape(svc)} 2>/dev/null || true`
+      );
+      const activeStr = activeOut.trim();
+      if (activeStr === 'not-found' || activeStr === '') continue;
+
+      const status = activeStr === 'active' ? 'active'
+        : activeStr === 'failed' ? 'failed'
+        : 'inactive';
+
+      let autostart = false;
       try {
-         await execPromise(`systemctl is-active ${s}`);
-         status[s] = 'active';
-      } catch {
-         status[s] = 'inactive';
-      }
-   }
-   await client.query(
-      'UPDATE tasks SET status = $1, payload = payload || $2, updated_at = NOW() WHERE id = $3',
-      ['completed', JSON.stringify({ status }), taskId]
-   );
+        const { stdout: enabledOut } = await execPromise(
+          `systemctl is-enabled ${shellEscape(svc)} 2>/dev/null || true`
+        );
+        autostart = enabledOut.trim() === 'enabled';
+      } catch { /* not enabled */ }
+
+      result.push({ name: svc, status, autostart });
+    } catch { /* service not installed on this system */ }
+  }
+
+  await client.query(
+    'UPDATE tasks SET status = $1, payload = payload || $2, updated_at = NOW() WHERE id = $3',
+    ['completed', JSON.stringify({ result }), taskId]
+  );
 }
 
-async function handleManageService(payload: any) {
+async function handleManageService(taskId: number, payload: any) {
   const service = validateServiceName(payload?.service);
-  const action = validateServiceAction(payload?.action);
-  await execPromise(`sudo systemctl ${action} ${shellEscape(service)}`);
+  const action  = validateServiceAction(payload?.action);
+
+  // If restarting/stopping the worker itself, mark the task done FIRST —
+  // the process will die before the outer handler can write 'completed'.
+  const selfAffecting =
+    service === 'superhost-worker' &&
+    (action === 'restart' || action === 'stop');
+
+  if (selfAffecting) {
+    await client.query(
+      "UPDATE tasks SET status = 'completed', payload = payload || $1, updated_at = NOW() WHERE id = $2",
+      [JSON.stringify({ message: `${service} ${action} initiated` }), taskId]
+    );
+  }
+
+  await execPromise(`systemctl ${action} ${shellEscape(service)}`);
   console.log(`Service ${service} ${action} executed.`);
 }
 
