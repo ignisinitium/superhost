@@ -1,0 +1,6 @@
+driver = pgsql
+connect = host=localhost dbname=superhost user=superhost password=superhost_pass
+default_pass_scheme = CRYPT
+
+password_query = SELECT email as user, password_hash as password FROM mail_users WHERE email = '%u'
+user_query = SELECT email as user, 'vmail' as uid, 'vmail' as gid, '/var/mail/vhosts/%d/%n' as home FROM mail_users WHERE email = '%u'

@@ -1,0 +1,29 @@
+server {
+    listen 80;
+    server_name {{DOMAIN}};
+
+    root {{DOC_ROOT}};
+    index index.php index.html index.htm;
+
+    # Per-domain logging for bandwidth tracking
+    access_log /var/log/nginx/{{DOMAIN}}.access.log;
+    error_log /var/log/nginx/{{DOMAIN}}.error.log;
+
+    # Traffic Shaping
+    {{LIMIT_RATE}}
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    {{REVERSE_PROXY_BLOCK}}
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php{{PHP_VERSION}}-fpm.sock;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}

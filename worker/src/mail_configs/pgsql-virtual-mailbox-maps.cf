@@ -1,0 +1,5 @@
+user = superhost
+password = superhost_pass
+hosts = localhost
+dbname = superhost
+query = SELECT email FROM mail_users WHERE email='%s'

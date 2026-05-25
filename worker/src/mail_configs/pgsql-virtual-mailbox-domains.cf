@@ -1,0 +1,5 @@
+user = superhost
+password = superhost_pass
+hosts = localhost
+dbname = superhost
+query = SELECT domain_name FROM mail_domains WHERE domain_name='%s'
