@@ -88,6 +88,9 @@ async function handleTask(task: Task) {
       case 'DELETE_APP_RUNTIME':
         await handleDeleteAppRuntime(task.payload);
         break;
+      case 'GIT_DEPLOY':
+        await handleGitDeploy(task.payload, task.id);
+        break;
       case 'SCAN_MALWARE':
         await handleScanMalware(task.payload, task.id);
         break;
@@ -687,6 +690,34 @@ async function handleDeleteAppRuntime(payload: any) {
     console.log(`App ${appName} deleted and domain ${domainName} reverted to standard.`);
   } catch (err) {
     console.error('Failed to delete app runtime:', err);
+    throw err;
+  }
+}
+
+async function handleGitDeploy(payload: any, taskId: number) {
+  const { username, repoUrl, branch, deployPath, repoId } = payload;
+  const fullPath = path.join(`/home/${username}/public_html`, deployPath || '');
+
+  try {
+    console.log(`Starting Git deployment for ${username} at ${fullPath}...`);
+    
+    // 1. Check if .git exists
+    const hasGit = await fs.stat(path.join(fullPath, '.git')).then(() => true).catch(() => false);
+
+    if (!hasGit) {
+      // Perform initial clone
+      // We must clone into a temporary dir then move if the target is not empty
+      await execPromise(`sudo -u ${username} git clone -b ${branch || 'main'} ${repoUrl} ${fullPath}`);
+    } else {
+      // Perform pull
+      await execPromise(`sudo -u ${username} bash -c "cd ${fullPath} && git fetch --all && git reset --hard origin/${branch || 'main'}"`);
+    }
+
+    // 2. Update DB
+    await client.query('UPDATE user_git_repos SET last_deployed = NOW() WHERE id = $1', [repoId]);
+    console.log(`Git deployment successful for repo ID ${repoId}`);
+  } catch (err) {
+    console.error('Git deployment failed:', err);
     throw err;
   }
 }

@@ -20,6 +20,7 @@ import ClientAppsPage from './pages/ClientApps';
 import ClientBillingPage from './pages/ClientBilling';
 import ClientBackupsPage from './pages/ClientBackups';
 import ClientFileManager from './pages/ClientFileManager';
+import ClientGitManager from './pages/ClientGitManager';
 import SecurityPage from './pages/Security';
 import NetworkPage from './pages/Network';
 import ThemeEnginePage from './pages/ThemeEngine';
@@ -120,6 +121,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                   <Route path="email" element={<ClientEmailPage />} />
                   <Route path="apps" element={<ClientAppsPage />} />
                   <Route path="files" element={<ClientFileManager />} />
+                  <Route path="git" element={<ClientGitManager />} />
                   <Route path="billing" element={<ClientBillingPage />} />
                   <Route path="backups" element={<ClientBackupsPage />} />
                 </>
