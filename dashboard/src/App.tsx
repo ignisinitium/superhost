@@ -39,6 +39,7 @@ import ClientDnsManager from './pages/ClientDnsManager';
 import AdminDnsManager from './pages/AdminDnsManager';
 import AdminNameserversPage from './pages/AdminNameservers';
 import AdminUserWebsitesPage from './pages/AdminUserWebsites';
+import AdminUserDatabasesPage from './pages/AdminUserDatabases';
 import SpamDashboard from './pages/SpamDashboard';
 import AdminMonitoring from './pages/AdminMonitoring';
 import ResellerManager from './pages/ResellerManager';
@@ -186,6 +187,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="users" element={<UsersPage />} />
                     <Route path="users/:id/settings" element={<UserSettingsPage />} />
                     <Route path="users/:id/websites" element={<AdminUserWebsitesPage />} />
+                    <Route path="users/:id/databases" element={<AdminUserDatabasesPage />} />
                     <Route path="packages" element={<PackagesPage />} />
                     <Route path="databases" element={<DatabasesPage />} />
                     <Route path="domains" element={<DomainsPage />} />

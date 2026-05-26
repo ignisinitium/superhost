@@ -137,6 +137,9 @@ async function handleTask(task: Task) {
       case 'DELETE_DATABASE':
         await handleDeleteDatabase(task.payload);
         break;
+      case 'CHANGE_DB_PASSWORD':
+        await handleChangeDbPassword(task.payload);
+        break;
       case 'GENERATE_EMAIL_DNS':
         await handleGenerateEmailDns(task.payload);
         break;
@@ -638,6 +641,25 @@ async function handleCreateDatabase(payload: any) {
   } catch (err) {
     console.error(`Error creating database ${dbName}:`, err);
     throw err;
+  } finally {
+    await connection.end();
+  }
+}
+
+async function handleChangeDbPassword(payload: any) {
+  const { dbUser, newPassword } = payload;
+  if (!dbUser || !newPassword) throw new Error('dbUser and newPassword are required');
+
+  const safeName = validateMysqlIdentifier(dbUser);
+  const connection = await mysql.createConnection({
+    host: 'localhost',
+    user: process.env.DB_ADMIN_USER || 'superhost_worker',
+    password: process.env.DB_ADMIN_PASS || 'worker_db_pass',
+  });
+  try {
+    await connection.query(`ALTER USER '${safeName}'@'localhost' IDENTIFIED BY ?`, [newPassword]);
+    await connection.query('FLUSH PRIVILEGES');
+    console.log(`Password changed for database user ${safeName}.`);
   } finally {
     await connection.end();
   }

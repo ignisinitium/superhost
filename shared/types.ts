@@ -80,6 +80,15 @@ export interface DnsRecord {
   created_at: string;
 }
 
+export interface Database {
+  id: number;
+  user_id: number;
+  db_name: string;
+  db_user: string;
+  created_at: string;
+  owner_name?: string; // Joined from users table (admin view)
+}
+
 export interface MailUser {
   id: number;
   domain_id: number;

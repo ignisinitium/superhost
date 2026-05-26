@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import api from '../api/client';
-import { Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock, Globe } from 'lucide-react';
+import { Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock, Globe, Database } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 const UserSettingsPage: React.FC = () => {
@@ -66,13 +66,22 @@ const UserSettingsPage: React.FC = () => {
             <p className="text-slate-500 mt-1">Adjust account details and resource quotas.</p>
           </div>
         </div>
-        <button
-          onClick={() => navigate(`/users/${id}/websites`)}
-          className="flex items-center gap-2 bg-white border border-slate-200 hover:border-orange-300 hover:bg-orange-50 text-slate-700 hover:text-orange-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
-        >
-          <Globe size={16} />
-          Manage Websites
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => navigate(`/users/${id}/websites`)}
+            className="flex items-center gap-2 bg-white border border-slate-200 hover:border-orange-300 hover:bg-orange-50 text-slate-700 hover:text-orange-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
+          >
+            <Globe size={16} />
+            Websites
+          </button>
+          <button
+            onClick={() => navigate(`/users/${id}/databases`)}
+            className="flex items-center gap-2 bg-white border border-slate-200 hover:border-blue-300 hover:bg-blue-50 text-slate-700 hover:text-blue-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
+          >
+            <Database size={16} />
+            Databases
+          </button>
+        </div>
       </div>
 
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
