@@ -1,6 +1,6 @@
 import { Client } from 'pg';
 import dotenv from 'dotenv';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
 import fs from 'fs/promises';
@@ -1655,7 +1655,7 @@ async function start() {
   // --- System Security Log Monitor (SSH Brute Force Protection) ---
   const startAuthLogWatcher = () => {
     console.log('Starting system security log monitor...');
-    const { spawn } = require('child_process');
+    // spawn is imported at the top of the file
     const tail = spawn('sudo', ['tail', '-f', '-n', '0', '/var/log/auth.log']);
 
     tail.stdout.on('data', async (data: Buffer) => {
