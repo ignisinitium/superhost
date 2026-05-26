@@ -103,6 +103,9 @@ async function handleTask(task) {
             case 'GENERATE_EMAIL_DNS':
                 await handleGenerateEmailDns(task.payload);
                 break;
+            case 'PROVISION_WEBMAIL_VHOST':
+                await handleProvisionWebmailVhost(task.payload);
+                break;
             case 'INSTALL_WORDPRESS':
                 await handleInstallWordPress(task.payload);
                 break;
@@ -768,19 +771,111 @@ async function handleGenerateEmailDns(payload) {
         const serverIp = process.env.SERVER_IP ?? '15.235.73.176';
         await upsertRecord('A', 'mail', serverIp);
         // SPF
-        await upsertRecord('TXT', '@', 'v=spf1 mx a -all');
+        await upsertRecord('TXT', '@', `v=spf1 ip4:${serverIp} mx ~all`);
         // DKIM
         await upsertRecord('TXT', `${selector}._domainkey`, dkimRecord);
         // DMARC
         await upsertRecord('TXT', '_dmarc', 'v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r;');
         // 5. Sync BIND zone file
         await handleSyncDnsZone({ zoneId, domainName });
+        // 6. Provision webmail vhost at mail.<domain>
+        await handleProvisionWebmailVhost({ domainName });
         console.log(`Email DNS (MX, SPF, DKIM, DMARC) configured for ${domainName}`);
     }
     catch (err) {
         console.error(`Error generating email DNS for ${domainName}:`, err);
         throw err;
     }
+}
+async function handleProvisionWebmailVhost({ domainName }) {
+    const mailHost = `mail.${domainName}`;
+    const nginxConf = `/etc/nginx/sites-available/${mailHost}`;
+    const nginxLink = `/etc/nginx/sites-enabled/${mailHost}`;
+    const certPath = `/etc/letsencrypt/live/${mailHost}/fullchain.pem`;
+    // 1. Write nginx config (HTTP only first — certbot will upgrade to HTTPS)
+    const httpConf = `server {
+    listen 80;
+    server_name ${mailHost};
+
+    root /var/www/roundcube;
+    index index.php;
+
+    access_log /var/log/nginx/${mailHost}.access.log;
+    error_log  /var/log/nginx/${mailHost}.error.log;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \\.php$ {
+        fastcgi_pass unix:/var/run/php/php8.5-fpm-roundcube.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ ^/(bin|config|installer|logs|SQL|temp) {
+        deny all;
+    }
+}
+`;
+    await fs.writeFile(`/tmp/${mailHost}.nginx`, httpConf);
+    await execPromise(`sudo mv /tmp/${mailHost}.nginx ${nginxConf}`);
+    await execPromise(`sudo ln -sf ${nginxConf} ${nginxLink}`);
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+    // 2. Obtain SSL certificate via certbot
+    try {
+        const certbotRes = await execPromise(`sudo certbot certonly --nginx --non-interactive --agree-tos ` +
+            `--email hostmaster@${domainName} -d ${shellEscape(mailHost)} 2>&1`);
+        console.log(`Certbot for ${mailHost}:`, certbotRes.stdout.slice(0, 200));
+    }
+    catch (certErr) {
+        console.warn(`Certbot failed for ${mailHost} (may need DNS to propagate):`, certErr.stderr?.slice(0, 200));
+        // Leave HTTP-only config in place; can re-run later
+        return;
+    }
+    // 3. Rewrite nginx config with SSL
+    const httpsConf = `server {
+    listen 80;
+    server_name ${mailHost};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${mailHost};
+
+    ssl_certificate     ${certPath};
+    ssl_certificate_key /etc/letsencrypt/live/${mailHost}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root /var/www/roundcube;
+    index index.php;
+
+    access_log /var/log/nginx/${mailHost}.access.log;
+    error_log  /var/log/nginx/${mailHost}.error.log;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \\.php$ {
+        fastcgi_pass unix:/var/run/php/php8.5-fpm-roundcube.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ ^/(bin|config|installer|logs|SQL|temp) {
+        deny all;
+    }
+}
+`;
+    await fs.writeFile(`/tmp/${mailHost}.nginx`, httpsConf);
+    await execPromise(`sudo mv /tmp/${mailHost}.nginx ${nginxConf}`);
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+    console.log(`Webmail vhost provisioned: https://${mailHost}`);
 }
 async function handleInstallWordPress(payload) {
     const { domainName, username, dbName, dbUser, dbPassword, siteTitle, adminUser, adminPassword, adminEmail } = payload;
@@ -1022,7 +1117,23 @@ async function handleSyncDnsZone(payload) {
             const name = r.name === '@' ? '' : r.name;
             const priority = r.priority ? `\t${r.priority}` : '';
             const ttl = r.ttl ? `\t${r.ttl}` : '';
-            return `${name}${ttl}\tIN\t${r.type}${priority}\t${r.content}`;
+            // TXT records must be quoted and split into ≤255-byte chunks for BIND
+            let content = r.content;
+            if (r.type === 'TXT') {
+                // Strip any existing outer quotes before re-quoting
+                const raw = content.replace(/^"+|"+$/g, '');
+                const chunkSize = 255;
+                if (raw.length <= chunkSize) {
+                    content = `"${raw}"`;
+                }
+                else {
+                    const chunks = [];
+                    for (let i = 0; i < raw.length; i += chunkSize)
+                        chunks.push(raw.slice(i, i + chunkSize));
+                    content = '( ' + chunks.map(c => `"${c}"`).join(' ') + ' )';
+                }
+            }
+            return `${name}${ttl}\tIN\t${r.type}${priority}\t${content}`;
         }).join('\n');
         template = template.replace(/{{RECORDS}}/g, recordLines);
         // 5. Write Zone File

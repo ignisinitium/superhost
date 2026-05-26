@@ -82,6 +82,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
     opcache_enabled, redis_access, memcached_access,
     daily_backups, backup_retention_days,
     reseller_enabled, reseller_accounts,
+    static_ip,
     stripe_price_id,
   } = req.body;
 
@@ -99,7 +100,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         opcache_enabled, redis_access, memcached_access,
         daily_backups, backup_retention_days,
         reseller_enabled, reseller_accounts,
-        stripe_price_id
+        static_ip, stripe_price_id
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,
         $9,$10,$11,
@@ -112,7 +113,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         $34,$35,$36,
         $37,$38,
         $39,$40,
-        $41
+        $41,$42
       ) RETURNING *`,
       [
         name, description ?? '', price_cents ?? 0, setup_fee_cents ?? 0,
@@ -130,7 +131,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         opcache_enabled ?? true, redis_access ?? false, memcached_access ?? false,
         daily_backups ?? false, backup_retention_days ?? 7,
         reseller_enabled ?? false, reseller_accounts ?? 0,
-        stripe_price_id ?? null,
+        static_ip ?? false, stripe_price_id ?? null,
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -154,6 +155,7 @@ router.put('/products/:id', authenticateAdmin, async (req, res) => {
     opcache_enabled, redis_access, memcached_access,
     daily_backups, backup_retention_days,
     reseller_enabled, reseller_accounts,
+    static_ip,
     stripe_price_id,
   } = req.body;
 
@@ -174,8 +176,8 @@ router.put('/products/:id', authenticateAdmin, async (req, res) => {
         opcache_enabled=$34, redis_access=$35, memcached_access=$36,
         daily_backups=$37, backup_retention_days=$38,
         reseller_enabled=$39, reseller_accounts=$40,
-        stripe_price_id=$41
-      WHERE id=$42 RETURNING *`,
+        static_ip=$41, stripe_price_id=$42
+      WHERE id=$43 RETURNING *`,
       [
         name, description, price_cents, setup_fee_cents, billing_cycle,
         type, is_active, sort_order,
@@ -190,7 +192,7 @@ router.put('/products/:id', authenticateAdmin, async (req, res) => {
         opcache_enabled, redis_access, memcached_access,
         daily_backups, backup_retention_days,
         reseller_enabled, reseller_accounts,
-        stripe_price_id ?? null,
+        static_ip ?? false, stripe_price_id ?? null,
         id,
       ]
     );
@@ -207,6 +209,71 @@ router.delete('/products/:id', authenticateAdmin, async (req, res) => {
   try {
     await query('DELETE FROM products WHERE id = $1', [id]);
     res.json({ message: 'Package deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ─── USER ADD-ONS (admin) ─────────────────────────────────────────────────────
+
+// List add-ons assigned to a user
+router.get('/users/:userId/addons', authenticateAdmin, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await query(
+      `SELECT ua.id, ua.user_id, ua.product_id, ua.quantity, ua.notes, ua.created_at,
+              p.name, p.description, p.price_cents, p.billing_cycle, p.static_ip,
+              p.disk_quota_mb, p.bandwidth_gb, p.email_accounts, p.databases_allowed,
+              p.domains_allowed, p.ssh_access, p.daily_backups, p.redis_access, p.memcached_access
+       FROM user_addons ua
+       JOIN products p ON ua.product_id = p.id
+       WHERE ua.user_id = $1
+       ORDER BY p.name ASC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Assign an add-on to a user
+router.post('/users/:userId/addons', authenticateAdmin, async (req, res) => {
+  const { userId } = req.params;
+  const { productId, quantity = 1, notes } = req.body;
+  if (!productId) return res.status(400).json({ message: 'productId is required' });
+  try {
+    // Verify the product exists and is an addon type
+    const prodRes = await query(
+      `SELECT id, name FROM products WHERE id = $1 AND type = 'addon'`,
+      [productId]
+    );
+    if (prodRes.rows.length === 0)
+      return res.status(404).json({ message: 'Add-on product not found' });
+
+    const result = await query(
+      `INSERT INTO user_addons (user_id, product_id, quantity, notes)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, product_id) DO UPDATE SET quantity = $3, notes = $4
+       RETURNING *`,
+      [userId, productId, quantity, notes ?? null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Remove an add-on from a user
+router.delete('/users/:userId/addons/:addonId', authenticateAdmin, async (req, res) => {
+  const { userId, addonId } = req.params;
+  try {
+    const r = await query(
+      'DELETE FROM user_addons WHERE id = $1 AND user_id = $2 RETURNING id',
+      [addonId, userId]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ message: 'Add-on assignment not found' });
+    res.json({ message: 'Add-on removed' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

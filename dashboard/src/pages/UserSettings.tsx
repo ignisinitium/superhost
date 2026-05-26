@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import type { HostingPackage } from '../../../shared/types';
+import type { HostingPackage, UserAddon } from '../../../shared/types';
 import {
   Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock,
   Globe, Database, Box, Check, RefreshCw, ChevronRight, Network,
+  Puzzle, Plus, X,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -15,6 +16,7 @@ const fmtDisk = (mb: number) =>
 const UserSettingsPage: React.FC = () => {
   const { id } = useParams();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const [email, setEmail]               = useState('');
   const [password, setPassword]         = useState('');
@@ -32,6 +34,13 @@ const UserSettingsPage: React.FC = () => {
   const { data: packages } = useQuery<HostingPackage[]>({
     queryKey: ['packages-admin'],
     queryFn: async () => (await api.get('/billing/products/admin')).data,
+  });
+
+  // ── fetch user's current add-ons ──
+  const { data: userAddons } = useQuery<UserAddon[]>({
+    queryKey: ['user-addons', id],
+    queryFn: async () => (await api.get(`/billing/users/${id}/addons`)).data,
+    enabled: !!id,
   });
 
   useEffect(() => {
@@ -69,9 +78,32 @@ const UserSettingsPage: React.FC = () => {
     onError: (err: any) => toast.error(err.response?.data?.message || 'Update failed'),
   });
 
-  const selectedPackage = packages?.find((p) => p.id === packageId) ?? null;
-  const activePackages  = packages?.filter((p) => p.is_active) ?? [];
-  const inactivePackages = packages?.filter((p) => !p.is_active) ?? [];
+  // ── add-on mutations ──
+  const assignAddonMutation = useMutation({
+    mutationFn: async (productId: number) =>
+      (await api.post(`/billing/users/${id}/addons`, { productId })).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['user-addons', id] });
+      toast.success('Add-on assigned');
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to assign add-on'),
+  });
+
+  const removeAddonMutation = useMutation({
+    mutationFn: async (addonId: number) =>
+      (await api.delete(`/billing/users/${id}/addons/${addonId}`)).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['user-addons', id] });
+      toast.success('Add-on removed');
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to remove add-on'),
+  });
+
+  const selectedPackage  = packages?.find((p) => p.id === packageId) ?? null;
+  const activePackages   = packages?.filter((p) => p.is_active && p.type !== 'addon') ?? [];
+  const inactivePackages = packages?.filter((p) => !p.is_active && p.type !== 'addon') ?? [];
+  const availableAddons  = packages?.filter((p) => p.type === 'addon' && p.is_active) ?? [];
+  const assignedAddonIds = new Set(userAddons?.map((a) => a.product_id) ?? []);
 
   if (isLoading) return (
     <div className="p-8 text-center text-slate-400 font-medium">Loading user data…</div>
@@ -244,6 +276,107 @@ const UserSettingsPage: React.FC = () => {
             )}
           </div>
         </div>
+
+        {/* ── Add-ons (only shown when a package is selected) ── */}
+        {packageId !== null && (
+          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <div className="p-5 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
+              <Puzzle className="text-purple-500" size={20} />
+              <div>
+                <h2 className="text-lg font-bold text-slate-800">Add-ons</h2>
+                <p className="text-xs text-slate-400 mt-0.5">Supplemental features on top of the hosting plan.</p>
+              </div>
+            </div>
+
+            <div className="p-6">
+              {availableAddons.length === 0 ? (
+                <div className="text-center py-6 text-slate-400 text-sm">
+                  No add-ons defined yet.{' '}
+                  <button type="button" onClick={() => navigate('/packages')} className="text-orange-500 font-semibold hover:underline">
+                    Create one →
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {availableAddons.map((addon) => {
+                    const assigned = assignedAddonIds.has(addon.id);
+                    const userAddon = userAddons?.find((a) => a.product_id === addon.id);
+                    return (
+                      <div
+                        key={addon.id}
+                        className={`flex items-center gap-4 p-4 rounded-xl border-2 transition-all ${
+                          assigned
+                            ? 'border-purple-300 bg-purple-50/40'
+                            : 'border-slate-100 hover:border-slate-200'
+                        }`}
+                      >
+                        {/* Icon */}
+                        <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${
+                          assigned ? 'bg-purple-100' : 'bg-slate-100'
+                        }`}>
+                          <Puzzle size={16} className={assigned ? 'text-purple-500' : 'text-slate-400'} />
+                        </div>
+
+                        {/* Info */}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-slate-800 text-sm">{addon.name}</span>
+                            {addon.static_ip && (
+                              <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full">Static IP</span>
+                            )}
+                            {addon.ssh_access && (
+                              <span className="text-[10px] font-bold bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full">SSH</span>
+                            )}
+                            {addon.daily_backups && (
+                              <span className="text-[10px] font-bold bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">Backups</span>
+                            )}
+                            {addon.disk_quota_mb > 0 && (
+                              <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-full">
+                                +{addon.disk_quota_mb >= 1024 ? `${(addon.disk_quota_mb / 1024).toFixed(0)} GB` : `${addon.disk_quota_mb} MB`} disk
+                              </span>
+                            )}
+                            {addon.email_accounts > 0 && (
+                              <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-full">+{addon.email_accounts} email</span>
+                            )}
+                          </div>
+                          {addon.description && (
+                            <p className="text-xs text-slate-400 mt-0.5 line-clamp-1">{addon.description}</p>
+                          )}
+                          <p className="text-xs font-semibold text-slate-500 mt-1">
+                            ${(addon.price_cents / 100).toFixed(2)}/{addon.billing_cycle === 'monthly' ? 'mo' : addon.billing_cycle}
+                          </p>
+                        </div>
+
+                        {/* Assign / Remove button */}
+                        {assigned ? (
+                          <button
+                            type="button"
+                            onClick={() => userAddon && removeAddonMutation.mutate(userAddon.id)}
+                            disabled={removeAddonMutation.isPending}
+                            className="flex items-center gap-1.5 text-xs font-bold text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50 flex-shrink-0"
+                          >
+                            <X size={12} />
+                            Remove
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => assignAddonMutation.mutate(addon.id)}
+                            disabled={assignAddonMutation.isPending}
+                            className="flex items-center gap-1.5 text-xs font-bold text-purple-600 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50 flex-shrink-0"
+                          >
+                            <Plus size={12} />
+                            Assign
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* ── Resource Quotas ── */}
         <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">

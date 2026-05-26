@@ -163,9 +163,32 @@ export interface HostingPackage {
     backup_retention_days: number;
     reseller_enabled: boolean;
     reseller_accounts: number;
+    static_ip: boolean;
     stripe_price_id?: string;
     created_at: string;
     updated_at: string;
+}
+export interface UserAddon {
+    id: number;
+    user_id: number;
+    product_id: number;
+    quantity: number;
+    notes: string | null;
+    created_at: string;
+    name: string;
+    description: string;
+    price_cents: number;
+    billing_cycle: string;
+    static_ip: boolean;
+    disk_quota_mb: number;
+    bandwidth_gb: number;
+    email_accounts: number;
+    databases_allowed: number;
+    domains_allowed: number;
+    ssh_access: boolean;
+    daily_backups: boolean;
+    redis_access: boolean;
+    memcached_access: boolean;
 }
 export interface Invoice {
     id: number;
