@@ -146,6 +146,9 @@ async function handleTask(task: Task) {
       case 'PROVISION_WEBMAIL_VHOST':
         await handleProvisionWebmailVhost(task.payload);
         break;
+      case 'PROVISION_SSL':
+        await handleProvisionSsl(task.payload);
+        break;
       case 'INSTALL_WORDPRESS':
         await handleInstallWordPress(task.payload);
         break;
@@ -496,7 +499,9 @@ www     IN      A       ${serverIp}
     }
 
     // ── SSL certificate ───────────────────────────────────────────────────────
-    // Attempt to issue a cert; failure is non-fatal (user can trigger via dashboard)
+    // Attempt to issue a cert immediately. If DNS hasn't propagated yet (common
+    // on brand-new accounts), certbot will fail — we queue a PROVISION_SSL retry
+    // task so SSL gets provisioned once DNS is live, rather than staying HTTP-only.
     try {
       const certbotEmail = process.env.CERTBOT_EMAIL;
       if (!certbotEmail) throw new Error('CERTBOT_EMAIL not set');
@@ -506,7 +511,13 @@ www     IN      A       ${serverIp}
       await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
       console.log(`SSL certificate issued for ${domainName}`);
     } catch (sslErr) {
-      console.warn(`SSL auto-issue skipped for ${domainName} (can be triggered manually):`, sslErr);
+      console.warn(`SSL immediate issue failed for ${domainName}, queuing PROVISION_SSL retry:`, sslErr);
+      // Queue a retry — the worker will pick it up on the next poll cycle by
+      // which point DNS propagation is likely complete.
+      await client.query(
+        `INSERT INTO tasks (command, payload, status) VALUES ('PROVISION_SSL', $1, 'pending')`,
+        [JSON.stringify({ domainName })]
+      );
     }
 
     console.log(`Domain ${domainName} created pointing to ${docRoot}`);
@@ -670,6 +681,20 @@ async function handleInstallSsl(payload: any) {
 
   await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
   console.log(`SSL installed for ${domainName}`);
+}
+
+// PROVISION_SSL: queued automatically by handleCreateDomain when certbot fails
+// on initial domain creation (DNS not propagated yet). Re-runs certbot once the
+// task is picked up — by then DNS is usually live.
+async function handleProvisionSsl(payload: any) {
+  const domainName = validateDomainName(payload?.domainName);
+  const certbotEmail = process.env.CERTBOT_EMAIL;
+  if (!certbotEmail) throw new Error('CERTBOT_EMAIL environment variable is not set');
+  await execPromise(
+    `sudo certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`
+  );
+  await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
+  console.log(`SSL provisioned (retry) for ${domainName}`);
 }
 
 async function handleRestartService(payload: any) {
