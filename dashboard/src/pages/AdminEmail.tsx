@@ -5,7 +5,7 @@ import api from '../api/client';
 import {
   Mail, Plus, ArrowLeft, RefreshCw, Loader2, KeyRound, Trash2,
   AlertTriangle, Eye, EyeOff, HardDrive, Shield, ShieldOff,
-  ChevronDown, Copy, Check,
+  ChevronDown, Copy, Check, ExternalLink,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { User } from '../../../shared/types';
@@ -131,6 +131,7 @@ const AdminEmailPage: React.FC = () => {
               onEditQuota={() => setEditQuota(mb)}
               onToggleSpam={() => spamMutation.mutate({ mbId: mb.id, enabled: !mb.spam_filter_enabled })}
               onDelete={() => setDeleting(mb)}
+              onOpenWebmail={() => window.open(`/webmail/?_user=${encodeURIComponent(mb.email)}`, '_blank', 'noopener')}
             />
           ))}
         </div>
@@ -178,7 +179,8 @@ const MailboxCard: React.FC<{
   onEditQuota: () => void;
   onToggleSpam: () => void;
   onDelete: () => void;
-}> = ({ mb, onChangePassword, onEditQuota, onToggleSpam, onDelete }) => {
+  onOpenWebmail: () => void;
+}> = ({ mb, onChangePassword, onEditQuota, onToggleSpam, onDelete, onOpenWebmail }) => {
   const [copied, setCopied] = useState(false);
 
   const copyEmail = async () => {
@@ -239,6 +241,13 @@ const MailboxCard: React.FC<{
           icon={mb.spam_filter_enabled ? <ShieldOff size={13} /> : <Shield size={13} />}
           label={mb.spam_filter_enabled ? 'Disable Spam' : 'Enable Spam'}
         />
+        <button
+          onClick={onOpenWebmail}
+          title="Open in Roundcube webmail"
+          className="flex items-center gap-1.5 text-xs font-bold px-3 py-2 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-600 hover:text-sky-700 border border-sky-100 hover:border-sky-200 transition-all"
+        >
+          <ExternalLink size={13} /> Webmail
+        </button>
         <button
           onClick={onDelete}
           className="ml-auto flex items-center gap-1.5 text-xs font-bold px-3 py-2 rounded-xl bg-slate-100 hover:bg-red-50 hover:text-red-600 text-slate-400 transition-all"
