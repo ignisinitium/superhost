@@ -203,9 +203,10 @@ const UsersPage: React.FC = () => {
                     type="text"
                     className="w-full bg-white border border-slate-200 rounded-xl py-3 pl-10 pr-4 text-slate-800 focus:outline-none focus:ring-2 focus:ring-orange-500/50 focus:border-orange-500/50 transition-all text-sm font-mono"
                     value={newUsername}
-                    onChange={(e) => setNewUsername(e.target.value)}
+                    onChange={(e) => setNewUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ''))}
                     placeholder="john_doe"
-                    pattern="[a-zA-Z0-9_-]+"
+                    pattern="[a-z_][a-z0-9_-]{0,31}"
+                    title="Lowercase letters, numbers, hyphens, underscores only (max 32 chars)"
                     required
                   />
                 </div>

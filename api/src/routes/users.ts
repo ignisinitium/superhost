@@ -22,8 +22,16 @@ router.get('/', async (_req, res) => {
   }
 });
 
+const USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
 router.post('/', async (req, res) => {
   const { username, email, password, disk_limit_mb, bandwidth_limit_mb, package_id } = req.body;
+
+  if (!username || !USERNAME_RE.test(username)) {
+    res.status(400).json({ message: 'Invalid username. Must start with a lowercase letter or underscore, contain only lowercase letters, numbers, hyphens, or underscores, and be at most 32 characters.' });
+    return;
+  }
+
   const homeDir = `/home/${username}`;
 
   try {
