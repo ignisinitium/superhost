@@ -1885,19 +1885,22 @@ async function handleManageService(taskId: number, payload: any) {
 }
 
 async function handleGetBindStatus(taskId: number) {
-  const isActive = await execPromise('systemctl is-active bind9').then(r => r.stdout.trim() === 'active').catch(() => false);
-  const isEnabled = await execPromise('systemctl is-enabled bind9').then(r => r.stdout.trim() === 'enabled').catch(() => false);
+  const isActive  = await execPromise('systemctl is-active bind9').then(r => r.stdout.trim() === 'active').catch(() => false);
+  // bind9 is an alias for named.service — is-enabled returns 'alias'; treat that as enabled
+  const isEnabled = await execPromise('systemctl is-enabled bind9').then(r => ['enabled','alias'].includes(r.stdout.trim())).catch(() => false);
   let version = '';
   try {
     const { stdout } = await execPromise('named -v 2>&1 || true');
     version = stdout.trim().split('\n')[0] ?? '';
   } catch { /* bind not installed */ }
 
-  // Read zone names from named.conf.zones
+  // Read zone names from both managed file and local config
   let zones: string[] = [];
   try {
-    const { stdout } = await execPromise("grep -oP '(?<=zone \")[^\"]+' /etc/bind/named.conf.zones 2>/dev/null || true");
-    zones = stdout.trim().split('\n').filter(Boolean);
+    const { stdout } = await execPromise(
+      "grep -oP '(?<=zone \")[^\"]+' /etc/bind/named.conf.zones /etc/bind/named.conf.local 2>/dev/null || true"
+    );
+    zones = [...new Set(stdout.trim().split('\n').filter(Boolean))];
   } catch { /* ignore */ }
 
   await client.query(
