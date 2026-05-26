@@ -943,10 +943,14 @@ async function handleSyncDnsZone(payload: any) {
     
     // 3. Prepare placeholders
     const masterDomain = process.env.MASTER_DOMAIN || 'web02.qc.fyi';
+    const ns1 = process.env.NS1 || `ns3.qc.fyi`;
+    const ns2 = process.env.NS2 || `ns4.qc.fyi`;
     const serial = Math.floor(Date.now() / 1000);
-    
+
     template = template.replace(/{{TTL}}/g, zone.ttl.toString());
     template = template.replace(/{{MASTER_DOMAIN}}/g, masterDomain);
+    template = template.replace(/{{NS1}}/g, ns1);
+    template = template.replace(/{{NS2}}/g, ns2);
     template = template.replace(/{{SERIAL}}/g, serial.toString());
 
     // 4. Generate Record Lines
@@ -960,16 +964,28 @@ async function handleSyncDnsZone(payload: any) {
     template = template.replace(/{{RECORDS}}/g, recordLines);
 
     // 5. Write Zone File
+    const safeDomain = shellEscape(domainName);
     const zoneFilePath = `/etc/bind/zones/db.${domainName}`;
     await execPromise('sudo mkdir -p /etc/bind/zones');
     await fs.writeFile(`/tmp/db.${domainName}`, template);
     await execPromise(`sudo mv /tmp/db.${domainName} ${zoneFilePath}`);
 
-    // 6. Reload Bind (or rndc reload)
-    await execPromise('sudo rndc reload ' + domainName).catch(async () => {
-       // If zone not in named.conf.local, we might need to add it
-       // This is a simplified version, real implementation would manage named.conf.local
-       await execPromise('sudo systemctl reload bind9');
+    // 6. Ensure zone entry exists in named.conf.zones
+    const zonesConfPath = '/etc/bind/named.conf.zones';
+    const zoneEntry = `zone "${domainName}" { type master; file "/etc/bind/zones/db.${domainName}"; };\n`;
+    let zonesConf = '';
+    try { zonesConf = await fs.readFile(zonesConfPath, 'utf8'); } catch { /* file may not exist yet */ }
+    if (!zonesConf.includes(`zone "${domainName}"`)) {
+      await fs.appendFile(`/tmp/named.conf.zones.tmp`, zoneEntry);
+      await execPromise(`cat ${zonesConfPath} /tmp/named.conf.zones.tmp | sudo tee ${zonesConfPath} > /dev/null`);
+      await execPromise(`rm -f /tmp/named.conf.zones.tmp`);
+    }
+
+    // 7. Reload Bind
+    await execPromise(`sudo rndc reload ${safeDomain}`).catch(async () => {
+      await execPromise('sudo rndc reconfig').catch(async () => {
+        await execPromise('sudo systemctl reload bind9');
+      });
     });
 
     console.log(`DNS zone ${domainName} synchronized.`);
@@ -984,9 +1000,24 @@ async function handleRemoveDnsZone(payload: any) {
   if (!domainName) throw new Error('domainName is required');
 
   try {
+    const safeDomain = shellEscape(domainName);
     const zoneFilePath = `/etc/bind/zones/db.${domainName}`;
-    await execPromise(`sudo rm -f ${zoneFilePath}`);
-    await execPromise('sudo systemctl reload bind9');
+    await execPromise(`sudo rm -f ${shellEscape(zoneFilePath)}`);
+
+    // Remove zone entry from named.conf.zones
+    const zonesConfPath = '/etc/bind/named.conf.zones';
+    try {
+      const current = await fs.readFile(zonesConfPath, 'utf8');
+      const updated = current.split('\n')
+        .filter(line => !line.includes(`zone "${domainName}"`))
+        .join('\n');
+      await fs.writeFile(`/tmp/named.conf.zones.new`, updated);
+      await execPromise(`sudo mv /tmp/named.conf.zones.new ${zonesConfPath}`);
+    } catch { /* ignore if file missing */ }
+
+    await execPromise('sudo rndc reconfig').catch(async () => {
+      await execPromise('sudo systemctl reload bind9');
+    });
     console.log(`DNS zone ${domainName} removed.`);
   } catch (err) {
     console.error(`Failed to remove DNS zone ${domainName}:`, err);
