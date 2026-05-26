@@ -1712,10 +1712,27 @@ async function start() {
     }
   });
 
+  // Pick up any tasks that were pending before this worker started
   const res = await client.query('SELECT * FROM tasks WHERE status = \'pending\' ORDER BY created_at ASC');
   for (const task of res.rows) {
-    await handleTask(task);
+    handleTask(task).catch(err =>
+      console.error(`Unhandled startup task error for ${task.command}:`, err instanceof Error ? err.message : err)
+    );
   }
+
+  // Polling fallback — catches tasks missed if LISTEN/NOTIFY is delayed or dropped
+  setInterval(async () => {
+    try {
+      const pendingRes = await client.query("SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10");
+      for (const task of pendingRes.rows as Task[]) {
+        handleTask(task).catch(err =>
+          console.error(`Unhandled poll task error for ${task.command}:`, err instanceof Error ? err.message : err)
+        );
+      }
+    } catch (pollErr) {
+      console.error('Task poll error:', pollErr instanceof Error ? pollErr.message : pollErr);
+    }
+  }, 5000);
 }
 
 // --- Missing Handlers ---
