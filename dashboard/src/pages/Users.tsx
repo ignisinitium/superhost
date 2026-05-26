@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -87,19 +87,26 @@ const UsersPage: React.FC = () => {
                 {user.email}
               </p>
               
-              <div className="mt-6 pt-6 border-t border-slate-100 flex gap-3">
-                <button 
-                  onClick={() => navigate(`/domains?user=${user.id}`)}
-                  className="flex-1 bg-slate-50 hover:bg-orange-50 text-slate-600 hover:text-orange-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-2"
+              <div className="mt-6 pt-4 border-t border-slate-100 grid grid-cols-3 gap-2">
+                <button
+                  onClick={() => navigate(`/users/${user.id}/websites`)}
+                  className="bg-slate-50 hover:bg-orange-50 text-slate-600 hover:text-orange-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
                 >
-                  <Globe size={14} />
-                  Manage Websites
+                  <Globe size={13} />
+                  Websites
                 </button>
-                <button 
-                  onClick={() => navigate(`/users/${user.id}/settings`)}
-                  className="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-2"
+                <button
+                  onClick={() => navigate(`/users/${user.id}/databases`)}
+                  className="bg-slate-50 hover:bg-blue-50 text-slate-600 hover:text-blue-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
                 >
-                  <SettingsIcon size={14} />
+                  <Database size={13} />
+                  Databases
+                </button>
+                <button
+                  onClick={() => navigate(`/users/${user.id}/settings`)}
+                  className="bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <SettingsIcon size={13} />
                   Settings
                 </button>
               </div>
