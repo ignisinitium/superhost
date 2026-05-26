@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -106,8 +106,26 @@ const UsersPage: React.FC = () => {
                 <Mail size={14} className="text-slate-400" />
                 {user.email}
               </p>
-              
-              <div className="mt-6 pt-4 border-t border-slate-100 grid grid-cols-2 gap-2">
+
+              {/* Package badge */}
+              <div className="mt-3">
+                {(user as any).package_name ? (
+                  <button
+                    onClick={() => navigate(`/users/${user.id}/settings`)}
+                    className="inline-flex items-center gap-1.5 bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors"
+                  >
+                    <Box size={11} />
+                    {(user as any).package_name}
+                  </button>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 bg-slate-50 text-slate-400 border border-slate-100 px-2.5 py-1 rounded-lg text-[11px] font-medium">
+                    <Box size={11} />
+                    No package
+                  </span>
+                )}
+              </div>
+
+              <div className="mt-5 pt-4 border-t border-slate-100 grid grid-cols-2 gap-2">
                 <button
                   onClick={() => navigate(`/users/${user.id}/websites`)}
                   className="bg-slate-50 hover:bg-orange-50 text-slate-600 hover:text-orange-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
