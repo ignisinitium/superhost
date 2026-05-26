@@ -106,6 +106,27 @@ router.post('/enable-2fa', authenticateAdmin, async (req: AuthRequest, res) => {
   }
 });
 
+// POST /impersonate/:userId — admin-only; returns a client-scoped JWT for the target user
+router.post('/impersonate/:userId', authenticateAdmin, async (req: AuthRequest, res) => {
+  const { userId } = req.params;
+  try {
+    const userRes = await query(
+      'SELECT id, username, email FROM users WHERE id = $1',
+      [userId],
+    );
+    if (userRes.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    const user = userRes.rows[0];
+    const token = jwt.sign(
+      { id: user.id, role: 'client', impersonatedBy: req.adminId },
+      getJwtSecret(),
+      { expiresIn: '2h' },
+    );
+    res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 router.get('/profile', authenticateAdmin, async (req: AuthRequest, res) => {
   try {
     const result = await query('SELECT id, username, email, two_factor_enabled FROM admins WHERE id = $1', [req.adminId]);

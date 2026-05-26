@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import Header from './components/layout/Header';
 import Sidebar from './components/layout/Sidebar';
 import Footer from './components/layout/Footer';
@@ -40,10 +40,13 @@ import AdminDnsManager from './pages/AdminDnsManager';
 import AdminNameserversPage from './pages/AdminNameservers';
 import AdminUserWebsitesPage from './pages/AdminUserWebsites';
 import AdminUserDatabasesPage from './pages/AdminUserDatabases';
+import AdminEmailPage from './pages/AdminEmail';
 import SpamDashboard from './pages/SpamDashboard';
 import AdminMonitoring from './pages/AdminMonitoring';
 import ResellerManager from './pages/ResellerManager';
 import ResellerBranding from './pages/ResellerBranding';
+import TerminalPage from './pages/Terminal';
+import AdminSpam from './pages/AdminSpam';
 
 // ---------------------------------------------------------------------------
 // JWT helpers — decode payload WITHOUT verification (verification is server-side)
@@ -115,6 +118,40 @@ const ProtectedRoute = ({ children, role }: { children: React.ReactElement; role
 };
 
 // ---------------------------------------------------------------------------
+// Impersonation banner — shown in client view when an admin is impersonating
+// ---------------------------------------------------------------------------
+const ImpersonationBanner: React.FC = () => {
+  const navigate = useNavigate();
+  const adminToken = localStorage.getItem('adminToken');
+  const impersonatedUser = localStorage.getItem('impersonatedUser');
+
+  if (!adminToken) return null;
+
+  const exit = () => {
+    localStorage.setItem('token', adminToken);
+    localStorage.removeItem('adminToken');
+    localStorage.removeItem('impersonatedUser');
+    navigate('/');
+  };
+
+  return (
+    <div className="flex items-center justify-between bg-amber-500 text-white px-5 py-2.5 text-sm font-medium shrink-0 z-40">
+      <span className="flex items-center gap-2">
+        <span className="text-base">👤</span>
+        Viewing as <strong className="font-bold">{impersonatedUser}</strong>
+        <span className="opacity-70 text-xs ml-1">— all actions are real</span>
+      </span>
+      <button
+        onClick={exit}
+        className="bg-white text-amber-700 hover:bg-amber-50 px-3 py-1 rounded-lg font-bold text-xs transition-colors shadow-sm"
+      >
+        ✕ Exit Impersonation
+      </button>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 const Layout = ({ role }: { role: 'admin' | 'client' }) => {
@@ -176,6 +213,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
 
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
         <Header toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} userRole={role} />
+        {role === 'client' && <ImpersonationBanner />}
 
         <main className="flex-1 overflow-y-auto p-4 lg:p-8 scroll-smooth flex flex-col">
           <div className="flex-1 max-w-7xl w-full mx-auto">
@@ -188,6 +226,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="users/:id/settings" element={<UserSettingsPage />} />
                     <Route path="users/:id/websites" element={<AdminUserWebsitesPage />} />
                     <Route path="users/:id/databases" element={<AdminUserDatabasesPage />} />
+                    <Route path="users/:id/email" element={<AdminEmailPage />} />
                     <Route path="packages" element={<PackagesPage />} />
                     <Route path="databases" element={<DatabasesPage />} />
                     <Route path="domains" element={<DomainsPage />} />
@@ -201,13 +240,14 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="services" element={<ServiceManagerPage />} />
                     <Route path="updates" element={<UpdatesPage />} />
                     <Route path="monitoring" element={<AdminMonitoring />} />
-                    <Route path="spam" element={<SpamDashboard mode="admin" />} />
+                    <Route path="spam" element={<AdminSpam />} />
                     <Route path="resellers" element={<ResellerManager />} />
                     <Route path="branding" element={<ResellerBranding />} />
                     <Route path="cron" element={<AdminCronManager />} />
                     <Route path="ftp" element={<AdminFtpManager />} />
                     <Route path="dns" element={<AdminDnsManager />} />
                     <Route path="nameservers" element={<AdminNameserversPage />} />
+                    <Route path="terminal" element={<TerminalPage />} />
                     <Route path="settings" element={<SettingsPage />} />
                   </>
                 ) : (

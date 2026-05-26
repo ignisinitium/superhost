@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { Mail, Plus, Trash2, Key, ShieldCheck, Copy, ArrowRight, MessageSquare, ShieldAlert } from 'lucide-react';
+import { Mail, Plus, Trash2, Key, ShieldCheck, Copy, ArrowRight, MessageSquare, ShieldAlert, Inbox } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { MailUser, MailForwarder, Domain } from '../../../shared/types';
 
@@ -30,6 +30,7 @@ const ClientEmailPage: React.FC = () => {
   const [domainId, setDomainId] = useState('');
   const [password, setPassword] = useState('');
   const [quota, setQuota] = useState('1024');
+  const [isCatchall, setIsCatchall] = useState(false);
   
   const [fwdSource, setFwdSource] = useState('');
   const [fwdDest, setFwdDest] = useState('');
@@ -73,14 +74,21 @@ const ClientEmailPage: React.FC = () => {
     enabled: !!selectedDomain && activeTab === 'security'
   });
 
+  // Derived: does the currently-selected domain already have a catchall?
+  const selectedDomainHasCatchall = useMemo(() => {
+    if (!domainId || !emails) return false;
+    return emails.some(e => String(e.domain_id) === String(domainId) && e.is_catchall);
+  }, [emails, domainId]);
+
   // Mutations
   const createEmailMutation = useMutation({
     mutationFn: async () => {
-      const res = await api.post('/client/email', { 
-        localPart, 
-        domainId: parseInt(domainId), 
+      const res = await api.post('/client/email', {
+        localPart,
+        domainId: parseInt(domainId),
         password,
-        quota: parseInt(quota)
+        quota: parseInt(quota),
+        isCatchall,
       });
       return res.data;
     },
@@ -89,6 +97,7 @@ const ClientEmailPage: React.FC = () => {
       setIsMailboxModalOpen(false);
       setLocalPart('');
       setPassword('');
+      setIsCatchall(false);
       queryClient.invalidateQueries({ queryKey: ['clientEmails'] });
     },
     onError: (err: any) => {
@@ -190,7 +199,7 @@ const ClientEmailPage: React.FC = () => {
         </div>
         <div className="flex gap-2">
            {activeTab === 'mailboxes' && (
-            <button onClick={() => setIsMailboxModalOpen(true)} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl font-bold transition-all shadow-md shadow-emerald-900/10 flex items-center gap-2 text-sm">
+            <button onClick={() => { setIsCatchall(false); setDomainId(''); setLocalPart(''); setPassword(''); setIsMailboxModalOpen(true); }} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl font-bold transition-all shadow-md shadow-emerald-900/10 flex items-center gap-2 text-sm">
               <Plus size={18} /> Create Mailbox
             </button>
            )}
@@ -235,7 +244,17 @@ const ClientEmailPage: React.FC = () => {
                   <tr><td colSpan={4} className="px-6 py-8 text-center text-slate-400">Loading...</td></tr>
                 ) : emails?.map(acc => (
                   <tr key={acc.id} className="hover:bg-slate-50/50 transition-colors group">
-                    <td className="px-6 py-4 font-bold text-slate-800 text-xs">{acc.email}</td>
+                    <td className="px-6 py-4 text-xs">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-bold text-slate-800">{acc.email}</span>
+                        {acc.is_catchall && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-violet-50 text-violet-700 border border-violet-200">
+                            <Inbox size={10} />
+                            Catchall
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td className="px-6 py-4">
                       <button 
                         onClick={() => updateMailAccountMutation.mutate({ id: acc.id, data: { spamFilterEnabled: !acc.spam_filter_enabled } })}
@@ -431,8 +450,32 @@ const ClientEmailPage: React.FC = () => {
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Quota (MB)</label>
                 <input type="number" title="quota" className="w-full border border-slate-200 rounded-xl py-3 px-4 text-sm" value={quota} onChange={e => setQuota(e.target.value)} min="1" required />
               </div>
-              <div className="pt-4 flex gap-3">
-                <button type="button" onClick={() => setIsMailboxModalOpen(false)} className="flex-1 px-4 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 text-sm">Cancel</button>
+
+              {/* Catchall option */}
+              <div className={`flex items-start gap-3 p-4 rounded-xl border transition-colors ${isCatchall ? 'bg-violet-50 border-violet-200' : 'bg-slate-50 border-slate-200'} ${selectedDomainHasCatchall ? 'opacity-60' : ''}`}>
+                <input
+                  id="catchall-checkbox"
+                  type="checkbox"
+                  className="mt-0.5 w-4 h-4 accent-violet-600 cursor-pointer disabled:cursor-not-allowed"
+                  checked={isCatchall}
+                  disabled={selectedDomainHasCatchall}
+                  onChange={e => setIsCatchall(e.target.checked)}
+                />
+                <label htmlFor="catchall-checkbox" className={`flex-1 ${selectedDomainHasCatchall ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
+                  <span className="flex items-center gap-1.5 text-sm font-bold text-slate-700">
+                    <Inbox size={14} className={isCatchall ? 'text-violet-600' : 'text-slate-400'} />
+                    Catchall mailbox
+                  </span>
+                  <p className="mt-0.5 text-[11px] text-slate-500 leading-snug">
+                    {selectedDomainHasCatchall
+                      ? 'This domain already has a catchall mailbox.'
+                      : 'All unmatched email sent to this domain will be delivered here. Only one catchall is allowed per domain.'}
+                  </p>
+                </label>
+              </div>
+
+              <div className="pt-2 flex gap-3">
+                <button type="button" onClick={() => { setIsMailboxModalOpen(false); setIsCatchall(false); }} className="flex-1 px-4 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 text-sm">Cancel</button>
                 <button type="submit" className="flex-1 px-4 py-3 rounded-xl font-bold text-white bg-emerald-600 hover:bg-emerald-700 text-sm">Create Mailbox</button>
               </div>
             </form>

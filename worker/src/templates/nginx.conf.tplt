@@ -1,6 +1,6 @@
 server {
     listen 80;
-    server_name {{DOMAIN}};
+    server_name {{DOMAIN}} www.{{DOMAIN}};
 
     root {{DOC_ROOT}};
     index index.php index.html index.htm;

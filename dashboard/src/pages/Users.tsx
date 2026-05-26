@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -12,6 +12,7 @@ const UsersPage: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [newUsername, setNewUsername] = useState('');
   const [newEmail, setNewEmail] = useState('');
+  const [impersonating, setImpersonating] = useState<number | null>(null);
 
   const { data: users, isLoading, error: queryError } = useQuery<User[]>({
     queryKey: ['users'],
@@ -41,6 +42,25 @@ const UsersPage: React.FC = () => {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     createUserMutation.mutate({ username: newUsername, email: newEmail });
+  };
+
+  const handleImpersonate = async (user: User) => {
+    setImpersonating(user.id);
+    try {
+      const res = await api.post(`/auth/impersonate/${user.id}`);
+      const { token: clientToken } = res.data as { token: string };
+      // Stash the current admin token so the banner can restore it
+      const currentToken = localStorage.getItem('token');
+      if (currentToken) localStorage.setItem('adminToken', currentToken);
+      localStorage.setItem('token', clientToken);
+      localStorage.setItem('impersonatedUser', user.username);
+      navigate('/client/');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message;
+      toast.error(msg ?? 'Failed to impersonate user');
+    } finally {
+      setImpersonating(null);
+    }
   };
 
   return (
@@ -87,7 +107,7 @@ const UsersPage: React.FC = () => {
                 {user.email}
               </p>
               
-              <div className="mt-6 pt-4 border-t border-slate-100 grid grid-cols-3 gap-2">
+              <div className="mt-6 pt-4 border-t border-slate-100 grid grid-cols-2 gap-2">
                 <button
                   onClick={() => navigate(`/users/${user.id}/websites`)}
                   className="bg-slate-50 hover:bg-orange-50 text-slate-600 hover:text-orange-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
@@ -103,11 +123,26 @@ const UsersPage: React.FC = () => {
                   Databases
                 </button>
                 <button
+                  onClick={() => navigate(`/users/${user.id}/email`)}
+                  className="bg-slate-50 hover:bg-violet-50 text-slate-600 hover:text-violet-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Mail size={13} />
+                  Email
+                </button>
+                <button
                   onClick={() => navigate(`/users/${user.id}/settings`)}
                   className="bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
                 >
                   <SettingsIcon size={13} />
                   Settings
+                </button>
+                <button
+                  onClick={() => handleImpersonate(user)}
+                  disabled={impersonating === user.id}
+                  className="col-span-2 bg-amber-50 hover:bg-amber-100 text-amber-700 hover:text-amber-800 font-semibold text-xs py-2.5 rounded-lg border border-amber-200 hover:border-amber-300 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  <LogIn size={13} />
+                  {impersonating === user.id ? 'Logging in…' : 'Impersonate'}
                 </button>
               </div>
             </div>

@@ -81,6 +81,13 @@ const UserSettingsPage: React.FC = () => {
             <Database size={16} />
             Databases
           </button>
+          <button
+            onClick={() => navigate(`/users/${id}/email`)}
+            className="flex items-center gap-2 bg-white border border-slate-200 hover:border-violet-300 hover:bg-violet-50 text-slate-700 hover:text-violet-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
+          >
+            <Mail size={16} />
+            Email
+          </button>
         </div>
       </div>
 

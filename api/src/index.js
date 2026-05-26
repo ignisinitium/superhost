@@ -38,6 +38,9 @@ import dnsRoutes from './routes/dns.js';
 import adminDnsRoutes from './routes/adminDns.js';
 import adminNameserversRoutes from './routes/adminNameservers.js';
 import resellerRoutes from './routes/reseller.js';
+import adminEmailRoutes from './routes/adminEmail.js';
+import adminSpamRoutes from './routes/adminSpam.js';
+import systemRoutes from './routes/system.js';
 dotenv.config();
 // Validate critical environment variables at startup
 if (!process.env.JWT_SECRET) {
@@ -116,6 +119,9 @@ app.use('/api/admin/ftp', adminFtpRoutes);
 app.use('/api/admin/dns', adminDnsRoutes);
 app.use('/api/admin/nameservers', adminNameserversRoutes);
 app.use('/api/admin/reseller', resellerRoutes);
+app.use('/api/admin/email', adminEmailRoutes);
+app.use('/api/admin/spam', adminSpamRoutes);
+app.use('/api/admin/system', systemRoutes);
 app.use('/api/client/files', filesRoutes);
 app.use('/api/client/git', gitRoutes);
 app.use('/api/client/cron', cronRoutes);

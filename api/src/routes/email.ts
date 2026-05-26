@@ -31,7 +31,8 @@ router.get('/', async (req: AuthRequest, res) => {
   try {
     // Get all email accounts for domains owned by this user
     const result = await query(`
-      SELECT mu.id, mu.email, md.domain_name, mu.quota 
+      SELECT mu.id, mu.domain_id, mu.email, md.domain_name, mu.quota,
+             mu.spam_filter_enabled, mu.is_catchall
       FROM mail_users mu
       JOIN mail_domains md ON mu.domain_id = md.id
       WHERE md.user_id = $1
@@ -44,7 +45,7 @@ router.get('/', async (req: AuthRequest, res) => {
 });
 
 router.post('/', async (req: AuthRequest, res) => {
-  const { localPart, domainId, password, quota = 1024 } = req.body;
+  const { localPart, domainId, password, quota = 1024, isCatchall = false } = req.body;
   const userId = req.userId!;
 
   try {
@@ -84,24 +85,43 @@ router.post('/', async (req: AuthRequest, res) => {
       mailDomainId = existingMailDomain.rows[0].id;
     }
 
-    // 3. Hash password with correct Dovecot scheme
+    // 3. If catchall requested, enforce one-per-domain before inserting
+    if (isCatchall) {
+      const existingCatchall = await query(
+        'SELECT id, email FROM mail_users WHERE domain_id = $1 AND is_catchall = TRUE',
+        [mailDomainId]
+      );
+      if (existingCatchall.rows.length > 0) {
+        return res.status(400).json({
+          message: `A catchall already exists for this domain: ${existingCatchall.rows[0].email}`
+        });
+      }
+    }
+
+    // 4. Hash password with correct Dovecot scheme
     const dovecotHash = await generateDovecotPassword(password);
 
     const result = await query(
-      'INSERT INTO mail_users (domain_id, email, password_hash, quota) VALUES ($1, $2, $3, $4) RETURNING id, email, quota',
-      [mailDomainId, fullEmail, dovecotHash, quotaNum]
+      'INSERT INTO mail_users (domain_id, email, password_hash, quota, is_catchall) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, quota, is_catchall',
+      [mailDomainId, fullEmail, dovecotHash, quotaNum, isCatchall === true]
     );
 
-    // 4. Trigger DNS record generation for email security
-    await query(
-      'INSERT INTO tasks (command, payload) VALUES ($1, $2)',
-      ['GENERATE_EMAIL_DNS', { domainId: domainId, domainName }]
-    );
+    // 5. Provision Maildir and trigger DNS + mail-server setup
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['PROVISION_MAILBOX', { email: fullEmail }]);
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['GENERATE_EMAIL_DNS', { domainId, domainName }]);
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['CONFIGURE_MAIL_SERVER', {}]);
 
     res.status(201).json(result.rows[0]);
   } catch (err) {
     if ((err as any).code === '23505') { // Unique violation
-      return res.status(400).json({ message: 'Email address already exists' });
+      // Could be duplicate email OR duplicate catchall (from partial index)
+      const msg = (err as any).constraint === 'mail_users_catchall_per_domain'
+        ? 'A catchall already exists for this domain'
+        : 'Email address already exists';
+      return res.status(400).json({ message: msg });
     }
     res.status(500).json({ message: (err as Error).message });
   }
@@ -131,6 +151,36 @@ router.delete('/:id', async (req: AuthRequest, res) => {
   }
 });
 
+// Change email password
+router.patch('/:id/password', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  const userId = req.userId!;
+
+  try {
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters' });
+    }
+
+    const verifyRes = await query(`
+      SELECT mu.id, mu.email FROM mail_users mu
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE mu.id = $1 AND md.user_id = $2
+    `, [id, userId]);
+
+    if (verifyRes.rows.length === 0) return res.status(403).json({ message: 'Access denied' });
+
+    const passwordHash = await generateDovecotPassword(password);
+
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['CHANGE_EMAIL_PASSWORD', { mailUserId: parseInt(id as string, 10), passwordHash }]);
+
+    res.json({ message: 'Password change queued' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // Update Email Account (Quota, Spam Filter)
 router.patch('/:id', async (req: AuthRequest, res) => {
   const { id } = req.params;
@@ -139,7 +189,7 @@ router.patch('/:id', async (req: AuthRequest, res) => {
 
   try {
     const verifyRes = await query(`
-      SELECT mu.id 
+      SELECT mu.id, mu.email
       FROM mail_users mu
       JOIN mail_domains md ON mu.domain_id = md.id
       WHERE mu.id = $1 AND md.user_id = $2
@@ -148,12 +198,18 @@ router.patch('/:id', async (req: AuthRequest, res) => {
     if (verifyRes.rows.length === 0) return res.status(403).json({ message: 'Access denied' });
 
     const result = await query(`
-      UPDATE mail_users 
-      SET quota = COALESCE($1, quota), 
+      UPDATE mail_users
+      SET quota = COALESCE($1, quota),
           spam_filter_enabled = COALESCE($2, spam_filter_enabled)
       WHERE id = $3
       RETURNING *
     `, [quota, spamFilterEnabled, id]);
+
+    // If quota changed, recalculate in Dovecot
+    if (quota !== undefined) {
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['APPLY_EMAIL_QUOTA', { email: verifyRes.rows[0].email }]);
+    }
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -258,10 +314,17 @@ router.post('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
     const result = await query(`
       INSERT INTO mail_autoresponders (mail_user_id, message, enabled)
       VALUES ($1, $2, $3)
-      ON CONFLICT (mail_user_id) DO UPDATE 
+      ON CONFLICT (mail_user_id) DO UPDATE
       SET message = EXCLUDED.message, enabled = EXCLUDED.enabled
       RETURNING *
     `, [mailUserId, message, enabled]);
+
+    // Get the email address so the worker can write the Sieve script
+    const userRes = await query('SELECT email FROM mail_users WHERE id = $1', [mailUserId]);
+    if (userRes.rows.length > 0) {
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['UPDATE_AUTORESPONDER', { email: userRes.rows[0].email, message, enabled }]);
+    }
 
     res.json(result.rows[0]);
   } catch (err) {

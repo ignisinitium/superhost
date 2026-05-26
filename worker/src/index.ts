@@ -179,6 +179,18 @@ async function handleTask(task: Task) {
       case 'SEND_SPAM_DIGEST':
         await handleSendSpamDigest(task.payload);
         break;
+      case 'PROVISION_MAILBOX':
+        await handleProvisionMailbox(task.payload);
+        break;
+      case 'CHANGE_EMAIL_PASSWORD':
+        await handleChangeEmailPassword(task.payload);
+        break;
+      case 'APPLY_EMAIL_QUOTA':
+        await handleApplyEmailQuota(task.payload);
+        break;
+      case 'UPDATE_AUTORESPONDER':
+        await handleUpdateAutoresponder(task.payload);
+        break;
       case 'SCAN_MALWARE':
         await handleScanMalware(task.payload, task.id);
         break;
@@ -254,6 +266,18 @@ async function handleTask(task: Task) {
       case 'UNZIP_FILE':
         await handleUnzipFile(task.payload);
         break;
+      case 'REBOOT_SERVER':
+        await handleRebootServer(task.id);
+        break;
+      case 'RESTART_WEB_SERVICES':
+        await handleRestartWebServices();
+        break;
+      case 'EXEC_COMMAND':
+        await handleExecCommand(task.payload, task.id);
+        break;
+      case 'ADMIN_BACKUP':
+        await handleAdminBackup(task.id);
+        break;
       default:
         throw new Error(`Unknown command: ${task.command}`);
     }
@@ -284,6 +308,8 @@ async function handleCreateUser(payload: any) {
     const publicHtml = `${homeDir}/public_html`;
     await execPromise(`sudo mkdir -p ${shellEscape(publicHtml)}`);
     await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(homeDir)}`);
+    // 711: owner has full access; others can traverse (needed for nginx to serve files)
+    await execPromise(`sudo chmod 711 ${shellEscape(homeDir)}`);
 
     // Detect installed PHP versions instead of hardcoding
     let phpVersion = '8.3';
@@ -346,10 +372,45 @@ async function handleCreateDomain(payload: any) {
 
   // Root strategy: All domains for this user point to their primary public_html
   const docRoot = `/home/${username}/public_html`;
-  
+
   try {
-    await execPromise(`sudo mkdir -p ${docRoot}`);
-    await execPromise(`sudo chown -R ${username}:${username} ${docRoot}`);
+    await execPromise(`sudo mkdir -p ${shellEscape(docRoot)}`);
+    await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(docRoot)}`);
+
+    // Write a default welcome page only if one does not already exist
+    const indexPath = `${docRoot}/index.html`;
+    const indexExists = await execPromise(`sudo test -f ${shellEscape(indexPath)}`).then(() => true).catch(() => false);
+    if (!indexExists) {
+      const welcomeHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to ${domainName}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 48px 56px; text-align: center; max-width: 480px; }
+    .icon { font-size: 48px; margin-bottom: 20px; }
+    h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 8px; color: #f8fafc; }
+    p { color: #94a3b8; line-height: 1.6; }
+    .domain { color: #38bdf8; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🚀</div>
+    <h1>You're live!</h1>
+    <p>Your hosting account for <span class="domain">${domainName}</span> is ready.<br>Upload your files to get started.</p>
+  </div>
+</body>
+</html>`;
+      const tempIndex = `/tmp/index_${username}.html`;
+      await fs.writeFile(tempIndex, welcomeHtml);
+      await execPromise(`sudo mv ${shellEscape(tempIndex)} ${shellEscape(indexPath)}`);
+      await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(indexPath)}`);
+      await execPromise(`sudo chmod 644 ${shellEscape(indexPath)}`);
+    }
 
     // Load template
     let template = await fs.readFile(path.join(process.cwd(), 'src/templates/nginx.conf.tplt'), 'utf8');
@@ -364,9 +425,87 @@ async function handleCreateDomain(payload: any) {
     const tempConfigPath = `/tmp/nginx_${domainName}`;
     await fs.writeFile(tempConfigPath, template);
     await execPromise(`sudo mv ${tempConfigPath} ${configPath}`);
-    await execPromise(`sudo ln -sf ${configPath} /etc/nginx/sites-enabled/`);
+    await execPromise(`sudo ln -sf ${shellEscape(configPath)} /etc/nginx/sites-enabled/`);
     await execPromise('sudo nginx -t && sudo systemctl reload nginx');
-    
+
+    // ── DNS zone ─────────────────────────────────────────────────────────────
+    // Look up the user_id from the username so we can insert the zone
+    const userRow = await client.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (userRow.rows.length > 0) {
+      const userId = userRow.rows[0].id as number;
+      const serverIp = process.env.SERVER_IP ?? '15.235.73.176';
+
+      // Upsert zone record
+      const zoneResult = await client.query<{ id: number }>(
+        `INSERT INTO dns_zones (user_id, domain_name, ttl)
+         VALUES ($1, $2, 3600)
+         ON CONFLICT (domain_name) DO UPDATE SET user_id = EXCLUDED.user_id
+         RETURNING id`,
+        [userId, domainName]
+      );
+      const zoneId = zoneResult.rows[0]!.id;
+
+      // Insert default A records (skip if already present)
+      for (const name of ['@', 'www']) {
+        await client.query(
+          `INSERT INTO dns_records (zone_id, type, name, content, ttl)
+           VALUES ($1, 'A', $2, $3, 3600)
+           ON CONFLICT DO NOTHING`,
+          [zoneId, name, serverIp]
+        );
+      }
+
+      // Write BIND zone file
+      const serial = new Date().toISOString().replace(/\D/g, '').slice(0, 10);
+      const zoneContent = `$TTL 3600
+@       IN      SOA     ns3.qc.fyi. hostmaster.qc.fyi. (
+                        ${serial}01  ; Serial (YYYYMMDDnn)
+                        3600         ; Refresh
+                        1800         ; Retry
+                        604800       ; Expire
+                        86400 )      ; Minimum TTL
+
+@       IN      NS      ns3.qc.fyi.
+@       IN      NS      ns4.qc.fyi.
+
+@       IN      A       ${serverIp}
+www     IN      A       ${serverIp}
+`;
+      const zoneFilePath = `/etc/bind/zones/db.${domainName}`;
+      const tempZonePath  = `/tmp/db_${domainName}`;
+      await fs.writeFile(tempZonePath, zoneContent);
+      await execPromise(`sudo mkdir -p /etc/bind/zones`);
+      await execPromise(`sudo mv ${shellEscape(tempZonePath)} ${shellEscape(zoneFilePath)}`);
+
+      // Register zone in named.conf.zones if not already there
+      const zonesConfPath = '/etc/bind/named.conf.zones';
+      let zonesConf = '';
+      try { zonesConf = await fs.readFile(zonesConfPath, 'utf8'); } catch { /* create fresh */ }
+      if (!zonesConf.includes(`zone "${domainName}"`)) {
+        zonesConf += `\nzone "${domainName}" { type master; file "${zoneFilePath}"; };\n`;
+        const tempZonesConf = `/tmp/named_zones_${Date.now()}`;
+        await fs.writeFile(tempZonesConf, zonesConf);
+        await execPromise(`sudo mv ${shellEscape(tempZonesConf)} ${zonesConfPath}`);
+      }
+
+      await execPromise('sudo named-checkconf && sudo systemctl reload bind9');
+      console.log(`DNS zone created for ${domainName} → ${serverIp}`);
+    }
+
+    // ── SSL certificate ───────────────────────────────────────────────────────
+    // Attempt to issue a cert; failure is non-fatal (user can trigger via dashboard)
+    try {
+      const certbotEmail = process.env.CERTBOT_EMAIL;
+      if (!certbotEmail) throw new Error('CERTBOT_EMAIL not set');
+      await execPromise(
+        `sudo certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`
+      );
+      await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
+      console.log(`SSL certificate issued for ${domainName}`);
+    } catch (sslErr) {
+      console.warn(`SSL auto-issue skipped for ${domainName} (can be triggered manually):`, sslErr);
+    }
+
     console.log(`Domain ${domainName} created pointing to ${docRoot}`);
   } catch (err) {
     console.error(`Failed to create domain ${domainName}:`, err);
@@ -696,46 +835,84 @@ async function handleGenerateEmailDns(payload: any) {
   const selector = 'default';
 
   try {
-    // 1. Generate DKIM keys
-    await execPromise(`sudo mkdir -p ${keyDir}`);
-    await execPromise(`sudo opendkim-genkey -s ${selector} -d ${domainName} -D ${keyDir}`);
-    await execPromise(`sudo chown -R opendkim:opendkim ${keyDir}`);
+    // 1. Generate DKIM keys (skip if already exist)
+    const keyExists = await execPromise(`sudo test -f ${shellEscape(`${keyDir}/${selector}.private`)}`).then(() => true).catch(() => false);
+    if (!keyExists) {
+      await execPromise(`sudo mkdir -p ${shellEscape(keyDir)}`);
+      await execPromise(`sudo opendkim-genkey -s ${shellEscape(selector)} -d ${shellEscape(domainName)} -D ${shellEscape(keyDir)}`);
+      await execPromise(`sudo chown -R opendkim:opendkim ${shellEscape(keyDir)}`);
+    }
 
-    // 2. Read the public key to construct the DNS record
-    const { stdout: pubKeyOut } = await execPromise(`sudo cat ${keyDir}/${selector}.txt`);
-    
-    // Extract the raw public key string from the formatted bind record
-    const match = pubKeyOut.match(/p=([^"]+)/);
-    const pubKey = match ? match[1] : '';
-
+    // 2. Read the public key — handle multi-line quoted BIND format
+    const { stdout: pubKeyOut } = await execPromise(`sudo cat ${shellEscape(`${keyDir}/${selector}.txt`)}`);
+    // Concatenate all quoted segments, then extract the base64 key after p=
+    const allQuoted = (pubKeyOut.match(/"([^"]*)"/g) ?? []).map(s => s.slice(1, -1)).join('');
+    const pkMatch = allQuoted.match(/p=([A-Za-z0-9+/=]+)/);
+    const pubKey = pkMatch?.[1] ?? '';
     if (!pubKey) throw new Error('Failed to parse DKIM public key');
 
     const dkimRecord = `v=DKIM1; h=sha256; k=rsa; p=${pubKey}`;
 
-    // 3. Update OpenDKIM mapping files
-    await execPromise(`sudo bash -c 'echo "${selector}._domainkey.${domainName} ${domainName}:${selector}:${keyDir}/${selector}.private" >> /etc/opendkim/KeyTable'`);
-    await execPromise(`sudo bash -c 'echo "*@${domainName} ${selector}._domainkey.${domainName}" >> /etc/opendkim/SigningTable'`);
-    await execPromise(`sudo bash -c 'grep -q "${domainName}" /etc/opendkim/TrustedHosts || echo "${domainName}" >> /etc/opendkim/TrustedHosts'`);
-    await execPromise(`sudo systemctl restart opendkim`);
+    // 3. Update OpenDKIM mapping files (avoid duplicates)
+    // Write entries via temp files to avoid any shell-quoting issues
+    const keyTableEntry = `${selector}._domainkey.${domainName} ${domainName}:${selector}:${keyDir}/${selector}.private`;
+    const signingEntry   = `*@${domainName} ${selector}._domainkey.${domainName}`;
 
-    // 4. Save SPF, DKIM, and DMARC records to database
-    await client.query('DELETE FROM domain_dns_records WHERE domain_id = $1 AND (type = \'TXT\' OR name LIKE \'_domainkey%\' OR name LIKE \'_dmarc%\')', [domainId]);
+    const tmpKT  = `/tmp/opendkim_kt_${domainName}`;
+    const tmpST  = `/tmp/opendkim_st_${domainName}`;
+    const tmpTH  = `/tmp/opendkim_th_${domainName}`;
+    await fs.writeFile(tmpKT, keyTableEntry + '\n');
+    await fs.writeFile(tmpST, signingEntry  + '\n');
+    await fs.writeFile(tmpTH, domainName    + '\n');
 
+    // Append only if the entry is not already present
+    await execPromise(`sudo grep -qF ${shellEscape(keyTableEntry)} /etc/opendkim/KeyTable   || sudo tee -a /etc/opendkim/KeyTable   < ${shellEscape(tmpKT)}   > /dev/null`);
+    await execPromise(`sudo grep -qF ${shellEscape(signingEntry)}   /etc/opendkim/SigningTable || sudo tee -a /etc/opendkim/SigningTable < ${shellEscape(tmpST)} > /dev/null`);
+    await execPromise(`sudo grep -qF ${shellEscape(domainName)}     /etc/opendkim/TrustedHosts || sudo tee -a /etc/opendkim/TrustedHosts < ${shellEscape(tmpTH)} > /dev/null`);
+    await Promise.all([fs.rm(tmpKT), fs.rm(tmpST), fs.rm(tmpTH)]).catch(() => {});
+    await execPromise('sudo systemctl restart opendkim');
+
+    // 4. Upsert DNS records into dns_records table (zone must already exist from handleCreateDomain)
+    const zoneRes = await client.query<{ id: number }>(
+      'SELECT id FROM dns_zones WHERE domain_name = $1',
+      [domainName]
+    );
+    if (zoneRes.rows.length === 0) throw new Error(`No DNS zone found for ${domainName} — create the domain first`);
+    const zoneId = zoneRes.rows[0]!.id;
+
+    // Helper: upsert a dns_record (match on zone_id + type + name)
+    const upsertRecord = async (type: string, name: string, content: string, priority?: number) => {
+      await client.query(
+        `INSERT INTO dns_records (zone_id, type, name, content, priority, ttl)
+         VALUES ($1, $2, $3, $4, $5, 3600)
+         ON CONFLICT DO NOTHING`,
+        [zoneId, type, name, content, priority ?? null]
+      );
+      // Also update if it already exists for this type+name
+      await client.query(
+        `UPDATE dns_records SET content = $1, priority = $2 WHERE zone_id = $3 AND type = $4 AND name = $5`,
+        [content, priority ?? null, zoneId, type, name]
+      );
+    };
+
+    // MX record — mail for the domain routes to mail.<domain>
+    await upsertRecord('MX', '@', `mail.${domainName}`, 10);
+    // A record for mail subdomain
+    const serverIp = process.env.SERVER_IP ?? '15.235.73.176';
+    await upsertRecord('A', 'mail', serverIp);
     // SPF
-    await client.query('INSERT INTO domain_dns_records (domain_id, type, name, content) VALUES ($1, $2, $3, $4)', 
-      [domainId, 'TXT', '@', 'v=spf1 mx a -all']);
-    
+    await upsertRecord('TXT', '@', 'v=spf1 mx a -all');
     // DKIM
-    await client.query('INSERT INTO domain_dns_records (domain_id, type, name, content) VALUES ($1, $2, $3, $4)', 
-      [domainId, 'TXT', `${selector}._domainkey`, dkimRecord]);
-
+    await upsertRecord('TXT', `${selector}._domainkey`, dkimRecord);
     // DMARC
-    await client.query('INSERT INTO domain_dns_records (domain_id, type, name, content) VALUES ($1, $2, $3, $4)', 
-      [domainId, 'TXT', '_dmarc', `v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r;`]);
+    await upsertRecord('TXT', '_dmarc', 'v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r;');
 
-    console.log(`Generated email DNS records for ${domainName}.`);
+    // 5. Sync BIND zone file
+    await handleSyncDnsZone({ zoneId, domainName });
+
+    console.log(`Email DNS (MX, SPF, DKIM, DMARC) configured for ${domainName}`);
   } catch (err) {
-    console.error(`Error generating DNS for ${domainName}:`, err);
+    console.error(`Error generating email DNS for ${domainName}:`, err);
     throw err;
   }
 }
@@ -1086,39 +1263,216 @@ async function handleRemoveDnsZone(payload: any) {
 }
 
 async function handleConfigureMailServer() {
-  console.log('Configuring mail server with advanced features...');
+  console.log('Configuring mail server...');
   try {
-    const configDir = path.join(process.cwd(), 'src/mail_configs');
-    
-    // 1. Copy Postfix PGSQL configurations
-    const postfixFiles = [
-      'pgsql-virtual-mailbox-domains.cf',
-      'pgsql-virtual-mailbox-maps.cf',
-      'pgsql-virtual-alias-maps.cf'
-    ];
+    const dbUser     = process.env.DB_USER     ?? 'superhost';
+    const dbPassword = process.env.DB_PASSWORD ?? '';
+    const dbHost     = process.env.DB_HOST     ?? 'localhost';
+    const dbName     = process.env.DB_NAME     ?? 'superhost';
 
-    for (const file of postfixFiles) {
-      await execPromise(`sudo cp ${path.join(configDir, file)} /etc/postfix/`);
-      await execPromise(`sudo chown root:postfix /etc/postfix/${file}`);
-      await execPromise(`sudo chmod 640 /etc/postfix/${file}`);
+    // 1. Generate Postfix pgsql lookup files from env vars (no hardcoded credentials)
+    const postfixConfigs: Record<string, string> = {
+      'pgsql-virtual-mailbox-domains.cf': [
+        `user = ${dbUser}`,
+        `password = ${dbPassword}`,
+        `hosts = ${dbHost}`,
+        `dbname = ${dbName}`,
+        `query = SELECT domain_name FROM mail_domains WHERE domain_name='%s'`,
+      ].join('\n'),
+      'pgsql-virtual-mailbox-maps.cf': [
+        `user = ${dbUser}`,
+        `password = ${dbPassword}`,
+        `hosts = ${dbHost}`,
+        `dbname = ${dbName}`,
+        `query = SELECT email FROM mail_users WHERE email='%s'`,
+      ].join('\n'),
+      'pgsql-virtual-alias-maps.cf': [
+        `user = ${dbUser}`,
+        `password = ${dbPassword}`,
+        `hosts = ${dbHost}`,
+        `dbname = ${dbName}`,
+        `query = SELECT destination FROM mail_forwarders WHERE source='%s'`,
+      ].join('\n'),
+      // Catchall lookup: Postfix passes '@domain.com' when no specific match found;
+      // %d extracts the domain part so we can find the designated catchall mailbox.
+      'pgsql-virtual-catchall.cf': [
+        `user = ${dbUser}`,
+        `password = ${dbPassword}`,
+        `hosts = ${dbHost}`,
+        `dbname = ${dbName}`,
+        `query = SELECT mu.email FROM mail_users mu JOIN mail_domains md ON mu.domain_id = md.id WHERE md.domain_name='%d' AND mu.is_catchall=TRUE`,
+      ].join('\n'),
+    };
+
+    for (const [filename, content] of Object.entries(postfixConfigs)) {
+      const tempPath = `/tmp/${filename}`;
+      await fs.writeFile(tempPath, content + '\n');
+      await execPromise(`sudo mv ${shellEscape(tempPath)} /etc/postfix/${filename}`);
+      await execPromise(`sudo chown root:postfix /etc/postfix/${filename}`);
+      await execPromise(`sudo chmod 640 /etc/postfix/${filename}`);
     }
 
-    // 2. Update Postfix main.cf for virtual aliases (Forwarders)
-    await execPromise(`sudo postconf -e "virtual_alias_maps = proxy:pgsql:/etc/postfix/pgsql-virtual-alias-maps.cf"`);
-    
-    // 3. Integrate SpamAssassin (using spamass-milter or similar)
-    // For this implementation, we will assume spamc/spamd is used via Postfix milter
-    await execPromise(`sudo systemctl enable spamassassin && sudo systemctl start spamassassin`);
-    
-    // 4. Restart Services
-    await execPromise(`sudo systemctl restart postfix`);
-    await execPromise(`sudo systemctl restart dovecot`);
+    // 2. Full Postfix virtual-mailbox configuration
+    const postconfSettings = [
+      'virtual_mailbox_domains = proxy:pgsql:/etc/postfix/pgsql-virtual-mailbox-domains.cf',
+      'virtual_mailbox_maps = proxy:pgsql:/etc/postfix/pgsql-virtual-mailbox-maps.cf',
+      'virtual_alias_maps = proxy:pgsql:/etc/postfix/pgsql-virtual-alias-maps.cf, proxy:pgsql:/etc/postfix/pgsql-virtual-catchall.cf',
+      'virtual_mailbox_base = /var/mail/vhosts',
+      'virtual_minimum_uid = 100',
+      'virtual_uid_maps = static:5000',
+      'virtual_gid_maps = static:5000',
+    ];
+    for (const setting of postconfSettings) {
+      await execPromise(`sudo postconf -e ${shellEscape(setting)}`);
+    }
+
+    // 3. Deploy Dovecot 2.4 SQL auth config (auth-sql.conf.ext)
+    const authSqlConf = [
+      `# Superhost-managed SQL auth — Dovecot 2.4 pgsql`,
+      `pgsql "host=${dbHost} dbname=${dbName} user=${dbUser} password=${dbPassword}" {`,
+      `}`,
+      ``,
+      `passdb sql {`,
+      `  default_password_scheme = CRYPT`,
+      `  query = SELECT email AS user, password_hash AS password \\`,
+      `    FROM mail_users WHERE email = '%{user}'`,
+      `}`,
+      ``,
+      `userdb sql {`,
+      `  query = SELECT \\`,
+      `    email AS user, \\`,
+      `    'vmail' AS uid, \\`,
+      `    'vmail' AS gid, \\`,
+      `    '/var/mail/vhosts/%{user|domain}/%{user|username}' AS home, \\`,
+      `    'maildir' AS mail_driver, \\`,
+      `    '/var/mail/vhosts/%{user|domain}/%{user|username}' AS mail_path, \\`,
+      `    CONCAT('*:bytes=', (quota * 1024 * 1024)::text) AS quota_rule \\`,
+      `    FROM mail_users WHERE email = '%{user}'`,
+      `}`,
+    ].join('\n');
+    const tempAuthSql = '/tmp/auth-sql.conf.ext';
+    await fs.writeFile(tempAuthSql, authSqlConf + '\n');
+    await execPromise(`sudo mv ${tempAuthSql} /etc/dovecot/conf.d/auth-sql.conf.ext`);
+    await execPromise('sudo chown root:dovecot /etc/dovecot/conf.d/auth-sql.conf.ext');
+    await execPromise('sudo chmod 640 /etc/dovecot/conf.d/auth-sql.conf.ext');
+
+    // 4. Write Dovecot 2.4 quota + Sieve plugin conf.d snippet
+    const dovecotPlugins = `# Superhost-managed: quota + sieve — Dovecot 2.4 syntax
+mail_plugins {
+  quota = yes
+  sieve = yes
+}
+
+sieve_script personal {
+  driver = file
+  path = ~/.dovecot.sieve
+}
+`;
+    const tempQuota = '/tmp/91-superhost-plugins.conf';
+    await fs.writeFile(tempQuota, dovecotPlugins);
+    await execPromise(`sudo mv ${tempQuota} /etc/dovecot/conf.d/91-superhost-plugins.conf`);
+    await execPromise('sudo chown root:root /etc/dovecot/conf.d/91-superhost-plugins.conf');
+
+    // 5. Ensure vmail user + /var/mail/vhosts exist
+    await execPromise(`id vmail`).catch(async () => {
+      await execPromise(`sudo groupadd -g 5000 vmail`).catch(() => {});
+      await execPromise(`sudo useradd -g vmail -u 5000 vmail -d /var/mail`);
+    });
+    await execPromise('sudo mkdir -p /var/mail/vhosts');
+    await execPromise('sudo chown -R vmail:vmail /var/mail');
+    await execPromise('sudo chmod -R 770 /var/mail');
+
+    // 6. SpamAssassin
+    await execPromise('sudo systemctl enable spamassassin').catch(() => {});
+    await execPromise('sudo systemctl start spamassassin').catch(() => {});
+
+    // 7. Restart services
+    await execPromise('sudo postfix check');
+    await execPromise('sudo systemctl restart postfix');
+    await execPromise('sudo systemctl restart dovecot');
 
     console.log('Mail server configuration updated successfully.');
   } catch (err) {
     console.error('Failed to configure mail server:', err);
     throw err;
   }
+}
+
+async function handleProvisionMailbox(payload: any) {
+  const { email } = payload as { email: string };
+  if (!email || !email.includes('@')) throw new Error('Valid email address required');
+  const [user, domain] = email.split('@') as [string, string];
+
+  const maildir = `/var/mail/vhosts/${shellEscape(domain)}/${shellEscape(user)}`;
+
+  // Create Maildir structure
+  await execPromise(`sudo mkdir -p ${maildir}/new ${maildir}/cur ${maildir}/tmp`);
+  await execPromise(`sudo chown -R vmail:vmail /var/mail/vhosts`);
+  await execPromise(`sudo chmod -R 700 ${maildir}`);
+
+  console.log(`Maildir provisioned for ${email}`);
+}
+
+async function handleChangeEmailPassword(payload: any) {
+  const { mailUserId, passwordHash } = payload as { mailUserId: number; passwordHash: string };
+  if (!mailUserId || !passwordHash) throw new Error('mailUserId and passwordHash required');
+
+  await client.query(
+    'UPDATE mail_users SET password_hash = $1 WHERE id = $2',
+    [passwordHash, mailUserId]
+  );
+  console.log(`Email password updated for mailbox ${mailUserId}`);
+}
+
+async function handleApplyEmailQuota(payload: any) {
+  const { email } = payload as { email: string };
+  if (!email) throw new Error('email required');
+
+  // Recalculate stored quota usage — non-fatal if maildir doesn't exist yet
+  await execPromise(`sudo doveadm quota recalc -u ${shellEscape(email)}`).catch((err) => {
+    console.warn(`Quota recalc skipped for ${email}: ${(err as Error).message}`);
+  });
+  console.log(`Quota applied for ${email}`);
+}
+
+async function handleUpdateAutoresponder(payload: any) {
+  const { email, message, enabled } = payload as { email: string; message: string; enabled: boolean };
+  if (!email || !email.includes('@')) throw new Error('Valid email address required');
+  const [user, domain] = email.split('@') as [string, string];
+
+  const maildirBase = `/var/mail/vhosts/${shellEscape(domain)}/${shellEscape(user)}`;
+  const sievePath   = `${maildirBase}/.dovecot.sieve`;
+
+  // Ensure maildir exists before writing sieve
+  await execPromise(`sudo mkdir -p ${maildirBase}`).catch(() => {});
+
+  if (!enabled || !message?.trim()) {
+    await execPromise(`sudo rm -f ${shellEscape(sievePath)}`).catch(() => {});
+    console.log(`Auto-responder disabled for ${email}`);
+    return;
+  }
+
+  // Escape double-quotes and backslashes for the Sieve string literal
+  const safeMsg = message.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const sieveScript = `require ["vacation"];
+
+vacation
+  :days 1
+  :subject "Auto-reply"
+  :from "${email}"
+  "${safeMsg}";
+`;
+
+  const tempSieve = `/tmp/sieve_${shellEscape(user)}_${shellEscape(domain)}.sieve`;
+  await fs.writeFile(tempSieve, sieveScript);
+  await execPromise(`sudo mv ${shellEscape(tempSieve)} ${shellEscape(sievePath)}`);
+  await execPromise(`sudo chown vmail:vmail ${shellEscape(sievePath)}`);
+  await execPromise(`sudo chmod 600 ${shellEscape(sievePath)}`);
+
+  // Compile — non-fatal, Dovecot will compile at first use if sievec is missing
+  await execPromise(`sudo sievec ${shellEscape(sievePath)}`).catch(() => {});
+
+  console.log(`Auto-responder updated for ${email}`);
 }
 
 async function handleReleaseQuarantine(payload: any) {
@@ -1992,6 +2346,95 @@ async function handleManageAutoUpdates(payload: any) {
    } else {
       await execPromise("sudo apt-get remove unattended-upgrades -y");
    }
+}
+
+// ── System action handlers ────────────────────────────────────────────────────
+
+async function handleRebootServer(taskId: number) {
+  // Mark the task completed BEFORE rebooting — the process dies with the system
+  await client.query(
+    "UPDATE tasks SET status = 'completed', payload = payload || $1, updated_at = NOW() WHERE id = $2",
+    [JSON.stringify({ message: 'Server reboot initiated' }), taskId]
+  );
+  console.warn('[REBOOT] Server reboot requested — initiating shutdown now.');
+  // Non-blocking: let the task mark finish before the kernel tears down processes
+  setTimeout(() => {
+    execPromise('sudo shutdown -r now "Reboot requested via Superhost admin panel"').catch(() => {});
+  }, 500);
+}
+
+async function handleRestartWebServices() {
+  // Restart Nginx
+  await execPromise('sudo systemctl restart nginx');
+  console.log('Nginx restarted.');
+
+  // Restart every installed PHP-FPM version (non-fatal if a version is missing)
+  const phpVersions = ['8.1', '8.2', '8.3', '8.4'];
+  for (const v of phpVersions) {
+    const svc = `php${v}-fpm`;
+    try {
+      const { stdout } = await execPromise(`systemctl is-active ${shellEscape(svc)} 2>/dev/null || true`);
+      if (stdout.trim() === 'active' || stdout.trim() === 'inactive') {
+        await execPromise(`sudo systemctl restart ${shellEscape(svc)}`);
+        console.log(`${svc} restarted.`);
+      }
+    } catch {
+      // Service not installed — skip
+    }
+  }
+}
+
+async function handleExecCommand(payload: any, taskId: number) {
+  const { command } = payload as { command?: string };
+  if (!command || typeof command !== 'string' || !command.trim()) {
+    throw new Error('command is required');
+  }
+  console.log(`[ROOT TERMINAL] Executing: ${command}`);
+
+  try {
+    const { stdout, stderr } = await execPromise(command, { timeout: 30_000 });
+    const output = stdout + (stderr ? `\nSTDERR:\n${stderr}` : '');
+    await client.query(
+      'UPDATE tasks SET payload = payload || $1 WHERE id = $2',
+      [JSON.stringify({ result: output, exitCode: 0 }), taskId]
+    );
+  } catch (err: any) {
+    // The command ran but returned a non-zero exit — treat as completed, not failed
+    const output = (err.stdout ?? '') + (err.stderr ? `\nSTDERR:\n${err.stderr}` : '');
+    await client.query(
+      'UPDATE tasks SET payload = payload || $1 WHERE id = $2',
+      [JSON.stringify({ result: output || err.message, exitCode: err.code ?? 1 }), taskId]
+    );
+  }
+}
+
+async function handleAdminBackup(taskId: number) {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const backupPath = `/root/superhost-backups/config_${ts}.tar.gz`;
+
+  await execPromise('sudo mkdir -p /root/superhost-backups');
+
+  // Archive key config directories — skip those that don't exist
+  const dirs = ['/etc/nginx', '/etc/postfix', '/etc/dovecot', '/etc/bind', '/etc/opendkim'];
+  const existingDirs: string[] = [];
+  for (const d of dirs) {
+    try {
+      await execPromise(`sudo test -d ${shellEscape(d)}`);
+      existingDirs.push(d);
+    } catch { /* not installed — skip */ }
+  }
+
+  if (existingDirs.length === 0) throw new Error('No config directories found to back up');
+
+  await execPromise(`sudo tar -czf ${shellEscape(backupPath)} ${existingDirs.map(shellEscape).join(' ')}`);
+  const { stdout: sizeOut } = await execPromise(`sudo stat -c '%s' ${shellEscape(backupPath)}`);
+  const sizeBytes = parseInt(sizeOut.trim(), 10);
+
+  await client.query(
+    'UPDATE tasks SET payload = payload || $1 WHERE id = $2',
+    [JSON.stringify({ path: backupPath, sizeBytes, dirs: existingDirs }), taskId]
+  );
+  console.log(`Admin config backup created: ${backupPath} (${sizeBytes} bytes)`);
 }
 
 start().catch(console.error);

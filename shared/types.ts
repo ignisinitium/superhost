@@ -96,6 +96,7 @@ export interface MailUser {
   quota: number;
   spam_filter_enabled: boolean;
   spam_digest_enabled: boolean;
+  is_catchall: boolean;
   created_at: string;
   domain_name?: string;
 }
