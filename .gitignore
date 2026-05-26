@@ -2,6 +2,9 @@
 .env.local
 node_modules/
 .DS_Store
-dist/
+# Compiled TS output — not the dashboard Vite build
+api/dist/
+worker/dist/
+shared/dist/
 *.js.map
 *.d.ts.map
