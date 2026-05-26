@@ -6,24 +6,22 @@ import type { AuthRequest } from '../middleware/auth.js';
 
 // Initialize Stripe (using a dummy key if not provided in env)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy_key', {
-  apiVersion: '2023-10-16' as any, // Cast to avoid TS error on older/newer versions depending on types
+  apiVersion: '2023-10-16' as any,
 });
 
 const router = express.Router();
 
 // --- PUBLIC WEBHOOK ROUTE (Do not authenticate) ---
-router.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  // Require proper Stripe configuration — never accept unverified webhook payloads
   if (!process.env.STRIPE_SECRET_KEY || !endpointSecret) {
     console.error('Stripe webhook received but STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET is not configured');
     return res.status(503).json({ message: 'Stripe webhooks not configured' });
   }
 
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(req.body, sig as string, endpointSecret);
   } catch (err: any) {
@@ -31,25 +29,25 @@ router.post('/webhook', express.raw({type: 'application/json'}), async (req, res
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle the event
   try {
     switch (event.type) {
-      case 'checkout.session.completed':
+      case 'checkout.session.completed': {
         const session = event.data.object;
-        // Fulfill the purchase (e.g., mark invoice paid, provision service)
         console.log(`Checkout session completed for ${session.customer}`);
         break;
-      case 'invoice.paid':
+      }
+      case 'invoice.paid': {
         const invoice = event.data.object;
         await query('UPDATE invoices SET status = $1, paid_at = NOW() WHERE stripe_invoice_id = $2', ['paid', invoice.id]);
         break;
-      case 'invoice.payment_failed':
+      }
+      case 'invoice.payment_failed': {
         const failedInvoice = event.data.object;
         await query('UPDATE invoices SET status = $1 WHERE stripe_invoice_id = $2', ['failed', failedInvoice.id]);
         break;
-      // ... handle other event types
+      }
       default:
-        console.log(`Unhandled event type ${event.type}`);
+        console.log(`Unhandled Stripe event type: ${event.type}`);
     }
     res.send();
   } catch (err) {
@@ -58,13 +56,82 @@ router.post('/webhook', express.raw({type: 'application/json'}), async (req, res
   }
 });
 
-// --- ADMIN ROUTES ---
+// ─── ADMIN ROUTES ────────────────────────────────────────────────────────────
+
+// List all products (admin)
+router.get('/products/admin', authenticateAdmin, async (_req, res) => {
+  try {
+    const result = await query('SELECT * FROM products ORDER BY sort_order ASC, price_cents ASC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Create a product (admin)
 router.post('/products', authenticateAdmin, async (req, res) => {
-  const { name, description, price_cents, type, stripe_price_id } = req.body;
+  const {
+    name, description, price_cents, setup_fee_cents, billing_cycle, type, is_active, sort_order,
+    disk_quota_mb, bandwidth_gb, inodes_limit,
+    domains_allowed, subdomains_allowed, addon_domains, parked_domains,
+    email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
+    spam_filter, catchall_email,
+    databases_allowed, database_users,
+    ftp_accounts, ssh_access, sftp_access,
+    ssl_included, cron_jobs, php_versions, nodejs_support, python_support, ruby_support,
+    opcache_enabled, redis_access, memcached_access,
+    daily_backups, backup_retention_days,
+    reseller_enabled, reseller_accounts,
+    stripe_price_id,
+  } = req.body;
+
   try {
     const result = await query(
-      'INSERT INTO products (name, description, price_cents, type, stripe_price_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, description, price_cents, type, stripe_price_id]
+      `INSERT INTO products (
+        name, description, price_cents, setup_fee_cents, billing_cycle, type, is_active, sort_order,
+        disk_quota_mb, bandwidth_gb, inodes_limit,
+        domains_allowed, subdomains_allowed, addon_domains, parked_domains,
+        email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
+        spam_filter, catchall_email,
+        databases_allowed, database_users,
+        ftp_accounts, ssh_access, sftp_access,
+        ssl_included, cron_jobs, php_versions, nodejs_support, python_support, ruby_support,
+        opcache_enabled, redis_access, memcached_access,
+        daily_backups, backup_retention_days,
+        reseller_enabled, reseller_accounts,
+        stripe_price_id
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,
+        $9,$10,$11,
+        $12,$13,$14,$15,
+        $16,$17,$18,$19,$20,
+        $21,$22,
+        $23,$24,
+        $25,$26,$27,
+        $28,$29,$30,$31,$32,$33,
+        $34,$35,$36,
+        $37,$38,
+        $39,$40,
+        $41
+      ) RETURNING *`,
+      [
+        name, description ?? '', price_cents ?? 0, setup_fee_cents ?? 0,
+        billing_cycle ?? 'monthly', type ?? 'hosting', is_active ?? true, sort_order ?? 0,
+        disk_quota_mb ?? 5120, bandwidth_gb ?? 100, inodes_limit ?? 250000,
+        domains_allowed ?? 1, subdomains_allowed ?? 10, addon_domains ?? 0, parked_domains ?? 5,
+        email_accounts ?? 10, email_quota_mb ?? 500, email_forwarders ?? 10,
+        email_autoresponders ?? 5, mailing_lists ?? 1,
+        spam_filter ?? true, catchall_email ?? true,
+        databases_allowed ?? 5, database_users ?? 5,
+        ftp_accounts ?? 3, ssh_access ?? false, sftp_access ?? true,
+        ssl_included ?? true, cron_jobs ?? 5,
+        php_versions ?? '8.1,8.2,8.3',
+        nodejs_support ?? false, python_support ?? false, ruby_support ?? false,
+        opcache_enabled ?? true, redis_access ?? false, memcached_access ?? false,
+        daily_backups ?? false, backup_retention_days ?? 7,
+        reseller_enabled ?? false, reseller_accounts ?? 0,
+        stripe_price_id ?? null,
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -72,22 +139,88 @@ router.post('/products', authenticateAdmin, async (req, res) => {
   }
 });
 
-router.delete('/products/:id', authenticateAdmin, async (req, res) => {
+// Update a product (admin)
+router.put('/products/:id', authenticateAdmin, async (req, res) => {
   const { id } = req.params;
+  const {
+    name, description, price_cents, setup_fee_cents, billing_cycle, type, is_active, sort_order,
+    disk_quota_mb, bandwidth_gb, inodes_limit,
+    domains_allowed, subdomains_allowed, addon_domains, parked_domains,
+    email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
+    spam_filter, catchall_email,
+    databases_allowed, database_users,
+    ftp_accounts, ssh_access, sftp_access,
+    ssl_included, cron_jobs, php_versions, nodejs_support, python_support, ruby_support,
+    opcache_enabled, redis_access, memcached_access,
+    daily_backups, backup_retention_days,
+    reseller_enabled, reseller_accounts,
+    stripe_price_id,
+  } = req.body;
+
   try {
-    await query('DELETE FROM products WHERE id = $1', [id]);
-    res.json({ message: 'Product deleted' });
+    const result = await query(
+      `UPDATE products SET
+        name=$1, description=$2, price_cents=$3, setup_fee_cents=$4, billing_cycle=$5,
+        type=$6, is_active=$7, sort_order=$8,
+        disk_quota_mb=$9, bandwidth_gb=$10, inodes_limit=$11,
+        domains_allowed=$12, subdomains_allowed=$13, addon_domains=$14, parked_domains=$15,
+        email_accounts=$16, email_quota_mb=$17, email_forwarders=$18,
+        email_autoresponders=$19, mailing_lists=$20,
+        spam_filter=$21, catchall_email=$22,
+        databases_allowed=$23, database_users=$24,
+        ftp_accounts=$25, ssh_access=$26, sftp_access=$27,
+        ssl_included=$28, cron_jobs=$29, php_versions=$30,
+        nodejs_support=$31, python_support=$32, ruby_support=$33,
+        opcache_enabled=$34, redis_access=$35, memcached_access=$36,
+        daily_backups=$37, backup_retention_days=$38,
+        reseller_enabled=$39, reseller_accounts=$40,
+        stripe_price_id=$41
+      WHERE id=$42 RETURNING *`,
+      [
+        name, description, price_cents, setup_fee_cents, billing_cycle,
+        type, is_active, sort_order,
+        disk_quota_mb, bandwidth_gb, inodes_limit,
+        domains_allowed, subdomains_allowed, addon_domains, parked_domains,
+        email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
+        spam_filter, catchall_email,
+        databases_allowed, database_users,
+        ftp_accounts, ssh_access, sftp_access,
+        ssl_included, cron_jobs, php_versions,
+        nodejs_support, python_support, ruby_support,
+        opcache_enabled, redis_access, memcached_access,
+        daily_backups, backup_retention_days,
+        reseller_enabled, reseller_accounts,
+        stripe_price_id ?? null,
+        id,
+      ]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Package not found' });
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
 });
 
-// --- AUTHENTICATED CLIENT ROUTES ---
+// Delete a product (admin)
+router.delete('/products/:id', authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await query('DELETE FROM products WHERE id = $1', [id]);
+    res.json({ message: 'Package deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ─── AUTHENTICATED CLIENT ROUTES ─────────────────────────────────────────────
+
 router.use(authenticateClient);
 
-router.get('/products', async (req: AuthRequest, res) => {
+router.get('/products', async (_req: AuthRequest, res) => {
   try {
-    const result = await query('SELECT * FROM products ORDER BY price_cents ASC');
+    const result = await query(
+      'SELECT * FROM products WHERE is_active = TRUE ORDER BY sort_order ASC, price_cents ASC'
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -96,7 +229,10 @@ router.get('/products', async (req: AuthRequest, res) => {
 
 router.get('/invoices', async (req: AuthRequest, res) => {
   try {
-    const result = await query('SELECT * FROM invoices WHERE user_id = $1 ORDER BY created_at DESC', [req.userId]);
+    const result = await query(
+      'SELECT * FROM invoices WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.userId]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -112,21 +248,22 @@ router.post('/create-checkout-session', async (req: AuthRequest, res) => {
     if (userRes.rows.length === 0) return res.status(404).json({ message: 'User not found' });
     let { email, stripe_customer_id } = userRes.rows[0];
 
-    const prodRes = await query('SELECT name, price_cents, stripe_price_id FROM products WHERE id = $1', [productId]);
-    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
+    const prodRes = await query(
+      'SELECT name, price_cents, stripe_price_id FROM products WHERE id = $1 AND is_active = TRUE',
+      [productId]
+    );
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Package not found' });
     const product = prodRes.rows[0];
 
-    // If no Stripe API key is configured, simulate a success for the demo
+    // Demo mode
     if (!process.env.STRIPE_SECRET_KEY) {
-      // Simulate creating an invoice
       await query(
-        'INSERT INTO invoices (user_id, stripe_invoice_id, amount_cents, status) VALUES ($1, $2, $3, $4)',
-        [userId, `demo_inv_${Date.now()}`, product.price_cents, 'open']
+        'INSERT INTO invoices (user_id, product_id, stripe_invoice_id, amount_cents, status) VALUES ($1, $2, $3, $4, $5)',
+        [userId, productId, `demo_inv_${Date.now()}`, product.price_cents, 'open']
       );
       return res.json({ url: '/client/billing?success=demo' });
     }
 
-    // Real Stripe Integration
     if (!stripe_customer_id) {
       const customer = await stripe.customers.create({ email });
       stripe_customer_id = customer.id;
@@ -135,15 +272,10 @@ router.post('/create-checkout-session', async (req: AuthRequest, res) => {
 
     const session = await stripe.checkout.sessions.create({
       customer: stripe_customer_id,
-      line_items: [
-        {
-          price: product.stripe_price_id, // Requires actual Stripe Price ID in DB
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: product.stripe_price_id, quantity: 1 }],
       mode: 'subscription',
-      success_url: `https://${process.env.RP_ID || 'web02.qc.fyi'}/client/billing?success=true`,
-      cancel_url: `https://${process.env.RP_ID || 'web02.qc.fyi'}/client/billing?canceled=true`,
+      success_url: `https://${process.env.RP_ID || 'localhost'}/client/billing?success=true`,
+      cancel_url: `https://${process.env.RP_ID || 'localhost'}/client/billing?canceled=true`,
     });
 
     res.json({ url: session.url });

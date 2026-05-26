@@ -31,7 +31,7 @@ interface QuarantineItem {
   id: number;
   sender: string;
   subject: string;
-  spam_score: number;
+  spam_score: number | null;
   created_at: string;
   file_path?: string;
   mail_user_id: number;
@@ -59,23 +59,25 @@ interface AdminMailbox {
   is_catchall: boolean;
   domain_name: string;
   owner: string;
-  created_at: string;
+  created_at?: string;
 }
 
 interface User { id: number; username: string }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function scoreColor(score: number): string {
+function scoreColor(score: number | null): string {
+  if (score === null || score === undefined) return 'bg-slate-50 text-slate-500 border-slate-100';
   if (score >= 20) return 'bg-red-100 text-red-700 border-red-200';
   if (score >= 10) return 'bg-orange-100 text-orange-700 border-orange-200';
   return 'bg-amber-50 text-amber-700 border-amber-100';
 }
 
-function ScoreBadge({ score }: { score: number }) {
+function ScoreBadge({ score }: { score: number | null }) {
+  const s = score ?? 0;
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold font-mono border ${scoreColor(score)}`}>
-      {score.toFixed(1)}
+    <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold font-mono border ${scoreColor(s)}`}>
+      {s.toFixed(1)}
     </span>
   );
 }

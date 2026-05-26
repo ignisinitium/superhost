@@ -20,7 +20,7 @@ router.get('/', async (req, res) => {
     const { userId } = req.query;
     const result = userId
       ? await query(
-          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, md.created_at,
+          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.is_catchall,
                   md.domain_name, u.username as owner
            FROM mail_users mu
            JOIN mail_domains md ON mu.domain_id = md.id
@@ -30,7 +30,7 @@ router.get('/', async (req, res) => {
           [userId]
         )
       : await query(
-          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, md.created_at,
+          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.is_catchall,
                   md.domain_name, u.username as owner
            FROM mail_users mu
            JOIN mail_domains md ON mu.domain_id = md.id

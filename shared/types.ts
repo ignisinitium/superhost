@@ -135,3 +135,83 @@ export interface MailAccessControl {
   access_type: 'allow' | 'block';
   created_at: string;
 }
+
+// -1 represents "unlimited" for any integer resource field
+export interface HostingPackage {
+  id: number;
+  name: string;
+  description: string;
+  price_cents: number;
+  setup_fee_cents: number;
+  billing_cycle: 'monthly' | 'quarterly' | 'annually' | 'onetime';
+  type: 'hosting' | 'addon' | 'domain' | 'vps' | 'reseller';
+  is_active: boolean;
+  sort_order: number;
+
+  // Storage & bandwidth
+  disk_quota_mb: number;
+  bandwidth_gb: number;
+  inodes_limit: number;
+
+  // Domains
+  domains_allowed: number;
+  subdomains_allowed: number;
+  addon_domains: number;
+  parked_domains: number;
+
+  // Email
+  email_accounts: number;
+  email_quota_mb: number;
+  email_forwarders: number;
+  email_autoresponders: number;
+  mailing_lists: number;
+  spam_filter: boolean;
+  catchall_email: boolean;
+
+  // Databases
+  databases_allowed: number;
+  database_users: number;
+
+  // FTP / SSH
+  ftp_accounts: number;
+  ssh_access: boolean;
+  sftp_access: boolean;
+
+  // Web features
+  ssl_included: boolean;
+  cron_jobs: number;
+  php_versions: string;
+  nodejs_support: boolean;
+  python_support: boolean;
+  ruby_support: boolean;
+
+  // Performance
+  opcache_enabled: boolean;
+  redis_access: boolean;
+  memcached_access: boolean;
+
+  // Backups
+  daily_backups: boolean;
+  backup_retention_days: number;
+
+  // Reseller
+  reseller_enabled: boolean;
+  reseller_accounts: number;
+
+  stripe_price_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Invoice {
+  id: number;
+  user_id: number;
+  product_id: number | null;
+  stripe_invoice_id: string | null;
+  amount_cents: number;
+  status: 'open' | 'paid' | 'failed' | 'void' | 'draft';
+  due_date: string | null;
+  paid_at: string | null;
+  notes: string | null;
+  created_at: string;
+}

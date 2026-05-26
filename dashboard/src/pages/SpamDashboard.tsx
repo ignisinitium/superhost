@@ -2,52 +2,27 @@ import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import adminApi from '../api/admin';
-import { 
-  ShieldAlert, Trash2, CheckCircle, Filter, 
+import {
+  ShieldAlert, Trash2, CheckCircle, Filter,
   Mail, UserCheck, UserX
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { MailUser, MailQuarantine, MailAccessControl } from '../../../shared/types';
 
-interface SpamDashboardProps {
-  mode?: 'admin' | 'client';
-}
-
-const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
+const SpamDashboard: React.FC = () => {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
   const [activeTab, setActiveTab] = useState<'quarantine' | 'access'>('quarantine');
-  
-  const currentApi = mode === 'admin' ? adminApi : api;
-  const apiPrefix = mode === 'admin' ? '' : '/client'; // adminApi already has /api/admin prefix
 
-  // Handle actions from Daily Digest links
-  useEffect(() => {
-    const releaseId = searchParams.get('release');
-    const deleteId = searchParams.get('delete');
-
-    if (releaseId) {
-      releaseMutation.mutate(parseInt(releaseId));
-      searchParams.delete('release');
-      setSearchParams(searchParams);
-    }
-    if (deleteId) {
-      deleteQuarantineMutation.mutate(parseInt(deleteId));
-      searchParams.delete('delete');
-      setSearchParams(searchParams);
-    }
-  }, [searchParams]);
-  
   // Access Control Form
   const [newPattern, setNewPattern] = useState('');
   const [newType, setNewType] = useState<'allow' | 'block'>('allow');
 
   const { data: mailboxes } = useQuery<MailUser[]>({
-    queryKey: mode === 'admin' ? ['adminEmails'] : ['clientEmails'],
+    queryKey: ['clientEmails'],
     queryFn: async () => {
-      const res = await currentApi.get(`${apiPrefix}/email`);
+      const res = await api.get('/client/email');
       return res.data;
     }
   });
@@ -56,7 +31,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
     queryKey: ['quarantine', selectedMailboxId],
     queryFn: async () => {
       if (!selectedMailboxId) return [];
-      const res = await currentApi.get(`${apiPrefix}/email/${selectedMailboxId}/quarantine`);
+      const res = await api.get(`/client/email/${selectedMailboxId}/quarantine`);
       return res.data;
     },
     enabled: !!selectedMailboxId
@@ -66,7 +41,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
     queryKey: ['access-control', selectedMailboxId],
     queryFn: async () => {
       if (!selectedMailboxId) return [];
-      const res = await currentApi.get(`${apiPrefix}/email/${selectedMailboxId}/access-control`);
+      const res = await api.get(`/client/email/${selectedMailboxId}/access-control`);
       return res.data;
     },
     enabled: !!selectedMailboxId
@@ -74,29 +49,31 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
 
   const releaseMutation = useMutation({
     mutationFn: async (id: number) => {
-      const res = await currentApi.post(`${apiPrefix}/email/quarantine/${id}/release`);
+      const res = await api.post(`/client/email/quarantine/${id}/release`);
       return res.data;
     },
     onSuccess: () => {
       toast.success('Email released to inbox');
       queryClient.invalidateQueries({ queryKey: ['quarantine', selectedMailboxId] });
-    }
+    },
+    onError: () => toast.error('Failed to release email'),
   });
 
   const deleteQuarantineMutation = useMutation({
     mutationFn: async (id: number) => {
-      const res = await currentApi.delete(`${apiPrefix}/email/quarantine/${id}`);
+      const res = await api.delete(`/client/email/quarantine/${id}`);
       return res.data;
     },
     onSuccess: () => {
       toast.success('Spam email deleted');
       queryClient.invalidateQueries({ queryKey: ['quarantine', selectedMailboxId] });
-    }
+    },
+    onError: () => toast.error('Failed to delete email'),
   });
 
   const addAccessRuleMutation = useMutation({
     mutationFn: async () => {
-      const res = await currentApi.post(`${apiPrefix}/email/${selectedMailboxId}/access-control`, {
+      const res = await api.post(`/client/email/${selectedMailboxId}/access-control`, {
         senderPattern: newPattern,
         accessType: newType
       });
@@ -111,7 +88,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
 
   const deleteAccessRuleMutation = useMutation({
     mutationFn: async (id: number) => {
-      const res = await currentApi.delete(`${apiPrefix}/email/${selectedMailboxId}/access-control/${id}`);
+      const res = await api.delete(`/client/email/${selectedMailboxId}/access-control/${id}`);
       return res.data;
     },
     onSuccess: () => {
@@ -119,6 +96,25 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
       queryClient.invalidateQueries({ queryKey: ['access-control', selectedMailboxId] });
     }
   });
+
+  // Handle one-click actions from Daily Digest email links (?release=N or ?delete=N)
+  useEffect(() => {
+    const releaseId = searchParams.get('release');
+    const deleteId = searchParams.get('delete');
+    if (!releaseId && !deleteId) return;
+
+    const next = new URLSearchParams(searchParams);
+    if (releaseId) {
+      releaseMutation.mutate(parseInt(releaseId, 10));
+      next.delete('release');
+    }
+    if (deleteId) {
+      deleteQuarantineMutation.mutate(parseInt(deleteId, 10));
+      next.delete('delete');
+    }
+    setSearchParams(next, { replace: true });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount only
 
   return (
     <div className="max-w-6xl mx-auto space-y-6 animate-in fade-in duration-500">
@@ -130,7 +126,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
           </h1>
           <p className="text-slate-500 mt-1 ml-1">Quarantine, Whitelists, and Blacklists for your email accounts.</p>
         </div>
-        <select 
+        <select
           className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold text-slate-700 outline-none shadow-sm focus:ring-2 focus:ring-orange-500/20"
           value={selectedMailboxId}
           onChange={(e) => setSelectedMailboxId(e.target.value)}
@@ -180,8 +176,8 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
                                   <td className="px-6 py-4 font-bold text-slate-700 text-xs">{q.sender}</td>
                                   <td className="px-6 py-4 text-slate-500 text-xs truncate max-w-xs">{q.subject}</td>
                                   <td className="px-6 py-4">
-                                     <span className={`px-2 py-1 rounded text-[10px] font-mono font-bold ${q.spam_score > 10 ? 'bg-red-50 text-red-600' : 'bg-orange-50 text-orange-600'}`}>
-                                        {q.spam_score.toFixed(1)}
+                                     <span className={`px-2 py-1 rounded text-[10px] font-mono font-bold ${(q.spam_score ?? 0) > 10 ? 'bg-red-50 text-red-600' : 'bg-orange-50 text-orange-600'}`}>
+                                        {(q.spam_score ?? 0).toFixed(1)}
                                      </span>
                                   </td>
                                   <td className="px-6 py-4 text-right space-x-1">
@@ -209,8 +205,8 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
                     <div className="flex flex-col md:flex-row gap-4">
                        <div className="flex-1 space-y-1">
                           <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Sender or Domain Pattern</label>
-                          <input 
-                            type="text" 
+                          <input
+                            type="text"
                             className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-mono"
                             value={newPattern}
                             onChange={e => setNewPattern(e.target.value)}
@@ -219,7 +215,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
                        </div>
                        <div className="space-y-1">
                           <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Access Type</label>
-                          <select 
+                          <select
                             className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold text-slate-700 outline-none"
                             value={newType}
                             onChange={e => setNewType(e.target.value as 'allow' | 'block')}
@@ -228,7 +224,7 @@ const SpamDashboard: React.FC<SpamDashboardProps> = ({ mode = 'client' }) => {
                              <option value="block">Block (Blacklist)</option>
                           </select>
                        </div>
-                       <button 
+                       <button
                          onClick={() => addAccessRuleMutation.mutate()}
                          disabled={!newPattern}
                          className="self-end bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-xl font-bold transition-all shadow-md shadow-orange-900/10 text-sm disabled:opacity-50"

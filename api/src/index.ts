@@ -111,6 +111,7 @@ app.use('/api/processes', processRoutes);
 app.use('/api/logs', logRoutes);
 app.use('/api/databases', databaseRoutes);
 app.use('/api/email', emailRoutes);
+app.use('/api/client/email', emailRoutes);
 app.use('/api/apps', appsRoutes);
 app.use('/api/security', securityRoutes);
 app.use('/api/billing', billingRoutes);
