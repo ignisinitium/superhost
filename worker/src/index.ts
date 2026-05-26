@@ -95,6 +95,9 @@ async function handleTask(task: Task) {
       case 'UPDATE_DOMAIN_CONFIG':
         await handleUpdateDomainConfig(task.payload);
         break;
+      case 'DELETE_DOMAIN':
+        await handleDeleteDomain(task.payload);
+        break;
       case 'SETUP_CUSTOM_API':
         await handleSetupCustomApi(task.payload);
         break;
@@ -366,6 +369,29 @@ async function handleCreateDomain(payload: any) {
     console.error(`Failed to create domain ${domainName}:`, err);
     throw err;
   }
+}
+
+async function handleDeleteDomain(payload: any) {
+  const domainName = validateDomainName(payload?.domainName);
+  const username   = validateUsername(payload?.username);
+
+  // Remove Nginx config and reload
+  await execPromise(`sudo rm -f /etc/nginx/sites-enabled/${shellEscape(domainName)}`);
+  await execPromise(`sudo rm -f /etc/nginx/sites-available/${shellEscape(domainName)}`);
+
+  // Remove document root
+  const docRoot = `/home/${shellEscape(username)}/public_html/${shellEscape(domainName)}`;
+  await execPromise(`sudo rm -rf ${docRoot}`).catch(() => { /* ignore if already gone */ });
+
+  // Remove SSL certs if they exist
+  await execPromise(`sudo certbot delete --cert-name ${shellEscape(domainName)} --non-interactive`).catch(() => { /* ignore if no cert */ });
+
+  // Remove BIND zone file if present
+  await execPromise(`sudo rm -f /etc/bind/zones/db.${shellEscape(domainName)}`).catch(() => { /* ignore */ });
+
+  await execPromise('sudo nginx -t && sudo systemctl reload nginx').catch(() => { /* ignore reload failure */ });
+
+  console.log(`Domain ${domainName} deleted.`);
 }
 
 async function handleUpdateDomainConfig(payload: any) {

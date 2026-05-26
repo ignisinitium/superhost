@@ -9,7 +9,10 @@ router.use(authenticateAdmin);
 
 router.get('/', async (req, res) => {
   try {
-    const result = await query('SELECT d.*, u.username FROM domains d JOIN users u ON d.user_id = u.id ORDER BY d.created_at DESC');
+    const { userId } = req.query;
+    const result = userId
+      ? await query('SELECT d.*, u.username FROM domains d JOIN users u ON d.user_id = u.id WHERE d.user_id = $1 ORDER BY d.created_at DESC', [userId])
+      : await query('SELECT d.*, u.username FROM domains d JOIN users u ON d.user_id = u.id ORDER BY d.created_at DESC');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -99,6 +102,29 @@ router.post('/:id/install-ssl', async (req, res) => {
     );
 
     res.json({ message: 'SSL installation task started', taskId: taskRes.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.delete('/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const domainRes = await query(
+      'SELECT d.*, u.username FROM domains d JOIN users u ON d.user_id = u.id WHERE d.id = $1',
+      [id]
+    );
+    if (domainRes.rows.length === 0) return res.status(404).json({ message: 'Domain not found' });
+    const domain = domainRes.rows[0];
+
+    await query('DELETE FROM domains WHERE id = $1', [id]);
+
+    const taskRes = await query(
+      'INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id',
+      ['DELETE_DOMAIN', { domainName: domain.domain_name, username: domain.username }]
+    );
+
+    res.json({ message: 'Domain deleted', taskId: taskRes.rows[0].id });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

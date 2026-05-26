@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import api from '../api/client';
-import { Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock } from 'lucide-react';
+import { Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock, Globe } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 const UserSettingsPage: React.FC = () => {
@@ -53,17 +53,26 @@ const UserSettingsPage: React.FC = () => {
 
   return (
     <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in duration-500">
-      <div className="flex items-center gap-4">
-        <button 
-          onClick={() => navigate('/users')}
-          className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500"
-        >
-          <ArrowLeft size={20} />
-        </button>
-        <div>
-          <h1 className="text-2xl font-bold text-slate-800">User Settings: <span className="text-orange-600">{user?.username}</span></h1>
-          <p className="text-slate-500 mt-1">Adjust account details and resource quotas.</p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => navigate('/users')}
+            className="p-2 hover:bg-slate-100 rounded-xl transition-colors text-slate-500"
+          >
+            <ArrowLeft size={20} />
+          </button>
+          <div>
+            <h1 className="text-2xl font-bold text-slate-800">User Settings: <span className="text-orange-600">{user?.username}</span></h1>
+            <p className="text-slate-500 mt-1">Adjust account details and resource quotas.</p>
+          </div>
         </div>
+        <button
+          onClick={() => navigate(`/users/${id}/websites`)}
+          className="flex items-center gap-2 bg-white border border-slate-200 hover:border-orange-300 hover:bg-orange-50 text-slate-700 hover:text-orange-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
+        >
+          <Globe size={16} />
+          Manage Websites
+        </button>
       </div>
 
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
