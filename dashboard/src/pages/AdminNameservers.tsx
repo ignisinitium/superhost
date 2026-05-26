@@ -65,7 +65,7 @@ const AdminNameserversPage: React.FC = () => {
   const [draft, setDraft] = useState<Settings>({ ns1: '', ns2: '', master_domain: '', server_ip: '' });
   const [bindStatus, setBindStatus] = useState<BindStatus | null>(null);
   const [zones, setZones] = useState<Zone[]>([]);
-  const [loadingStatus, setLoadingStatus] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
   const [bindAction, setBindAction] = useState<string | null>(null);
 

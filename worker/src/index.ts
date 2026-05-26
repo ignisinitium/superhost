@@ -1897,8 +1897,9 @@ async function handleGetBindStatus(taskId: number) {
   // Read zone names from both managed file and local config
   let zones: string[] = [];
   try {
+    // -h suppresses filename prefix when searching multiple files
     const { stdout } = await execPromise(
-      "grep -oP '(?<=zone \")[^\"]+' /etc/bind/named.conf.zones /etc/bind/named.conf.local 2>/dev/null || true"
+      "grep -hoP '(?<=zone \")[^\"]+' /etc/bind/named.conf.zones /etc/bind/named.conf.local 2>/dev/null || true"
     );
     zones = [...new Set(stdout.trim().split('\n').filter(Boolean))];
   } catch { /* ignore */ }
