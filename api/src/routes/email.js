@@ -18,8 +18,8 @@ async function generateDovecotPassword(plainPassword) {
     }
     // bcryptjs generates $2a$ prefix; Dovecot accepts both $2a$ and $2y$
     const hash = await bcrypt.hash(plainPassword, 12);
-    // Use {BF-CRYPT} — the correct Dovecot scheme name for bcrypt
-    return `{BF-CRYPT}${hash}`;
+    // Use {BLF-CRYPT} — Dovecot's bcrypt scheme name (Blowfish-Crypt)
+    return `{BLF-CRYPT}${hash}`;
 }
 router.get('/', async (req, res) => {
     try {

@@ -9,7 +9,7 @@ router.use(authenticateAdmin);
 async function generateDovecotPassword(plain: string): Promise<string> {
   if (!plain || plain.length < 8) throw new Error('Password must be at least 8 characters');
   const hash = await bcrypt.hash(plain, 12);
-  return `{BF-CRYPT}${hash}`;
+  return `{BLF-CRYPT}${hash}`;
 }
 
 // ── List mailboxes ─────────────────────────────────────────────────────────────

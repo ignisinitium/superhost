@@ -8,7 +8,7 @@ async function generateDovecotPassword(plain) {
     if (!plain || plain.length < 8)
         throw new Error('Password must be at least 8 characters');
     const hash = await bcrypt.hash(plain, 12);
-    return `{BF-CRYPT}${hash}`;
+    return `{BLF-CRYPT}${hash}`;
 }
 // ── List mailboxes ─────────────────────────────────────────────────────────────
 // GET /api/admin/email?userId=n  — for a specific user
