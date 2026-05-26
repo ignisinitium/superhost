@@ -224,6 +224,12 @@ async function handleTask(task: Task) {
       case 'MANAGE_AUTO_UPDATES':
         await handleManageAutoUpdates(task.payload);
         break;
+      case 'GET_BIND_STATUS':
+        await handleGetBindStatus(task.id);
+        break;
+      case 'MANAGE_BIND':
+        await handleManageBind(task.id, task.payload);
+        break;
       case 'LIST_FILES':
         await handleListFiles(task.payload, task.id);
         break;
@@ -941,10 +947,16 @@ async function handleSyncDnsZone(payload: any) {
     // 2. Load Template
     let template = await fs.readFile(path.join(process.cwd(), 'src/templates/bind_zone.tplt'), 'utf8');
     
-    // 3. Prepare placeholders
-    const masterDomain = process.env.MASTER_DOMAIN || 'web02.qc.fyi';
-    const ns1 = process.env.NS1 || `ns3.qc.fyi`;
-    const ns2 = process.env.NS2 || `ns4.qc.fyi`;
+    // 3. Prepare placeholders — prefer DB settings, fall back to env
+    const settingsRes = await client.query(
+      "SELECT key, value FROM server_settings WHERE key IN ('ns1','ns2','master_domain')"
+    ).catch(() => ({ rows: [] as { key: string; value: string }[] }));
+    const dbSettings: Record<string, string> = {};
+    for (const row of settingsRes.rows) dbSettings[row.key] = row.value;
+
+    const masterDomain = dbSettings['master_domain'] ?? process.env.MASTER_DOMAIN ?? 'web02.qc.fyi';
+    const ns1 = dbSettings['ns1'] ?? process.env.NS1 ?? 'ns3.qc.fyi';
+    const ns2 = dbSettings['ns2'] ?? process.env.NS2 ?? 'ns4.qc.fyi';
     const serial = Math.floor(Date.now() / 1000);
 
     template = template.replace(/{{TTL}}/g, zone.ttl.toString());
@@ -1870,6 +1882,41 @@ async function handleManageService(taskId: number, payload: any) {
 
   await execPromise(`systemctl ${action} ${shellEscape(service)}`);
   console.log(`Service ${service} ${action} executed.`);
+}
+
+async function handleGetBindStatus(taskId: number) {
+  const isActive = await execPromise('systemctl is-active bind9').then(r => r.stdout.trim() === 'active').catch(() => false);
+  const isEnabled = await execPromise('systemctl is-enabled bind9').then(r => r.stdout.trim() === 'enabled').catch(() => false);
+  let version = '';
+  try {
+    const { stdout } = await execPromise('named -v 2>&1 || true');
+    version = stdout.trim().split('\n')[0] ?? '';
+  } catch { /* bind not installed */ }
+
+  // Read zone names from named.conf.zones
+  let zones: string[] = [];
+  try {
+    const { stdout } = await execPromise("grep -oP '(?<=zone \")[^\"]+' /etc/bind/named.conf.zones 2>/dev/null || true");
+    zones = stdout.trim().split('\n').filter(Boolean);
+  } catch { /* ignore */ }
+
+  await client.query(
+    'UPDATE tasks SET status=$1, payload=payload||$2, updated_at=NOW() WHERE id=$3',
+    ['completed', JSON.stringify({ isActive, isEnabled, version, zones }), taskId]
+  );
+}
+
+async function handleManageBind(taskId: number, payload: any) {
+  const allowed = ['start', 'stop', 'restart', 'reload'];
+  const action = payload?.action as string;
+  if (!allowed.includes(action)) throw new Error(`Invalid bind action: ${action}`);
+
+  await execPromise(`systemctl ${shellEscape(action)} bind9`);
+  const isActive = await execPromise('systemctl is-active bind9').then(r => r.stdout.trim() === 'active').catch(() => false);
+  await client.query(
+    'UPDATE tasks SET status=$1, payload=payload||$2, updated_at=NOW() WHERE id=$3',
+    ['completed', JSON.stringify({ action, isActive }), taskId]
+  );
 }
 
 async function handleGetUpdates(taskId: number) {

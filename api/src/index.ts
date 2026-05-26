@@ -36,6 +36,7 @@ import ftpRoutes from './routes/ftp.js';
 import adminFtpRoutes from './routes/adminFtp.js';
 import dnsRoutes from './routes/dns.js';
 import adminDnsRoutes from './routes/adminDns.js';
+import adminNameserversRoutes from './routes/adminNameservers.js';
 import resellerRoutes from './routes/reseller.js';
 
 dotenv.config();
@@ -122,6 +123,7 @@ app.use('/api/admin/updates', updateRoutes);
 app.use('/api/admin/cron', adminCronRoutes);
 app.use('/api/admin/ftp', adminFtpRoutes);
 app.use('/api/admin/dns', adminDnsRoutes);
+app.use('/api/admin/nameservers', adminNameserversRoutes);
 app.use('/api/admin/reseller', resellerRoutes);
 
 app.use('/api/client/files', filesRoutes);
