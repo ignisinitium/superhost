@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box, Network } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -148,8 +148,15 @@ const UsersPage: React.FC = () => {
                   Email
                 </button>
                 <button
+                  onClick={() => navigate(`/dns?user=${encodeURIComponent(user.username)}`)}
+                  className="bg-slate-50 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Network size={13} />
+                  DNS
+                </button>
+                <button
                   onClick={() => navigate(`/users/${user.id}/settings`)}
-                  className="bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
+                  className="col-span-2 bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold text-xs py-2.5 rounded-lg border border-slate-200 transition-colors flex items-center justify-center gap-1.5"
                 >
                   <SettingsIcon size={13} />
                   Settings

@@ -5,7 +5,7 @@ import api from '../api/client';
 import type { HostingPackage } from '../../../shared/types';
 import {
   Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock,
-  Globe, Database, Box, Check, RefreshCw, ChevronRight,
+  Globe, Database, Box, Check, RefreshCw, ChevronRight, Network,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -114,6 +114,12 @@ const UserSettingsPage: React.FC = () => {
             className="flex items-center gap-2 bg-white border border-slate-200 hover:border-violet-300 hover:bg-violet-50 text-slate-700 hover:text-violet-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
           >
             <Mail size={16} /> Email
+          </button>
+          <button
+            onClick={() => navigate(`/dns?user=${encodeURIComponent(user?.username ?? '')}`)}
+            className="flex items-center gap-2 bg-white border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50 text-slate-700 hover:text-indigo-600 px-4 py-2.5 rounded-xl font-bold text-sm transition-all shadow-sm"
+          >
+            <Network size={16} /> DNS
           </button>
         </div>
       </div>

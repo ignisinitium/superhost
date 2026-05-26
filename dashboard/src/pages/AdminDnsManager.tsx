@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import {
   Globe, Plus, Trash2, Edit2, User, Shield,
@@ -39,9 +40,11 @@ function CopyButton({ value }: { value: string }) {
 // ── Component ─────────────────────────────────────────────────────────────────
 const AdminDnsManager: React.FC = () => {
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
 
   const [selectedZone, setSelectedZone] = useState<(DnsZone & { username?: string }) | null>(null);
-  const [zoneSearch, setZoneSearch]     = useState('');
+  // Pre-populate search from ?user=username query param (linked from UserSettings)
+  const [zoneSearch, setZoneSearch]     = useState(searchParams.get('user') ?? '');
 
   // Zone modal
   const [isZoneModalOpen, setIsZoneModalOpen] = useState(false);
@@ -61,7 +64,7 @@ const AdminDnsManager: React.FC = () => {
   // ── Data ──────────────────────────────────────────────────────────────────
   const { data: zones = [], isLoading: isLoadingZones } = useQuery<(DnsZone & { username?: string })[]>({
     queryKey: ['adminDnsZones'],
-    queryFn: async () => (await api.get('/dns/zones')).data,
+    queryFn: async () => (await api.get('/admin/dns/zones')).data,
   });
 
   const { data: users = [] } = useQuery<{ id: number; username: string }[]>({
@@ -73,16 +76,14 @@ const AdminDnsManager: React.FC = () => {
     queryKey: ['adminDnsRecords', selectedZone?.id],
     queryFn: async () => {
       if (!selectedZone) return [];
-      // Admin uses the client DNS API scoped to the zone ID
-      // We query via admin endpoint which has no user restriction
-      return (await api.get(`/dns/zones/${selectedZone.id}/records`)).data;
+      return (await api.get(`/admin/dns/zones/${selectedZone.id}/records`)).data;
     },
     enabled: !!selectedZone,
   });
 
   // ── Mutations ─────────────────────────────────────────────────────────────
   const addZoneMutation = useMutation({
-    mutationFn: async () => (await api.post('/dns/zones', {
+    mutationFn: async () => (await api.post('/admin/dns/zones', {
       userId: newUserId ? parseInt(newUserId) : null,
       domainName: newDomain,
       ttl: parseInt(newTtl) || 3600,
@@ -97,7 +98,7 @@ const AdminDnsManager: React.FC = () => {
   });
 
   const deleteZoneMutation = useMutation({
-    mutationFn: async (id: number) => (await api.delete(`/dns/zones/${id}`)).data,
+    mutationFn: async (id: number) => (await api.delete(`/admin/dns/zones/${id}`)).data,
     onSuccess: (_, id) => {
       toast.success('DNS zone deleted');
       if (selectedZone?.id === id) setSelectedZone(null);
@@ -116,9 +117,9 @@ const AdminDnsManager: React.FC = () => {
         ttl: parseInt(rTtl) || 3600,
       };
       if (editingRecord) {
-        return (await api.put(`/dns/zones/${selectedZone?.id}/records/${editingRecord.id}`, payload)).data;
+        return (await api.put(`/admin/dns/zones/${selectedZone?.id}/records/${editingRecord.id}`, payload)).data;
       }
-      return (await api.post(`/dns/zones/${selectedZone?.id}/records`, payload)).data;
+      return (await api.post(`/admin/dns/zones/${selectedZone?.id}/records`, payload)).data;
     },
     onSuccess: () => {
       toast.success(editingRecord ? 'Record updated — syncing…' : 'Record added — syncing…');
@@ -130,13 +131,24 @@ const AdminDnsManager: React.FC = () => {
 
   const deleteRecordMutation = useMutation({
     mutationFn: async (id: number) =>
-      (await api.delete(`/dns/zones/${selectedZone?.id}/records/${id}`)).data,
+      (await api.delete(`/admin/dns/zones/${selectedZone?.id}/records/${id}`)).data,
     onSuccess: () => {
       toast.success('Record deleted');
       queryClient.invalidateQueries({ queryKey: ['adminDnsRecords', selectedZone?.id] });
     },
     onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to delete record'),
   });
+
+  // Auto-select the first zone when arriving via ?user= deep link
+  useEffect(() => {
+    const userParam = searchParams.get('user');
+    if (userParam && zones.length > 0 && !selectedZone) {
+      const match = zones.find(z =>
+        (z.username ?? '').toLowerCase() === userParam.toLowerCase()
+      );
+      if (match) setSelectedZone(match);
+    }
+  }, [zones, searchParams]);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const closeRecordModal = () => {
