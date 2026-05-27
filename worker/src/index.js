@@ -1681,9 +1681,24 @@ async function handleConfigureMailServer() {
         await execPromise('sudo chmod 640 /etc/dovecot/conf.d/auth-sql.conf.ext');
         // 4. Write Dovecot 2.4 quota + Sieve plugin conf.d snippet
         const dovecotPlugins = `# Superhost-managed: quota + sieve — Dovecot 2.4 syntax
+
+# Quota applies to all mail protocols
 mail_plugins {
   quota = yes
-  sieve = yes
+}
+
+# Sieve is a delivery-time plugin — only load during lmtp/lda, not imap
+# Loading it globally causes dlopen failure (missing delivery symbol) in imap sessions
+protocol lmtp {
+  mail_plugins {
+    sieve = yes
+  }
+}
+
+protocol lda {
+  mail_plugins {
+    sieve = yes
+  }
 }
 
 sieve_script personal {
