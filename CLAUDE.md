@@ -13,7 +13,7 @@ api/        Express API (port 3001) — runs as user `jonathan` via systemd
 worker/     Privileged daemon — runs as root via systemd, executes system commands
 dashboard/  React + Vite SPA
 shared/     TypeScript types shared across api/ and worker/
-docs/migrations/  PostgreSQL schema migrations (apply in order 001–008)
+docs/migrations/  PostgreSQL schema migrations (apply in order 001–015)
 ```
 
 ## Build & Run Commands
@@ -61,7 +61,12 @@ The central design pattern: **API creates tasks → Worker polls & executes them
 4. Worker updates the task to status='completed' or 'failed' with optional `error_message`
 5. Dashboard polls `GET /api/tasks/:id` until the task resolves
 
-This decoupling means **the API never touches the filesystem or runs shell commands** — only the worker does. All 40+ task types are handled in `worker/src/index.ts` (a single large switch/dispatch file).
+This decoupling means **the API never touches the filesystem or runs shell commands** — only the worker does. 70+ task types are handled in `worker/src/index.ts` (a single large switch/dispatch file).
+
+Worker safety mechanisms:
+- **Optimistic locking**: `UPDATE tasks SET status='processing' WHERE id=$1 AND status='pending' RETURNING id` — safe for concurrent workers
+- **5-minute timeout** wraps every task promise
+- All shell arguments pass through `shellEscape()` from `shared/sanitize.js` — never interpolate user input directly into shell strings
 
 ## Authentication Flows
 
@@ -78,8 +83,10 @@ PostgreSQL is the primary database. Apply migrations in order:
 
 ```bash
 psql -U superhost -d superhost -f docs/migrations/001_initial_schema.sql
-# ... through 008_reseller_support.sql
+# ... through 015_deleted_users.sql
 ```
+
+There are two files prefixed `009_` (`009_email_catchall.sql` and `009_security_hardening.sql`) — apply both before `010_`.
 
 The API connects via `api/src/db.ts` (connection pool). The worker has its own pool and also connects to MariaDB for client database operations. Two separate DB users:
 - `superhost` — API user (limited privileges)
@@ -106,6 +113,12 @@ case 'MY_TASK_COMMAND': {
 ```
 
 **Client resource isolation**: Client resources (domains, databases, email, etc.) are always scoped by `user_id` from the JWT. The worker prefixes MariaDB database names with the username to prevent collisions.
+
+**Recently added routes** (not yet widespread in the codebase documentation):
+- `/api/admin/apps` (`adminApps.ts`) — manage user app runtimes; queues `SETUP_APP_RUNTIME`, `MANAGE_APP_RUNTIME`, `DELETE_APP_RUNTIME`
+- `/api/admin/deleted-users` (`adminDeletedUsers.ts`) — soft-deleted account archive; queues `RESTORE_USER`, `PURGE_USER_ARCHIVE`. The `deleted_users` table (migration 015) stores a JSON snapshot of the user's domains, databases, DNS zones, and mail accounts.
+
+**`HostingPackage` limits**: a value of `-1` means unlimited. Check this when reading/writing package-gated resource caps.
 
 ## Tech Stack Details
 
