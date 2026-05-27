@@ -8,3 +8,10 @@ worker/dist/
 shared/dist/
 *.js.map
 *.d.ts.map
+
+# AI instruction / planning files
+CLAUDE.md
+GEMINI.md
+ai-instructions.md
+implementation.md
+todo.md
