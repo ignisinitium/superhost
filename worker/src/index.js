@@ -347,6 +347,7 @@ PYTHON_SUPPORT=${limits?.python_support ? 'true' : 'false'}
         await execPromise(`sudo mv ${shellEscape(envTmp)} /home/${shellEscape(username)}/.env`);
         await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} /home/${shellEscape(username)}/.env`);
         await execPromise(`sudo chmod 600 /home/${shellEscape(username)}/.env`);
+        await execPromise(`sudo setfacl -b /home/${shellEscape(username)}/.env`);
         // ── serverResources.md ───────────────────────────────────────────────────
         const nodever = (await execPromise('node --version').catch(() => ({ stdout: 'unavailable' }))).stdout.trim();
         const pyver = (await execPromise('python3 --version').catch(() => ({ stdout: 'unavailable' }))).stdout.trim();
@@ -446,6 +447,7 @@ Your app will survive reboots — PM2 saves its state after every start/stop.
         await fs.writeFile(mdTmp, resourcesMd);
         await execPromise(`sudo mv ${shellEscape(mdTmp)} /home/${shellEscape(username)}/serverResources.md`);
         await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} /home/${shellEscape(username)}/serverResources.md`);
+        await execPromise(`sudo setfacl -b /home/${shellEscape(username)}/serverResources.md`);
         // Create automatic staging subdomain
         if (!masterDomain)
             throw new Error('MASTER_DOMAIN environment variable is not set');
