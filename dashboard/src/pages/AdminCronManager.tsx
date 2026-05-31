@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import adminApi from '../api/admin';
+import api from '../api/client';
 import { 
   Clock, Plus, Trash2, Calendar, Terminal, User, Shield
 } from 'lucide-react';
@@ -45,7 +46,7 @@ const AdminCronManager: React.FC = () => {
   const { data: users } = useQuery({
     queryKey: ['users'],
     queryFn: async () => {
-      const res = await adminApi.get('/users');
+      const res = await api.get('/users');
       return res.data;
     }
   });

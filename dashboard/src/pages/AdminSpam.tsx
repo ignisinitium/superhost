@@ -5,6 +5,7 @@ import {
   AreaChart, Area, CartesianGrid,
 } from 'recharts';
 import adminApi from '../api/admin';
+import api from '../api/client';
 import {
   ShieldAlert, Trash2, CheckCircle2, Filter, Mail,
   TrendingDown, AlertTriangle, Search, RefreshCw, Send,
@@ -345,7 +346,7 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
 
   const { data: users } = useQuery<User[]>({
     queryKey: ['users'],
-    queryFn: async () => (await adminApi.get('/../users')).data,
+    queryFn: async () => (await api.get('/users')).data,
   });
 
   const { data, isLoading, refetch } = useQuery<{ items: QuarantineItem[]; total: number }>({

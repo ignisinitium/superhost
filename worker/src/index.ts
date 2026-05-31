@@ -1919,6 +1919,8 @@ async function handleConfigureMailServer() {
       'virtual_minimum_uid = 100',
       'virtual_uid_maps = static:5000',
       'virtual_gid_maps = static:5000',
+      // Route virtual delivery through Dovecot LMTP so sieve scripts run
+      'virtual_transport = lmtp:unix:private/dovecot-lmtp',
     ];
     for (const setting of postconfSettings) {
       await execPromise(`sudo postconf -e ${shellEscape(setting)}`);
@@ -1991,6 +1993,27 @@ sieve_script personal {
     await fs.writeFile(tempQuota, dovecotPlugins);
     await execPromise(`sudo mv ${tempQuota} /etc/dovecot/conf.d/91-superhost-plugins.conf`);
     await execPromise('sudo chown root:root /etc/dovecot/conf.d/91-superhost-plugins.conf');
+
+    // 4b. Expose Dovecot LMTP socket inside Postfix chroot so virtual_transport can reach it
+    const dovecotLmtpConf = `# Superhost-managed: expose LMTP socket inside Postfix chroot for sieve delivery
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
+
+# Override Debian default: our SQL userdb stores full email addresses (user@domain),
+# so don't strip the domain before lookup. 20-lmtp.conf strips it for /etc/passwd.
+protocol lmtp {
+  auth_username_format = %{user | lower}
+}
+`;
+    const tempLmtp = '/tmp/92-superhost-lmtp.conf';
+    await fs.writeFile(tempLmtp, dovecotLmtpConf);
+    await execPromise(`sudo mv ${tempLmtp} /etc/dovecot/conf.d/92-superhost-lmtp.conf`);
+    await execPromise('sudo chown root:root /etc/dovecot/conf.d/92-superhost-lmtp.conf');
 
     // 5. Ensure vmail user + /var/mail/vhosts exist
     await execPromise(`id vmail`).catch(async () => {
