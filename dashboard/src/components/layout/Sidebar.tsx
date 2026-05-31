@@ -7,7 +7,7 @@ import {
   ShieldCheck, ShieldAlert, Mail,
   Network, Terminal, Cpu, Paintbrush, Settings,
   Zap, GitBranch, CreditCard,
-  Server, LogOut, RadioTower,
+  Server, LogOut, RadioTower, UserX,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -30,6 +30,7 @@ const adminGroups: MenuGroup[] = [
     section: 'Accounts',
     items: [
       { label: 'Users',          icon: Users,     path: '/users' },
+      { label: 'Deleted Users',  icon: UserX,     path: '/deleted-users' },
       { label: 'Packages',       icon: Package,   path: '/packages' },
       { label: 'Resellers',      icon: Briefcase, path: '/resellers' },
       { label: 'White-Label',    icon: Palette,   path: '/branding' },

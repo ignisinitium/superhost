@@ -40,7 +40,7 @@ router.post('/', async (req, res) => {
     // 3. Insert Task for Worker
     const taskRes = await query(
       'INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id',
-      ['CREATE_DOMAIN', { domainName, username, phpVersion: domain.php_version }]
+      ['CREATE_DOMAIN', { domainId: domain.id, domainName, username, phpVersion: domain.php_version, docRoot }]
     );
 
     // 4. Auto-create DNS Zone

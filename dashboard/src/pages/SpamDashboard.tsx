@@ -509,12 +509,6 @@ const SettingsTab: React.FC<{
     return (v: T) => { setter(v); setDirty(true); };
   }
 
-  const ACTION_LABELS: Record<string, string> = {
-    quarantine: 'Quarantine — hold suspected spam for review',
-    tag:        'Tag — prepend [SPAM] to subject and deliver',
-    deliver:    'Deliver — pass spam through without modification',
-  };
-
   return (
     <div className="space-y-6">
       {/* Filter on/off */}

@@ -40,6 +40,8 @@ import adminNameserversRoutes from './routes/adminNameservers.js';
 import resellerRoutes from './routes/reseller.js';
 import adminEmailRoutes from './routes/adminEmail.js';
 import adminSpamRoutes from './routes/adminSpam.js';
+import adminAppsRoutes from './routes/adminApps.js';
+import adminDeletedUsersRoutes from './routes/adminDeletedUsers.js';
 import systemRoutes from './routes/system.js';
 
 dotenv.config();
@@ -131,6 +133,9 @@ app.use('/api/admin/nameservers', adminNameserversRoutes);
 app.use('/api/admin/reseller', resellerRoutes);
 app.use('/api/admin/email', adminEmailRoutes);
 app.use('/api/admin/spam', adminSpamRoutes);
+app.use('/api/spam', adminSpamRoutes);
+app.use('/api/admin/apps', adminAppsRoutes);
+app.use('/api/admin/deleted-users', adminDeletedUsersRoutes);
 app.use('/api/admin/system', systemRoutes);
 
 app.use('/api/client/files', filesRoutes);

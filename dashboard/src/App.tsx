@@ -6,6 +6,7 @@ import Footer from './components/layout/Footer';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Login from './pages/Login';
 import UsersPage from './pages/Users';
+import DeletedUsersPage from './pages/DeletedUsers';
 import DomainsPage from './pages/Domains';
 import SettingsPage from './pages/Settings';
 import FirewallPage from './pages/Firewall';
@@ -223,6 +224,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                   <>
                     <Route index element={<Dashboard />} />
                     <Route path="users" element={<UsersPage />} />
+                    <Route path="deleted-users" element={<DeletedUsersPage />} />
                     <Route path="users/:id/settings" element={<UserSettingsPage />} />
                     <Route path="users/:id/websites" element={<AdminUserWebsitesPage />} />
                     <Route path="users/:id/databases" element={<AdminUserDatabasesPage />} />

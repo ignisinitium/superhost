@@ -584,12 +584,12 @@ const MailboxesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }>
 
   const { data: mailboxes, isLoading } = useQuery<AdminMailbox[]>({
     queryKey: ['adminMailboxes'],
-    queryFn: async () => (await adminApi.get('/email')).data,
+    queryFn: async () => (await adminApi.get('/admin/email')).data,
   });
 
   const toggleMutation = useMutation({
     mutationFn: async ({ id, enabled }: { id: number; enabled: boolean }) =>
-      (await adminApi.patch(`/email/${id}`, { spamFilterEnabled: enabled })).data,
+      (await adminApi.patch(`/admin/email/${id}`, { spamFilterEnabled: enabled })).data,
     onSuccess: () => { toast.success('Updated'); queryClient.invalidateQueries({ queryKey: ['adminMailboxes'] }); },
     onError: (e: any) => toast.error(e.response?.data?.message || 'Update failed'),
   });
@@ -715,6 +715,11 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
   const [globalType, setGlobalType] = useState<'allow' | 'block'>('block');
   const [globalNote, setGlobalNote] = useState('');
 
+  // Per-mailbox rule form state
+  const [mbMailboxId, setMbMailboxId] = useState('');
+  const [mbPattern, setMbPattern] = useState('');
+  const [mbType, setMbType] = useState<'allow' | 'block'>('allow');
+
   const { data: rules, isLoading } = useQuery<AdminRule[]>({
     queryKey: ['adminRules'],
     queryFn: async () => (await adminApi.get('/spam/rules')).data,
@@ -743,12 +748,14 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
     onError: (e: any) => toast.error(e.response?.data?.message || 'Delete failed'),
   });
 
+  const { data: allMailboxes } = useQuery<AdminMailbox[]>({
+    queryKey: ['adminMailboxes'],
+    queryFn: async () => (await adminApi.get('/admin/email')).data,
+  });
+
   const addGlobalMutation = useMutation({
-    mutationFn: async () => (await adminApi.post('/spam/global-rules', {
-      senderPattern: globalPattern.trim(),
-      accessType: globalType,
-      note: globalNote.trim() || undefined,
-    })).data,
+    mutationFn: async (vars: { senderPattern: string; accessType: 'allow' | 'block'; note?: string }) =>
+      (await adminApi.post('/spam/global-rules', vars)).data,
     onSuccess: () => {
       toast.success('Global rule saved');
       setGlobalPattern('');
@@ -756,6 +763,17 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
       invalidate();
     },
     onError: (e: any) => toast.error(e.response?.data?.message || 'Failed to save rule'),
+  });
+
+  const addMailboxRuleMutation = useMutation({
+    mutationFn: async (vars: { mailUserId: number; senderPattern: string; accessType: 'allow' | 'block' }) =>
+      (await adminApi.post('/spam/rules', vars)).data,
+    onSuccess: () => {
+      toast.success('Rule added');
+      setMbPattern('');
+      invalidate();
+    },
+    onError: (e: any) => toast.error(e.response?.data?.message || 'Failed to add rule'),
   });
 
   const filtered = useMemo(() => {
@@ -812,11 +830,15 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
               onChange={e => setGlobalNote(e.target.value)}
             />
             <button
-              onClick={() => addGlobalMutation.mutate()}
+              onClick={() => addGlobalMutation.mutate({
+                senderPattern: globalPattern.trim(),
+                accessType: globalType,
+                note: globalNote.trim() || undefined,
+              })}
               disabled={!globalPattern.trim() || addGlobalMutation.isPending}
               className="flex items-center gap-2 px-4 py-2.5 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-bold text-sm transition-all disabled:opacity-50"
             >
-              <Plus size={14} /> Add
+              <Plus size={14} /> {addGlobalMutation.isPending ? 'Saving…' : 'Add'}
             </button>
           </div>
         </div>
@@ -861,6 +883,56 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
 
       {/* ── Per-mailbox rules ─────────────────────────────────────────────── */}
       <div className="space-y-4">
+        {/* Add per-mailbox rule form */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
+            <Filter size={15} className="text-orange-500" />
+            <h3 className="text-sm font-bold text-slate-800">Add Rule for a Mailbox</h3>
+          </div>
+          <div className="px-6 py-4">
+            <div className="flex flex-col md:flex-row gap-3">
+              <select
+                className="border border-slate-200 rounded-xl px-3 py-2.5 text-sm outline-none bg-white focus:ring-2 focus:ring-orange-500/20"
+                value={mbMailboxId}
+                onChange={e => setMbMailboxId(e.target.value)}
+              >
+                <option value="">Select mailbox…</option>
+                {(allMailboxes ?? []).map(m => (
+                  <option key={m.id} value={m.id}>{m.email} ({m.owner})</option>
+                ))}
+              </select>
+              <input
+                className="flex-1 px-4 py-2.5 border border-slate-200 rounded-xl text-sm font-mono outline-none focus:ring-2 focus:ring-orange-500/20"
+                placeholder="sender@domain.com or @domain.com"
+                value={mbPattern}
+                onChange={e => setMbPattern(e.target.value)}
+              />
+              <div className="flex gap-1 bg-slate-100 p-1 rounded-xl shrink-0">
+                {(['allow', 'block'] as const).map(v => (
+                  <button
+                    key={v}
+                    onClick={() => setMbType(v)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${mbType === v ? (v === 'allow' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-red-600 text-white shadow-sm') : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    {v === 'allow' ? 'Allow' : 'Block'}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => addMailboxRuleMutation.mutate({
+                  mailUserId: parseInt(mbMailboxId, 10),
+                  senderPattern: mbPattern.trim(),
+                  accessType: mbType,
+                })}
+                disabled={!mbMailboxId || !mbPattern.trim() || addMailboxRuleMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2.5 bg-orange-600 hover:bg-orange-700 text-white rounded-xl font-bold text-sm transition-all disabled:opacity-50"
+              >
+                <Plus size={14} /> {addMailboxRuleMutation.isPending ? 'Saving…' : 'Add'}
+              </button>
+            </div>
+          </div>
+        </div>
+
         {/* Summary chips */}
         <div className="flex gap-3">
           <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl">

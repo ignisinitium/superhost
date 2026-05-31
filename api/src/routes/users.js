@@ -1,5 +1,6 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 const router = express.Router();
@@ -18,19 +19,38 @@ router.get('/', async (_req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+const USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
 router.post('/', async (req, res) => {
     const { username, email, password, disk_limit_mb, bandwidth_limit_mb, package_id } = req.body;
-    const homeDir = `/home/${username}`;
+    if (!username || !USERNAME_RE.test(username)) {
+        res.status(400).json({ message: 'Invalid username. Must start with a lowercase letter or underscore, contain only lowercase letters, numbers, hyphens, or underscores, and be at most 32 characters.' });
+        return;
+    }
     try {
+        // Resolve conflicts with active users and archived (deleted) usernames.
+        // If the requested name is taken, append a random 3-digit hex suffix and retry.
+        let finalUsername = username;
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const conflict = await query(`SELECT 1 FROM users WHERE username = $1
+         UNION ALL
+         SELECT 1 FROM deleted_users WHERE username = $1
+         LIMIT 1`, [finalUsername]);
+            if (conflict.rows.length === 0)
+                break;
+            const base = username.slice(0, 28); // leave room for _xxx suffix
+            const suffix = crypto.randomBytes(2).toString('hex').slice(0, 3);
+            finalUsername = `${base}_${suffix}`;
+        }
+        const homeDir = `/home/${finalUsername}`;
         const passwordHash = password ? await bcrypt.hash(password, 10) : null;
         const result = await query(`INSERT INTO users
          (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`, [username, email, homeDir, passwordHash,
+       RETURNING *`, [finalUsername, email, homeDir, passwordHash,
             disk_limit_mb || 1024, bandwidth_limit_mb || 5120,
             package_id ?? null]);
         const user = result.rows[0];
-        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CREATE_USER', { username }]);
+        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CREATE_USER', { username: finalUsername }]);
         res.status(201).json(user);
     }
     catch (err) {
@@ -78,6 +98,19 @@ router.put('/:id', async (req, res) => {
         if (result.rows.length === 0)
             return res.status(404).json({ message: 'User not found' });
         res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+router.delete('/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const userRes = await query('SELECT id, username, email FROM users WHERE id = $1', [id]);
+        if (userRes.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        const taskRes = await query('INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id', ['ARCHIVE_AND_DELETE_USER', { userId: parseInt(id) }]);
+        res.json({ message: 'User archival and deletion queued', taskId: taskRes.rows[0].id });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

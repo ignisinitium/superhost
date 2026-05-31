@@ -6,10 +6,22 @@ import {
   Globe, Plus, ArrowLeft, Shield, ShieldCheck,
   Settings2, Trash2, ExternalLink, Loader2,
   CheckCircle, XCircle, AlertTriangle, RefreshCw, FolderOpen,
+  Terminal, Play, Square,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useTaskMonitor } from '../hooks/useTaskMonitor';
 import type { Domain, User } from '../../../shared/types';
+
+interface AppRuntime {
+  id: number;
+  name: string;
+  type: 'node' | 'python';
+  port: number;
+  status: string;
+  startup_script: string;
+  domain_name: string;
+  created_at: string;
+}
 
 const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'];
 
@@ -37,6 +49,32 @@ const AdminUserWebsitesPage: React.FC = () => {
   });
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['domains', 'user', id] });
+
+  const { data: apps = [], isLoading: isAppsLoading } = useQuery<AppRuntime[]>({
+    queryKey: ['admin-apps', id],
+    queryFn: async () => (await api.get(`/admin/apps?userId=${id}`)).data,
+    enabled: !!id,
+  });
+
+  const manageAppMutation = useMutation({
+    mutationFn: async ({ appId, action }: { appId: number; action: string }) =>
+      (await api.post(`/admin/apps/${appId}/manage`, { action })).data,
+    onSuccess: (data, vars) => {
+      toast.success(`App ${vars.action} queued`);
+      setTimeout(() => queryClient.invalidateQueries({ queryKey: ['admin-apps', id] }), 2000);
+      if (data.taskId) monitorTask(data.taskId, `App ${vars.action}ed successfully`);
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message ?? 'Action failed'),
+  });
+
+  const deleteAppMutation = useMutation({
+    mutationFn: async (appId: number) => (await api.delete(`/admin/apps/${appId}`)).data,
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['admin-apps', id] });
+      if (data.taskId) monitorTask(data.taskId, 'App deleted successfully');
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message ?? 'Delete failed'),
+  });
 
   // ── Delete ───────────────────────────────────────────────────────────────────
   const deleteMutation = useMutation({
@@ -132,6 +170,88 @@ const AdminUserWebsitesPage: React.FC = () => {
           ))}
         </div>
       )}
+
+      {/* ── App Runtimes ─────────────────────────────────────────────────── */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+        <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
+          <Terminal size={18} className="text-slate-500" />
+          <h2 className="font-bold text-slate-800">App Runtimes</h2>
+          <span className="ml-auto text-xs text-slate-400 font-medium">{apps.length} app{apps.length !== 1 ? 's' : ''}</span>
+        </div>
+
+        {isAppsLoading ? (
+          <div className="flex items-center justify-center py-10 gap-2 text-slate-400">
+            <Loader2 size={16} className="animate-spin" />
+            <span className="text-sm">Loading runtimes…</span>
+          </div>
+        ) : apps.length === 0 ? (
+          <div className="py-10 text-center text-slate-400 text-sm italic">No app runtimes configured.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase tracking-widest text-[10px] font-bold">
+                <tr>
+                  <th className="px-6 py-3">Application</th>
+                  <th className="px-6 py-3">Domain → Port</th>
+                  <th className="px-6 py-3">Status</th>
+                  <th className="px-6 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {apps.map(app => (
+                  <tr key={app.id} className="hover:bg-slate-50/50 transition-colors">
+                    <td className="px-6 py-4">
+                      <div className="font-bold text-slate-800">{app.name}</div>
+                      <div className="text-[10px] uppercase tracking-widest font-bold text-slate-400 mt-0.5">
+                        {app.type === 'node' ? 'Node.js' : 'Python 3'} · <span className="font-mono normal-case">{app.startup_script}</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="text-slate-700 font-medium">{app.domain_name}</div>
+                      <div className="font-mono text-[11px] text-orange-500 font-bold mt-0.5">:{app.port}</div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-widest border ${
+                        app.status === 'running'
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
+                          : 'bg-slate-50 text-slate-500 border-slate-200'
+                      }`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${app.status === 'running' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
+                        {app.status}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          title={app.status === 'running' ? 'Stop' : 'Start'}
+                          onClick={() => manageAppMutation.mutate({ appId: app.id, action: app.status === 'running' ? 'stop' : 'start' })}
+                          className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 transition-colors"
+                        >
+                          {app.status === 'running' ? <Square size={14} /> : <Play size={14} />}
+                        </button>
+                        <button
+                          title="Restart"
+                          onClick={() => manageAppMutation.mutate({ appId: app.id, action: 'restart' })}
+                          className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 transition-colors"
+                        >
+                          <RefreshCw size={14} />
+                        </button>
+                        <button
+                          title="Delete"
+                          onClick={() => { if (window.confirm(`Delete app "${app.name}"?`)) deleteAppMutation.mutate(app.id); }}
+                          className="p-2 hover:bg-red-50 rounded-lg text-slate-400 hover:text-red-600 transition-colors"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
 
       {/* ── Modals ──────────────────────────────────────────────────────────── */}
       {showAddModal && (
