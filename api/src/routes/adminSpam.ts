@@ -242,12 +242,41 @@ router.get('/rules', async (_req, res) => {
   }
 });
 
+// ── Access-control rules: add (admin on behalf of any mailbox) ────────────────
+
+router.post('/rules', async (req, res) => {
+  const { mailUserId, senderPattern, accessType } = req.body as {
+    mailUserId?: number; senderPattern?: string; accessType?: string;
+  };
+  if (!mailUserId || !senderPattern || !['allow', 'block'].includes(accessType ?? '')) {
+    return res.status(400).json({ message: 'mailUserId, senderPattern, and accessType (allow|block) required' });
+  }
+  try {
+    const result = await query(`
+      INSERT INTO mail_access_control (mail_user_id, sender_pattern, access_type)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (mail_user_id, sender_pattern) DO UPDATE SET access_type = EXCLUDED.access_type
+      RETURNING *
+    `, [mailUserId, senderPattern, accessType]);
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['SYNC_SPAM_RULES', { mailUserId }]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // ── Access-control rules: delete ──────────────────────────────────────────────
 
 router.delete('/rules/:id', async (req, res) => {
   const { id } = req.params;
   try {
+    const existing = await query('SELECT mail_user_id FROM mail_access_control WHERE id = $1', [id]);
     await query('DELETE FROM mail_access_control WHERE id = $1', [id]);
+    if (existing.rows[0]) {
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['SYNC_SPAM_RULES', { mailUserId: existing.rows[0].mail_user_id }]);
+    }
     res.json({ message: 'Rule deleted' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -282,6 +311,8 @@ router.post('/global-rules', async (req, res) => {
         SET access_type = EXCLUDED.access_type, note = EXCLUDED.note
       RETURNING *
     `, [senderPattern, accessType, note ?? null]);
+    // Sync all mailboxes — global rule affects everyone
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_SPAM_RULES', {}]);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -291,6 +322,7 @@ router.post('/global-rules', async (req, res) => {
 router.delete('/global-rules/:id', async (req, res) => {
   try {
     await query('DELETE FROM mail_global_rules WHERE id = $1', [req.params.id]);
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_SPAM_RULES', {}]);
     res.json({ message: 'Global rule deleted' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

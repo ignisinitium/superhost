@@ -198,6 +198,12 @@ async function handleTask(task: Task) {
       case 'PURGE_EXPIRED_QUARANTINE':
         await handlePurgeExpiredQuarantine();
         break;
+      case 'SYNC_SPAM_RULES':
+        await handleSyncSpamRules(task.payload);
+        break;
+      case 'SCAN_QUARANTINE_FOLDERS':
+        await handleScanQuarantineFolders(task.payload);
+        break;
       case 'PROVISION_MAILBOX':
         await handleProvisionMailbox(task.payload);
         break;
@@ -2048,43 +2054,257 @@ async function handleApplyEmailQuota(payload: any) {
   console.log(`Quota applied for ${email}`);
 }
 
-async function handleUpdateAutoresponder(payload: any) {
-  const { email, message, enabled } = payload as { email: string; message: string; enabled: boolean };
-  if (!email || !email.includes('@')) throw new Error('Valid email address required');
-  const [user, domain] = email.split('@') as [string, string];
+// ── Sieve script generation ────────────────────────────────────────────────────
 
-  const maildirBase = `/var/mail/vhosts/${shellEscape(domain)}/${shellEscape(user)}`;
+function sieveStr(s: string): string {
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function sieveEnvelopeTest(pattern: string): string {
+  if (pattern.startsWith('@')) {
+    return `envelope :domain :is "from" ${sieveStr(pattern.slice(1))}`;
+  }
+  return `envelope :is "from" ${sieveStr(pattern)}`;
+}
+
+function buildSieveScript(opts: {
+  email: string;
+  spamFilterEnabled: boolean;
+  spamAction: string;
+  globalAllows: string[];
+  globalBlocks: string[];
+  mbAllows: string[];
+  mbBlocks: string[];
+  arEnabled: boolean;
+  arMessage: string;
+}): string {
+  const { email, spamFilterEnabled, spamAction, globalAllows, globalBlocks,
+          mbAllows, mbBlocks, arEnabled, arMessage } = opts;
+
+  const allAllows = [...globalAllows, ...mbAllows];
+  const allBlocks = [...globalBlocks, ...mbBlocks];
+  const needFileinto = spamFilterEnabled && (allBlocks.length > 0 || spamAction === 'quarantine');
+  const needEnvelope = spamFilterEnabled && (allAllows.length > 0 || allBlocks.length > 0);
+  const needVacation  = arEnabled && !!arMessage?.trim();
+
+  const exts: string[] = [];
+  if (needFileinto) exts.push('fileinto');
+  if (needEnvelope) exts.push('envelope');
+  if (needVacation)  exts.push('vacation');
+  if (exts.length === 0) return '';
+
+  const lines: string[] = [`require [${exts.map(e => `"${e}"`).join(', ')}];`, ''];
+
+  if (spamFilterEnabled) {
+    // Allow rules — whitelist bypasses all spam checks
+    for (const p of allAllows) {
+      lines.push(`if ${sieveEnvelopeTest(p)} {`, '  keep;', '  stop;', '}');
+    }
+    if (allAllows.length > 0) lines.push('');
+
+    // Block rules — quarantine the message
+    for (const p of allBlocks) {
+      lines.push(`if ${sieveEnvelopeTest(p)} {`, '  fileinto "Quarantine";', '  stop;', '}');
+    }
+    if (allBlocks.length > 0) lines.push('');
+
+    // SpamAssassin flag
+    if (spamAction !== 'deliver') {
+      lines.push('if header :contains "X-Spam-Flag" "YES" {');
+      if (spamAction === 'quarantine') {
+        lines.push('  fileinto "Quarantine";', '  stop;');
+      } else {
+        // tag — SA already rewrote subject, just keep
+        lines.push('  keep;', '  stop;');
+      }
+      lines.push('}', '');
+    }
+  }
+
+  if (needVacation) {
+    lines.push(
+      'vacation',
+      '  :days 1',
+      '  :subject "Auto-reply"',
+      `  :from ${sieveStr(email)}`,
+      `  ${sieveStr(arMessage)};`,
+      ''
+    );
+  }
+
+  return lines.join('\n');
+}
+
+async function writeSieve(mailboxId: number, email: string, script: string) {
+  const [user, domain] = email.split('@') as [string, string];
+  const maildirBase = `/var/mail/vhosts/${domain}/${user}`;
   const sievePath   = `${maildirBase}/.dovecot.sieve`;
 
-  // Ensure maildir exists before writing sieve
-  await execPromise(`sudo mkdir -p ${maildirBase}`).catch(() => {});
+  await execPromise(`sudo mkdir -p ${shellEscape(maildirBase)}`).catch(() => {});
 
-  if (!enabled || !message?.trim()) {
+  if (!script.trim()) {
     await execPromise(`sudo rm -f ${shellEscape(sievePath)}`).catch(() => {});
-    console.log(`Auto-responder disabled for ${email}`);
     return;
   }
 
-  // Escape double-quotes and backslashes for the Sieve string literal
-  const safeMsg = message.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const sieveScript = `require ["vacation"];
-
-vacation
-  :days 1
-  :subject "Auto-reply"
-  :from "${email}"
-  "${safeMsg}";
-`;
-
-  const tempSieve = `/tmp/sieve_${shellEscape(user)}_${shellEscape(domain)}.sieve`;
-  await fs.writeFile(tempSieve, sieveScript);
-  await execPromise(`sudo mv ${shellEscape(tempSieve)} ${shellEscape(sievePath)}`);
+  const temp = `/tmp/sieve_${mailboxId}.sieve`;
+  await fs.writeFile(temp, script + '\n');
+  await execPromise(`sudo mv ${shellEscape(temp)} ${shellEscape(sievePath)}`);
   await execPromise(`sudo chown vmail:vmail ${shellEscape(sievePath)}`);
   await execPromise(`sudo chmod 600 ${shellEscape(sievePath)}`);
-
-  // Compile — non-fatal, Dovecot will compile at first use if sievec is missing
   await execPromise(`sudo sievec ${shellEscape(sievePath)}`).catch(() => {});
+}
 
+async function ensureQuarantineMaildir(email: string) {
+  const [user, domain] = email.split('@') as [string, string];
+  const base = `/var/mail/vhosts/${domain}/${user}/.Quarantine`;
+  for (const sub of ['cur', 'new', 'tmp']) {
+    await execPromise(`sudo mkdir -p ${shellEscape(`${base}/${sub}`)}`).catch(() => {});
+  }
+  await execPromise(`sudo chown -R vmail:vmail ${shellEscape(base)}`).catch(() => {});
+}
+
+// ── SYNC_SPAM_RULES ────────────────────────────────────────────────────────────
+
+async function handleSyncSpamRules(payload: any) {
+  const { mailUserId } = payload as { mailUserId?: number };
+
+  const mailboxRes = await client.query<{
+    id: number; email: string; spam_filter_enabled: boolean;
+    spam_score_threshold: number; spam_action: string;
+  }>(`
+    SELECT id, email, spam_filter_enabled, spam_score_threshold, spam_action
+    FROM mail_users
+    WHERE ($1::int IS NULL OR id = $1)
+  `, [mailUserId ?? null]);
+
+  const globalRes = await client.query<{ sender_pattern: string; access_type: string }>(
+    'SELECT sender_pattern, access_type FROM mail_global_rules'
+  );
+  const globalAllows = globalRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
+  const globalBlocks = globalRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
+
+  for (const mailbox of mailboxRes.rows) {
+    try {
+      const mbRes = await client.query<{ sender_pattern: string; access_type: string }>(
+        'SELECT sender_pattern, access_type FROM mail_access_control WHERE mail_user_id = $1',
+        [mailbox.id]
+      );
+      const mbAllows = mbRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
+      const mbBlocks = mbRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
+
+      const arRes = await client.query<{ message: string; enabled: boolean }>(
+        'SELECT message, enabled FROM mail_autoresponders WHERE mail_user_id = $1',
+        [mailbox.id]
+      );
+      const ar = arRes.rows[0];
+
+      const script = buildSieveScript({
+        email: mailbox.email,
+        spamFilterEnabled: mailbox.spam_filter_enabled,
+        spamAction: mailbox.spam_action ?? 'quarantine',
+        globalAllows, globalBlocks, mbAllows, mbBlocks,
+        arEnabled:  ar?.enabled  ?? false,
+        arMessage:  ar?.message  ?? '',
+      });
+
+      await writeSieve(mailbox.id, mailbox.email, script);
+
+      if (mailbox.spam_filter_enabled) {
+        await ensureQuarantineMaildir(mailbox.email);
+      }
+
+      console.log(`Spam rules synced for ${mailbox.email}`);
+    } catch (err) {
+      console.error(`Failed to sync spam rules for mailbox ${mailbox.id}:`, (err as Error).message);
+    }
+  }
+}
+
+// ── SCAN_QUARANTINE_FOLDERS ────────────────────────────────────────────────────
+
+async function handleScanQuarantineFolders(payload: any) {
+  const { mailUserId } = payload as { mailUserId?: number };
+
+  const mailboxRes = await client.query<{ id: number; email: string }>(
+    `SELECT id, email FROM mail_users WHERE ($1::int IS NULL OR id = $1) AND spam_filter_enabled = true`,
+    [mailUserId ?? null]
+  );
+
+  let found = 0;
+
+  for (const mailbox of mailboxRes.rows) {
+    try {
+      const [user, domain] = mailbox.email.split('@') as [string, string];
+      const qBase = `/var/mail/vhosts/${domain}/${user}/.Quarantine`;
+
+      for (const sub of ['new', 'cur']) {
+        const dir = `${qBase}/${sub}`;
+
+        let listing = '';
+        try {
+          const r = await execPromise(`sudo ls -1 ${shellEscape(dir)} 2>/dev/null`);
+          listing = r.stdout.trim();
+        } catch { continue; }
+        if (!listing) continue;
+
+        for (const filename of listing.split('\n').filter(Boolean)) {
+          const filePath = `${dir}/${filename}`;
+
+          const existing = await client.query(
+            'SELECT id FROM mail_quarantine WHERE file_path = $1 AND released_at IS NULL',
+            [filePath]
+          );
+          if ((existing.rowCount ?? 0) > 0) continue;
+
+          let sender = '', subject = '', spamScore: number | null = null;
+          try {
+            const { stdout } = await execPromise(`sudo head -150 ${shellEscape(filePath)}`);
+            const angleMatch = stdout.match(/^From:\s*.*?<([^>]+)>/mi);
+            const plainMatch = stdout.match(/^From:\s*(\S+@\S+)/mi);
+            sender = (angleMatch?.[1] ?? plainMatch?.[1] ?? '').trim();
+
+            const subjectMatch = stdout.match(/^Subject:\s*(.+?)(?=\r?\n[^\s]|\r?\n\r?\n|$)/mis);
+            if (subjectMatch) subject = subjectMatch[1]!.replace(/\r?\n\s+/g, ' ').trim();
+
+            const scoreMatch = stdout.match(/^X-Spam-Score:\s*([\d.-]+)/mi)
+              ?? stdout.match(/score=([\d.-]+)/i);
+            if (scoreMatch) spamScore = parseFloat(scoreMatch[1]!);
+          } catch { /* unreadable — still record it */ }
+
+          await client.query(`
+            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, file_path)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT DO NOTHING
+          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, filePath]);
+
+          found++;
+        }
+      }
+    } catch (err) {
+      console.error(`Quarantine scan failed for mailbox ${mailbox.id}:`, (err as Error).message);
+    }
+  }
+
+  if (found > 0) console.log(`Quarantine scan: recorded ${found} new emails`);
+}
+
+// ── UPDATE_AUTORESPONDER (updated to include spam rules) ───────────────────────
+
+async function handleUpdateAutoresponder(payload: any) {
+  const { email } = payload as { email: string };
+  if (!email || !email.includes('@')) throw new Error('Valid email address required');
+
+  // Find the mailbox id and delegate to handleSyncSpamRules, which reads all
+  // current DB state (spam rules + autoresponder) and writes a combined script.
+  const mbRes = await client.query<{ id: number }>(
+    'SELECT id FROM mail_users WHERE email = $1', [email]
+  );
+  if (mbRes.rows.length === 0) {
+    console.warn(`handleUpdateAutoresponder: mailbox not found for ${email}`);
+    return;
+  }
+  await handleSyncSpamRules({ mailUserId: mbRes.rows[0]!.id });
   console.log(`Auto-responder updated for ${email}`);
 }
 
@@ -2758,6 +2978,12 @@ async function start() {
     try { await collectTrafficStats(); }
     catch (err) { console.error('collectTrafficStats error:', err instanceof Error ? err.message : err); }
   }, 15 * 60 * 1000);
+
+  // Scan quarantine folders every 5 minutes to populate mail_quarantine table
+  setInterval(async () => {
+    try { await handleScanQuarantineFolders({}); }
+    catch (err) { console.error('Quarantine scan error:', err instanceof Error ? err.message : err); }
+  }, 5 * 60 * 1000);
 
   collectMetrics().catch(err => console.error('Initial collectMetrics error:', err));
   collectTrafficStats().catch(err => console.error('Initial collectTrafficStats error:', err));

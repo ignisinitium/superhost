@@ -212,10 +212,15 @@ router.patch('/:id', async (req: AuthRequest, res) => {
       RETURNING *
     `, [quota ?? null, spamFilterEnabled ?? null, spamDigestEnabled ?? null, spamScoreThreshold ?? null, spamAction ?? null, id]);
 
-    // If quota changed, recalculate in Dovecot
     if (quota !== undefined) {
       await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
         ['APPLY_EMAIL_QUOTA', { email: verifyRes.rows[0].email }]);
+    }
+
+    // Re-sync Sieve when spam settings change
+    if (spamFilterEnabled !== undefined || spamAction !== undefined || spamScoreThreshold !== undefined) {
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['SYNC_SPAM_RULES', { mailUserId: parseInt(id as string, 10) }]);
     }
 
     res.json(result.rows[0]);
@@ -509,6 +514,9 @@ router.post('/:mailUserId/access-control', async (req: AuthRequest, res) => {
       RETURNING *
     `, [mailUserId, senderPattern, accessType]);
 
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['SYNC_SPAM_RULES', { mailUserId: parseInt(mailUserId as string, 10) }]);
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -527,6 +535,8 @@ router.delete('/:mailUserId/access-control/:id', async (req: AuthRequest, res) =
     if (verifyRes.rowCount === 0) return res.status(403).json({ message: 'Access denied' });
 
     await query('DELETE FROM mail_access_control WHERE id = $1 AND mail_user_id = $2', [id, mailUserId]);
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['SYNC_SPAM_RULES', { mailUserId: parseInt(mailUserId as string, 10) }]);
     res.json({ message: 'Access rule deleted' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

@@ -134,6 +134,11 @@ router.patch('/:id', async (req, res) => {
         ['APPLY_EMAIL_QUOTA', { email: r.rows[0].email }]);
     }
 
+    if (spamFilterEnabled !== undefined || spamScoreThreshold !== undefined || spamAction !== undefined) {
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['SYNC_SPAM_RULES', { mailUserId: parseInt(id, 10) }]);
+    }
+
     res.json(r.rows[0]);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
