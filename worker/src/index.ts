@@ -195,6 +195,9 @@ async function handleTask(task: Task) {
       case 'SEND_SPAM_DIGEST':
         await handleSendSpamDigest(task.payload);
         break;
+      case 'PURGE_EXPIRED_QUARANTINE':
+        await handlePurgeExpiredQuarantine();
+        break;
       case 'PROVISION_MAILBOX':
         await handleProvisionMailbox(task.payload);
         break;
@@ -2090,74 +2093,126 @@ async function handleReleaseQuarantine(payload: any) {
   if (!filePath || !recipient) throw new Error('filePath and recipient are required');
 
   try {
-    // 1. Deliver the file to the user's Maildir
-    // We assume standard Maildir structure: /var/mail/vhosts/domain/user/new/
     const [user, domain] = recipient.split('@');
     const destDir = `/var/mail/vhosts/${domain}/${user}/new`;
     const fileName = path.basename(filePath);
-    
+
     await execPromise(`sudo mkdir -p ${destDir}`);
-    await execPromise(`sudo mv ${filePath} ${destDir}/${fileName}`);
-    await execPromise(`sudo chown vmail:vmail ${destDir}/${fileName}`);
+    await execPromise(`sudo mv ${shellEscape(filePath)} ${shellEscape(destDir + '/' + fileName)}`);
+    await execPromise(`sudo chown vmail:vmail ${shellEscape(destDir + '/' + fileName)}`);
 
-    // 2. Clean up DB record
-    await client.query('DELETE FROM mail_quarantine WHERE id = $1', [id]);
+    // Mark as released (keep for FP stats; purge job cleans up after 7 days)
+    await client.query('UPDATE mail_quarantine SET released_at = NOW() WHERE id = $1', [id]);
 
-    console.log(`Released quarantined email to ${recipient}.`);
+    console.log(`Released quarantined email ${id} to ${recipient}.`);
   } catch (err) {
     console.error(`Failed to release quarantine for ${id}:`, err);
     throw err;
   }
 }
 
+function htmlEscape(s: string | null | undefined): string {
+  return (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 async function handleSendSpamDigest(payload: any) {
   const { mailUserId } = payload;
-  
+
   try {
-    // 1. Get user and their quarantined items from the last 24h
     const userRes = await client.query(`
-      SELECT mu.email, mu.id 
-      FROM mail_users mu 
+      SELECT mu.email, mu.id
+      FROM mail_users mu
       WHERE ($1::int IS NULL OR mu.id = $1) AND mu.spam_digest_enabled = true
-    `, [mailUserId || null]);
+    `, [mailUserId ?? null]);
 
     for (const user of userRes.rows) {
       const qRes = await client.query(`
-        SELECT * FROM mail_quarantine 
-        WHERE mail_user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+        SELECT id, sender, subject, spam_score, created_at
+        FROM mail_quarantine
+        WHERE mail_user_id = $1 AND released_at IS NULL AND created_at > NOW() - INTERVAL '24 hours'
+        ORDER BY created_at DESC
       `, [user.id]);
 
       if (qRes.rowCount === 0) continue;
 
-      // 2. Build the Digest Email (Simplified)
       console.log(`Sending spam digest to ${user.email} with ${qRes.rowCount} items...`);
-      
-      let htmlBody = `<h1>Daily Spam Digest for ${user.email}</h1>`;
-      htmlBody += `<p>The following emails were quarantined in the last 24 hours:</p><table border="1">`;
-      htmlBody += `<tr><th>From</th><th>Subject</th><th>Score</th><th>Action</th></tr>`;
 
-      for (const item of qRes.rows) {
-        htmlBody += `<tr>
-          <td>${item.sender}</td>
-          <td>${item.subject}</td>
-          <td>${item.spam_score}</td>
-          <td>
-            <a href="https://${process.env.DASHBOARD_DOMAIN}/client/spam?release=${item.id}">Allow</a> | 
-            <a href="https://${process.env.DASHBOARD_DOMAIN}/client/spam?delete=${item.id}">Delete</a>
-          </td>
-        </tr>`;
-      }
-      htmlBody += `</table>`;
+      const dashBase = `https://${process.env.DASHBOARD_DOMAIN}/client/spam`;
+      const rows = qRes.rows.map((item: any) => {
+        const score = Number(item.spam_score ?? 0).toFixed(1);
+        const scoreColor = Number(score) >= 10 ? '#dc2626' : '#ea580c';
+        const date = new Date(item.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        return `
+          <tr>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-family:monospace;font-size:13px;color:#374151">${htmlEscape(item.sender)}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#374151">${htmlEscape(item.subject) || '<em style="color:#9ca3af">no subject</em>'}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;text-align:center">
+              <span style="background:#fff7ed;color:${scoreColor};border:1px solid #fed7aa;border-radius:4px;padding:2px 6px;font-family:monospace;font-size:11px;font-weight:700">${score}</span>
+            </td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;white-space:nowrap">${date}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;white-space:nowrap">
+              <a href="${dashBase}?release=${item.id}" style="background:#16a34a;color:#fff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;margin-right:6px">Release</a>
+              <a href="${dashBase}?delete=${item.id}"  style="background:#dc2626;color:#fff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700">Delete</a>
+            </td>
+          </tr>`;
+      }).join('');
 
-      // 3. Send via sendmail or internal transport
+      const htmlBody = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:system-ui,sans-serif">
+  <div style="max-width:680px;margin:32px auto;background:#fff;border-radius:12px;border:1px solid #e2e8f0;overflow:hidden">
+    <div style="background:#ea580c;padding:24px 32px">
+      <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700">Daily Spam Digest</h1>
+      <p style="margin:4px 0 0;color:#fed7aa;font-size:14px">${htmlEscape(user.email)} — ${qRes.rowCount} email${qRes.rowCount === 1 ? '' : 's'} quarantined in the last 24 hours</p>
+    </div>
+    <div style="padding:24px 32px">
+      <p style="margin:0 0 16px;color:#475569;font-size:14px">Review these emails and release any that were incorrectly flagged.</p>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden">
+        <thead>
+          <tr style="background:#f8fafc">
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">From</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Subject</th>
+            <th style="padding:10px 16px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Score</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Time</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Action</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">Quarantined emails are automatically deleted after 30 days. <a href="${dashBase}" style="color:#ea580c">Manage spam settings →</a></p>
+    </div>
+  </div>
+</body></html>`;
+
       const tempMail = `/tmp/digest_${user.id}.html`;
       await fs.writeFile(tempMail, htmlBody);
-      await execPromise(`sudo mail -a "Content-Type: text/html" -s "Daily Spam Digest" ${user.email} < ${tempMail}`);
+      await execPromise(`sudo mail -a "Content-Type: text/html" -s "Daily Spam Digest for ${shellEscape(user.email)}" ${shellEscape(user.email)} < ${shellEscape(tempMail)}`);
       await fs.rm(tempMail);
     }
   } catch (err) {
     console.error('Failed to send spam digest:', err);
     throw err;
+  }
+}
+
+async function handlePurgeExpiredQuarantine() {
+  const expired = await client.query(`
+    SELECT id, file_path FROM mail_quarantine
+    WHERE expires_at < NOW()
+       OR (released_at IS NOT NULL AND released_at < NOW() - INTERVAL '7 days')
+  `);
+
+  for (const row of expired.rows) {
+    if (row.file_path) {
+      try {
+        await execPromise(`sudo rm -f ${shellEscape(row.file_path)}`);
+      } catch { /* file may already be gone */ }
+    }
+  }
+
+  if (expired.rows.length > 0) {
+    await client.query('DELETE FROM mail_quarantine WHERE id = ANY($1)', [expired.rows.map((r: any) => r.id)]);
+    console.log(`Purged ${expired.rows.length} expired quarantine records`);
   }
 }
 

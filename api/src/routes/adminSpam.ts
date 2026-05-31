@@ -12,8 +12,10 @@ router.get('/stats', async (_req, res) => {
     const [
       mailboxes,
       quarantined,
+      released,
       filterEnabled,
       rules,
+      globalRules,
       highSeverity,
       topSenders,
       scoreDist,
@@ -21,13 +23,16 @@ router.get('/stats', async (_req, res) => {
       dailyVolume,
     ] = await Promise.all([
       query('SELECT COUNT(*) FROM mail_users'),
-      query('SELECT COUNT(*) FROM mail_quarantine'),
+      query("SELECT COUNT(*) FROM mail_quarantine WHERE released_at IS NULL"),
+      query("SELECT COUNT(*) FROM mail_quarantine WHERE released_at IS NOT NULL AND released_at >= NOW() - INTERVAL '30 days'"),
       query('SELECT COUNT(*) FROM mail_users WHERE spam_filter_enabled = TRUE'),
       query('SELECT COUNT(*) FROM mail_access_control'),
-      query("SELECT COUNT(*) FROM mail_quarantine WHERE spam_score > 10"),
+      query('SELECT COUNT(*) FROM mail_global_rules'),
+      query("SELECT COUNT(*) FROM mail_quarantine WHERE spam_score > 10 AND released_at IS NULL"),
       query(`
         SELECT sender, COUNT(*)::int AS count
         FROM mail_quarantine
+        WHERE released_at IS NULL
         GROUP BY sender
         ORDER BY count DESC
         LIMIT 10
@@ -42,6 +47,7 @@ router.get('/stats', async (_req, res) => {
           END AS range,
           COUNT(*)::int AS count
         FROM mail_quarantine
+        WHERE released_at IS NULL
         GROUP BY range
         ORDER BY MIN(spam_score)
       `),
@@ -52,6 +58,7 @@ router.get('/stats', async (_req, res) => {
         JOIN mail_users mu ON mq.mail_user_id = mu.id
         JOIN mail_domains md ON mu.domain_id = md.id
         JOIN users u ON md.user_id = u.id
+        WHERE mq.released_at IS NULL
         ORDER BY mq.created_at DESC
         LIMIT 8
       `),
@@ -67,8 +74,9 @@ router.get('/stats', async (_req, res) => {
     res.json({
       totalMailboxes:    parseInt(mailboxes.rows[0].count),
       totalQuarantined:  parseInt(quarantined.rows[0].count),
+      releasedCount:     parseInt(released.rows[0].count),
       filterEnabled:     parseInt(filterEnabled.rows[0].count),
-      totalRules:        parseInt(rules.rows[0].count),
+      totalRules:        parseInt(rules.rows[0].count) + parseInt(globalRules.rows[0].count),
       highSeverity:      parseInt(highSeverity.rows[0].count),
       topSenders:        topSenders.rows,
       scoreDistribution: scoreDist.rows,
@@ -83,10 +91,10 @@ router.get('/stats', async (_req, res) => {
 // ── Quarantine: list all (admin) ───────────────────────────────────────────────
 
 router.get('/quarantine', async (req, res) => {
-  const { search, userId, limit = '100', offset = '0' } = req.query;
+  const { search, userId, dateFrom, dateTo, limit = '100', offset = '0' } = req.query;
   try {
     const params: unknown[] = [];
-    const wheres: string[] = [];
+    const wheres: string[] = ['mq.released_at IS NULL'];
     let p = 1;
 
     if (userId) {
@@ -98,8 +106,16 @@ router.get('/quarantine', async (req, res) => {
       params.push(`%${search.trim()}%`);
       p++;
     }
+    if (dateFrom && typeof dateFrom === 'string') {
+      wheres.push(`mq.created_at >= $${p++}`);
+      params.push(dateFrom);
+    }
+    if (dateTo && typeof dateTo === 'string') {
+      wheres.push(`mq.created_at <= $${p++}`);
+      params.push(dateTo);
+    }
 
-    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    const where = `WHERE ${wheres.join(' AND ')}`;
 
     const [rows, countRow] = await Promise.all([
       query(`
@@ -233,6 +249,49 @@ router.delete('/rules/:id', async (req, res) => {
   try {
     await query('DELETE FROM mail_access_control WHERE id = $1', [id]);
     res.json({ message: 'Rule deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ── Global allow/block rules (server-wide) ─────────────────────────────────────
+
+router.get('/global-rules', async (_req, res) => {
+  try {
+    const result = await query(
+      'SELECT * FROM mail_global_rules ORDER BY access_type ASC, sender_pattern ASC'
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.post('/global-rules', async (req, res) => {
+  const { senderPattern, accessType, note } = req.body as {
+    senderPattern?: string; accessType?: string; note?: string;
+  };
+  if (!senderPattern || !['allow', 'block'].includes(accessType ?? '')) {
+    return res.status(400).json({ message: 'senderPattern and accessType (allow|block) required' });
+  }
+  try {
+    const result = await query(`
+      INSERT INTO mail_global_rules (sender_pattern, access_type, note)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (sender_pattern) DO UPDATE
+        SET access_type = EXCLUDED.access_type, note = EXCLUDED.note
+      RETURNING *
+    `, [senderPattern, accessType, note ?? null]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.delete('/global-rules/:id', async (req, res) => {
+  try {
+    await query('DELETE FROM mail_global_rules WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Global rule deleted' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

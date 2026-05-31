@@ -20,8 +20,8 @@ router.get('/', async (req, res) => {
     const { userId } = req.query;
     const result = userId
       ? await query(
-          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.is_catchall,
-                  md.domain_name, u.username as owner
+          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.spam_score_threshold,
+                  mu.spam_action, mu.is_catchall, md.domain_name, u.username as owner
            FROM mail_users mu
            JOIN mail_domains md ON mu.domain_id = md.id
            JOIN users u ON md.user_id = u.id
@@ -30,8 +30,8 @@ router.get('/', async (req, res) => {
           [userId]
         )
       : await query(
-          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.is_catchall,
-                  md.domain_name, u.username as owner
+          `SELECT mu.id, mu.email, mu.quota, mu.spam_filter_enabled, mu.spam_score_threshold,
+                  mu.spam_action, mu.is_catchall, md.domain_name, u.username as owner
            FROM mail_users mu
            JOIN mail_domains md ON mu.domain_id = md.id
            JOIN users u ON md.user_id = u.id
@@ -109,18 +109,23 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ── Update quota ───────────────────────────────────────────────────────────────
+// ── Update mailbox settings ─────────────────────────────────────────────────────
 router.patch('/:id', async (req, res) => {
   const { id } = req.params;
-  const { quota, spamFilterEnabled } = req.body;
+  const { quota, spamFilterEnabled, spamScoreThreshold, spamAction } = req.body;
+  if (spamAction !== undefined && !['quarantine', 'tag', 'deliver'].includes(spamAction)) {
+    return res.status(400).json({ message: 'spamAction must be quarantine, tag, or deliver' });
+  }
   try {
     const r = await query(
       `UPDATE mail_users
-       SET quota = COALESCE($1, quota),
-           spam_filter_enabled = COALESCE($2, spam_filter_enabled)
-       WHERE id = $3
+       SET quota               = COALESCE($1, quota),
+           spam_filter_enabled = COALESCE($2, spam_filter_enabled),
+           spam_score_threshold= COALESCE($3, spam_score_threshold),
+           spam_action         = COALESCE($4, spam_action)
+       WHERE id = $5
        RETURNING *`,
-      [quota ?? null, spamFilterEnabled ?? null, id]
+      [quota ?? null, spamFilterEnabled ?? null, spamScoreThreshold ?? null, spamAction ?? null, id]
     );
     if (r.rows.length === 0) return res.status(404).json({ message: 'Mailbox not found' });
 

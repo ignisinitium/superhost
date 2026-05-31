@@ -10,6 +10,7 @@ import {
   TrendingDown, AlertTriangle, Search, RefreshCw, Send,
   UserCheck, UserX, MailOpen, ShieldCheck,
   CircleAlert, Inbox, SquareCheck, Square, X, ArrowUpDown,
+  Globe, Plus, CalendarRange, Undo2,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -18,6 +19,7 @@ import toast from 'react-hot-toast';
 interface SpamStats {
   totalMailboxes: number;
   totalQuarantined: number;
+  releasedCount: number;
   filterEnabled: number;
   totalRules: number;
   highSeverity: number;
@@ -25,6 +27,14 @@ interface SpamStats {
   scoreDistribution: { range: string; count: number }[];
   recentQuarantine: QuarantineItem[];
   dailyVolume: { day: string; count: number }[];
+}
+
+interface GlobalRule {
+  id: number;
+  sender_pattern: string;
+  access_type: 'allow' | 'block';
+  note: string | null;
+  created_at: string;
 }
 
 interface QuarantineItem {
@@ -195,12 +205,13 @@ const OverviewTab: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-        <StatCard color="orange" icon={<Inbox size={20} />}    label="Quarantined" value={stats.totalQuarantined.toLocaleString()} />
-        <StatCard color="red"    icon={<CircleAlert size={20} />} label="High Severity" value={stats.highSeverity.toLocaleString()} sub="score > 10" />
-        <StatCard color="emerald" icon={<Mail size={20} />}    label="Mailboxes" value={stats.totalMailboxes.toLocaleString()} />
-        <StatCard color="blue"   icon={<ShieldCheck size={20} />} label="Filter Coverage" value={`${filterPct}%`} sub={`${stats.filterEnabled} of ${stats.totalMailboxes}`} />
-        <StatCard color="violet" icon={<Filter size={20} />}   label="Rules" value={stats.totalRules.toLocaleString()} />
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <StatCard color="orange"  icon={<Inbox size={20} />}       label="Quarantined"     value={stats.totalQuarantined.toLocaleString()} />
+        <StatCard color="red"     icon={<CircleAlert size={20} />}  label="High Severity"   value={stats.highSeverity.toLocaleString()} sub="score > 10" />
+        <StatCard color="emerald" icon={<Undo2 size={20} />}        label="Released (30d)"  value={stats.releasedCount.toLocaleString()} sub="false positives" />
+        <StatCard color="sky"     icon={<Mail size={20} />}         label="Mailboxes"       value={stats.totalMailboxes.toLocaleString()} />
+        <StatCard color="blue"    icon={<ShieldCheck size={20} />}  label="Filter Coverage" value={`${filterPct}%`} sub={`${stats.filterEnabled} of ${stats.totalMailboxes}`} />
+        <StatCard color="violet"  icon={<Filter size={20} />}       label="Rules"           value={stats.totalRules.toLocaleString()} />
       </div>
 
       {/* Charts row */}
@@ -323,9 +334,10 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [userFilter, setUserFilter] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const [selected, setSelected] = useState<Set<number>>(new Set());
 
-  // Debounce search
   React.useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 350);
     return () => clearTimeout(t);
@@ -337,11 +349,13 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
   });
 
   const { data, isLoading, refetch } = useQuery<{ items: QuarantineItem[]; total: number }>({
-    queryKey: ['adminQuarantine', debouncedSearch, userFilter],
+    queryKey: ['adminQuarantine', debouncedSearch, userFilter, dateFrom, dateTo],
     queryFn: async () => {
       const params = new URLSearchParams({ limit: '200' });
       if (debouncedSearch) params.set('search', debouncedSearch);
       if (userFilter) params.set('userId', userFilter);
+      if (dateFrom) params.set('dateFrom', dateFrom);
+      if (dateTo) params.set('dateTo', dateTo + 'T23:59:59');
       return (await adminApi.get(`/spam/quarantine?${params}`)).data;
     },
     refetchInterval: 15_000,
@@ -422,6 +436,33 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
         <button onClick={() => refetch()} className="p-2.5 border border-slate-200 rounded-xl text-slate-500 hover:text-slate-700 hover:bg-slate-50">
           <RefreshCw size={16} />
         </button>
+      </div>
+      {/* Date range */}
+      <div className="flex flex-col sm:flex-row items-center gap-2">
+        <CalendarRange size={14} className="text-slate-400 shrink-0" />
+        <input
+          type="date"
+          className="border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none bg-white focus:ring-2 focus:ring-orange-500/20"
+          value={dateFrom}
+          onChange={e => setDateFrom(e.target.value)}
+          title="From date"
+        />
+        <span className="text-slate-400 text-sm">to</span>
+        <input
+          type="date"
+          className="border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none bg-white focus:ring-2 focus:ring-orange-500/20"
+          value={dateTo}
+          onChange={e => setDateTo(e.target.value)}
+          title="To date"
+        />
+        {(dateFrom || dateTo) && (
+          <button
+            onClick={() => { setDateFrom(''); setDateTo(''); }}
+            className="text-xs text-slate-400 hover:text-slate-600 underline"
+          >
+            Clear dates
+          </button>
+        )}
       </div>
 
       {/* Bulk action bar */}
@@ -669,15 +710,52 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
   const [typeFilter, setTypeFilter] = useState<'all' | 'allow' | 'block'>('all');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
+  // Global rule form state
+  const [globalPattern, setGlobalPattern] = useState('');
+  const [globalType, setGlobalType] = useState<'allow' | 'block'>('block');
+  const [globalNote, setGlobalNote] = useState('');
+
   const { data: rules, isLoading } = useQuery<AdminRule[]>({
     queryKey: ['adminRules'],
     queryFn: async () => (await adminApi.get('/spam/rules')).data,
   });
 
+  const { data: globalRules, isLoading: isGLoading } = useQuery<GlobalRule[]>({
+    queryKey: ['adminGlobalRules'],
+    queryFn: async () => (await adminApi.get('/spam/global-rules')).data,
+  });
+
+  const invalidate = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['adminRules'] });
+    queryClient.invalidateQueries({ queryKey: ['adminGlobalRules'] });
+    queryClient.invalidateQueries({ queryKey: ['adminSpamStats'] });
+  }, [queryClient]);
+
   const deleteMutation = useMutation({
     mutationFn: async (id: number) => (await adminApi.delete(`/spam/rules/${id}`)).data,
-    onSuccess: () => { toast.success('Rule deleted'); queryClient.invalidateQueries({ queryKey: ['adminRules'] }); queryClient.invalidateQueries({ queryKey: ['adminSpamStats'] }); },
+    onSuccess: () => { toast.success('Rule deleted'); invalidate(); },
     onError: (e: any) => toast.error(e.response?.data?.message || 'Delete failed'),
+  });
+
+  const deleteGlobalMutation = useMutation({
+    mutationFn: async (id: number) => (await adminApi.delete(`/spam/global-rules/${id}`)).data,
+    onSuccess: () => { toast.success('Global rule deleted'); invalidate(); },
+    onError: (e: any) => toast.error(e.response?.data?.message || 'Delete failed'),
+  });
+
+  const addGlobalMutation = useMutation({
+    mutationFn: async () => (await adminApi.post('/spam/global-rules', {
+      senderPattern: globalPattern.trim(),
+      accessType: globalType,
+      note: globalNote.trim() || undefined,
+    })).data,
+    onSuccess: () => {
+      toast.success('Global rule saved');
+      setGlobalPattern('');
+      setGlobalNote('');
+      invalidate();
+    },
+    onError: (e: any) => toast.error(e.response?.data?.message || 'Failed to save rule'),
   });
 
   const filtered = useMemo(() => {
@@ -697,92 +775,78 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
   const blockCount = (rules ?? []).filter(r => r.access_type === 'block').length;
 
   return (
-    <div className="space-y-4">
-      {/* Summary chips */}
-      <div className="flex gap-3">
-        <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl">
-          <UserCheck size={14} className="text-emerald-600" />
-          <span className="text-xs font-bold text-emerald-700">{allowCount} whitelist rules</span>
-        </div>
-        <div className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl">
-          <UserX size={14} className="text-red-600" />
-          <span className="text-xs font-bold text-red-700">{blockCount} blacklist rules</span>
-        </div>
-      </div>
-
-      {/* Toolbar */}
-      <div className="flex flex-col md:flex-row gap-3">
-        <div className="relative flex-1">
-          <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            className="w-full pl-9 pr-4 py-2.5 border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-orange-500/20"
-            placeholder="Search pattern or owner…"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-          />
-        </div>
-        <div className="flex gap-1 bg-slate-100 p-1 rounded-xl">
-          {(['all', 'allow', 'block'] as const).map(v => (
-            <button
-              key={v}
-              onClick={() => setTypeFilter(v)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${typeFilter === v ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
-            >
-              {v === 'all' ? 'All' : v === 'allow' ? 'Whitelist' : 'Blacklist'}
-            </button>
-          ))}
-        </div>
-        <button
-          onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
-          className="flex items-center gap-2 px-3 py-2.5 border border-slate-200 rounded-xl text-sm text-slate-500 hover:text-slate-700 hover:bg-slate-50"
-          title="Toggle sort direction"
-        >
-          <ArrowUpDown size={14} />
-          {sortDir === 'asc' ? 'A→Z' : 'Z→A'}
-        </button>
-      </div>
-
-      <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-        {filtered.length} rules
-      </div>
-
+    <div className="space-y-6">
+      {/* ── Global Rules ─────────────────────────────────────────────────── */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
+          <Globe size={16} className="text-violet-500" />
+          <h3 className="text-sm font-bold text-slate-800">Global Rules</h3>
+          <span className="ml-auto text-[10px] text-slate-400">Apply server-wide to all mailboxes</span>
+        </div>
+
+        {/* Add form */}
+        <div className="px-6 py-4 border-b border-slate-100 bg-violet-50/30">
+          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Add Global Rule</p>
+          <div className="flex flex-col md:flex-row gap-3">
+            <input
+              className="flex-1 px-4 py-2.5 border border-slate-200 rounded-xl text-sm font-mono outline-none focus:ring-2 focus:ring-violet-500/20 bg-white"
+              placeholder="sender@domain.com or @domain.com"
+              value={globalPattern}
+              onChange={e => setGlobalPattern(e.target.value)}
+            />
+            <div className="flex gap-1 bg-slate-100 p-1 rounded-xl shrink-0">
+              {(['block', 'allow'] as const).map(v => (
+                <button
+                  key={v}
+                  onClick={() => setGlobalType(v)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${globalType === v ? (v === 'block' ? 'bg-red-600 text-white shadow-sm' : 'bg-emerald-600 text-white shadow-sm') : 'text-slate-500 hover:text-slate-700'}`}
+                >
+                  {v === 'allow' ? 'Allow' : 'Block'}
+                </button>
+              ))}
+            </div>
+            <input
+              className="w-48 px-4 py-2.5 border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-violet-500/20 bg-white"
+              placeholder="Note (optional)"
+              value={globalNote}
+              onChange={e => setGlobalNote(e.target.value)}
+            />
+            <button
+              onClick={() => addGlobalMutation.mutate()}
+              disabled={!globalPattern.trim() || addGlobalMutation.isPending}
+              className="flex items-center gap-2 px-4 py-2.5 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-bold text-sm transition-all disabled:opacity-50"
+            >
+              <Plus size={14} /> Add
+            </button>
+          </div>
+        </div>
+
+        {/* Global rules list */}
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-left">
             <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
               <tr>
                 <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Type</th>
                 <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Pattern</th>
-                <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Mailbox</th>
-                <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Owner</th>
-                <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Domain</th>
+                <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Note</th>
                 <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Added</th>
                 <th className="px-6 py-3 text-right text-[10px] font-bold uppercase tracking-wider"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {isLoading ? (
-                <tr><td colSpan={7} className="px-6 py-10 text-center text-slate-400">Loading…</td></tr>
-              ) : filtered.length === 0 ? (
-                <tr><td colSpan={7}><EmptyState icon={Filter} text="No rules match your filter." /></td></tr>
-              ) : filtered.map(r => (
+              {isGLoading ? (
+                <tr><td colSpan={5} className="px-6 py-6 text-center text-slate-400">Loading…</td></tr>
+              ) : (globalRules ?? []).length === 0 ? (
+                <tr><td colSpan={5}><EmptyState icon={Globe} text="No global rules yet. Add one above to block or allow patterns server-wide." /></td></tr>
+              ) : (globalRules ?? []).map(r => (
                 <tr key={r.id} className="hover:bg-slate-50/60 transition-colors">
-                  <td className="px-6 py-4"><RuleBadge type={r.access_type} /></td>
-                  <td className="px-6 py-4 font-mono text-xs font-bold text-slate-800">{r.sender_pattern}</td>
-                  <td className="px-6 py-4 text-[11px] text-slate-500 font-mono">{r.mailbox_email}</td>
-                  <td className="px-6 py-4">
-                    <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold">{r.owner}</span>
-                  </td>
-                  <td className="px-6 py-4 text-xs text-slate-500">{r.domain_name}</td>
-                  <td className="px-6 py-4 text-[11px] text-slate-400">
-                    {new Date(r.created_at).toLocaleDateString()}
-                  </td>
-                  <td className="px-6 py-4 text-right">
+                  <td className="px-6 py-3"><RuleBadge type={r.access_type} /></td>
+                  <td className="px-6 py-3 font-mono text-xs font-bold text-slate-800">{r.sender_pattern}</td>
+                  <td className="px-6 py-3 text-xs text-slate-500 italic">{r.note ?? '—'}</td>
+                  <td className="px-6 py-3 text-[11px] text-slate-400">{new Date(r.created_at).toLocaleDateString()}</td>
+                  <td className="px-6 py-3 text-right">
                     <button
-                      onClick={() => {
-                        if (window.confirm(`Delete rule for ${r.sender_pattern}?`))
-                          deleteMutation.mutate(r.id);
-                      }}
+                      onClick={() => { if (window.confirm(`Delete global rule for ${r.sender_pattern}?`)) deleteGlobalMutation.mutate(r.id); }}
                       className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
                     >
                       <Trash2 size={15} />
@@ -792,6 +856,101 @@ const RulesTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
               ))}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      {/* ── Per-mailbox rules ─────────────────────────────────────────────── */}
+      <div className="space-y-4">
+        {/* Summary chips */}
+        <div className="flex gap-3">
+          <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl">
+            <UserCheck size={14} className="text-emerald-600" />
+            <span className="text-xs font-bold text-emerald-700">{allowCount} user whitelist rules</span>
+          </div>
+          <div className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl">
+            <UserX size={14} className="text-red-600" />
+            <span className="text-xs font-bold text-red-700">{blockCount} user blacklist rules</span>
+          </div>
+        </div>
+
+        {/* Toolbar */}
+        <div className="flex flex-col md:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              className="w-full pl-9 pr-4 py-2.5 border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-orange-500/20"
+              placeholder="Search pattern or owner…"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+            />
+          </div>
+          <div className="flex gap-1 bg-slate-100 p-1 rounded-xl">
+            {(['all', 'allow', 'block'] as const).map(v => (
+              <button
+                key={v}
+                onClick={() => setTypeFilter(v)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${typeFilter === v ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                {v === 'all' ? 'All' : v === 'allow' ? 'Whitelist' : 'Blacklist'}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
+            className="flex items-center gap-2 px-3 py-2.5 border border-slate-200 rounded-xl text-sm text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+            title="Toggle sort direction"
+          >
+            <ArrowUpDown size={14} />
+            {sortDir === 'asc' ? 'A→Z' : 'Z→A'}
+          </button>
+        </div>
+
+        <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+          {filtered.length} user rules
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left">
+              <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                <tr>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Type</th>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Pattern</th>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Mailbox</th>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Owner</th>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Domain</th>
+                  <th className="px-6 py-3 text-[10px] font-bold uppercase tracking-wider">Added</th>
+                  <th className="px-6 py-3 text-right text-[10px] font-bold uppercase tracking-wider"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {isLoading ? (
+                  <tr><td colSpan={7} className="px-6 py-10 text-center text-slate-400">Loading…</td></tr>
+                ) : filtered.length === 0 ? (
+                  <tr><td colSpan={7}><EmptyState icon={Filter} text="No per-mailbox rules match your filter." /></td></tr>
+                ) : filtered.map(r => (
+                  <tr key={r.id} className="hover:bg-slate-50/60 transition-colors">
+                    <td className="px-6 py-4"><RuleBadge type={r.access_type} /></td>
+                    <td className="px-6 py-4 font-mono text-xs font-bold text-slate-800">{r.sender_pattern}</td>
+                    <td className="px-6 py-4 text-[11px] text-slate-500 font-mono">{r.mailbox_email}</td>
+                    <td className="px-6 py-4">
+                      <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold">{r.owner}</span>
+                    </td>
+                    <td className="px-6 py-4 text-xs text-slate-500">{r.domain_name}</td>
+                    <td className="px-6 py-4 text-[11px] text-slate-400">{new Date(r.created_at).toLocaleDateString()}</td>
+                    <td className="px-6 py-4 text-right">
+                      <button
+                        onClick={() => { if (window.confirm(`Delete rule for ${r.sender_pattern}?`)) deleteMutation.mutate(r.id); }}
+                        className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>

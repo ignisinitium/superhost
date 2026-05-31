@@ -96,6 +96,8 @@ export interface MailUser {
   quota: number;
   spam_filter_enabled: boolean;
   spam_digest_enabled: boolean;
+  spam_score_threshold: number;
+  spam_action: 'quarantine' | 'tag' | 'deliver';
   is_catchall: boolean;
   created_at: string;
   domain_name?: string;
@@ -125,6 +127,16 @@ export interface MailQuarantine {
   subject: string;
   spam_score: number;
   file_path: string;
+  created_at: string;
+  released_at: string | null;
+  expires_at: string;
+}
+
+export interface MailGlobalRule {
+  id: number;
+  sender_pattern: string;
+  access_type: 'allow' | 'block';
+  note: string | null;
   created_at: string;
 }
 

@@ -184,8 +184,12 @@ router.patch('/:id/password', async (req: AuthRequest, res) => {
 // Update Email Account (Quota, Spam Filter)
 router.patch('/:id', async (req: AuthRequest, res) => {
   const { id } = req.params;
-  const { quota, spamFilterEnabled } = req.body;
+  const { quota, spamFilterEnabled, spamDigestEnabled, spamScoreThreshold, spamAction } = req.body;
   const userId = req.userId!;
+
+  if (spamAction !== undefined && !['quarantine', 'tag', 'deliver'].includes(spamAction)) {
+    return res.status(400).json({ message: 'spamAction must be quarantine, tag, or deliver' });
+  }
 
   try {
     const verifyRes = await query(`
@@ -199,11 +203,14 @@ router.patch('/:id', async (req: AuthRequest, res) => {
 
     const result = await query(`
       UPDATE mail_users
-      SET quota = COALESCE($1, quota),
-          spam_filter_enabled = COALESCE($2, spam_filter_enabled)
-      WHERE id = $3
+      SET quota                = COALESCE($1, quota),
+          spam_filter_enabled  = COALESCE($2, spam_filter_enabled),
+          spam_digest_enabled  = COALESCE($3, spam_digest_enabled),
+          spam_score_threshold = COALESCE($4, spam_score_threshold),
+          spam_action          = COALESCE($5, spam_action)
+      WHERE id = $6
       RETURNING *
-    `, [quota, spamFilterEnabled, id]);
+    `, [quota ?? null, spamFilterEnabled ?? null, spamDigestEnabled ?? null, spamScoreThreshold ?? null, spamAction ?? null, id]);
 
     // If quota changed, recalculate in Dovecot
     if (quota !== undefined) {
@@ -334,9 +341,10 @@ router.post('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
 
 // --- Spam Quarantine & Access Control ---
 
-// Get quarantined emails for a user
+// Get quarantined emails for a user (supports ?search=)
 router.get('/:mailUserId/quarantine', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  const { search } = req.query;
   try {
     const verifyRes = await query(`
       SELECT mu.id FROM mail_users mu
@@ -346,35 +354,90 @@ router.get('/:mailUserId/quarantine', async (req: AuthRequest, res) => {
 
     if (verifyRes.rowCount === 0) return res.status(403).json({ message: 'Access denied' });
 
-    const result = await query('SELECT * FROM mail_quarantine WHERE mail_user_id = $1 ORDER BY created_at DESC', [mailUserId]);
+    const params: unknown[] = [mailUserId];
+    let sql = 'SELECT * FROM mail_quarantine WHERE mail_user_id = $1 AND released_at IS NULL';
+    if (search && typeof search === 'string' && search.trim()) {
+      sql += ' AND (sender ILIKE $2 OR subject ILIKE $2)';
+      params.push(`%${search.trim()}%`);
+    }
+    sql += ' ORDER BY created_at DESC';
+
+    const result = await query(sql, params);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
 });
 
-// Release email from quarantine (Deliver)
+// Bulk release or delete quarantined emails (client)
+router.post('/quarantine/bulk', async (req: AuthRequest, res) => {
+  const { ids, action } = req.body as { ids: number[]; action: 'release' | 'delete' };
+  if (!Array.isArray(ids) || !ids.length || !['release', 'delete'].includes(action)) {
+    return res.status(400).json({ message: 'ids[] and action (release|delete) required' });
+  }
+  const safeIds = ids.slice(0, 200).map(Number).filter(n => Number.isFinite(n) && n > 0);
+  const userId = req.userId!;
+
+  try {
+    const qRes = await query(`
+      SELECT q.id, q.file_path, q.sender, q.mail_user_id, mu.email AS recipient
+      FROM mail_quarantine q
+      JOIN mail_users mu ON q.mail_user_id = mu.id
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE q.id = ANY($1) AND md.user_id = $2 AND q.released_at IS NULL
+    `, [safeIds, userId]);
+
+    if (action === 'delete') {
+      await query('DELETE FROM mail_quarantine WHERE id = ANY($1)', [qRes.rows.map((r: any) => r.id)]);
+      for (const row of qRes.rows) {
+        if (row.file_path) {
+          await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+            ['DELETE_FILE', { filePath: row.file_path }]);
+        }
+      }
+    } else {
+      for (const row of qRes.rows) {
+        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+          ['RELEASE_QUARANTINE', { id: row.id, filePath: row.file_path, recipient: row.recipient }]);
+      }
+    }
+
+    res.json({ processed: qRes.rows.length });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Release email from quarantine (Deliver), optionally adding sender to allowlist
 router.post('/quarantine/:id/release', async (req: AuthRequest, res) => {
   const { id } = req.params;
+  const { addToAllowlist } = req.body as { addToAllowlist?: boolean };
   try {
     const qRes = await query(`
       SELECT q.*, mu.email FROM mail_quarantine q
       JOIN mail_users mu ON q.mail_user_id = mu.id
       JOIN mail_domains md ON mu.domain_id = md.id
-      WHERE q.id = $1 AND md.user_id = $2
+      WHERE q.id = $1 AND md.user_id = $2 AND q.released_at IS NULL
     `, [id, req.userId]);
 
     if (qRes.rowCount === 0) return res.status(404).json({ message: 'Quarantined email not found' });
 
-    const email = qRes.rows[0];
+    const item = qRes.rows[0];
 
-    // Trigger worker to deliver the file
     await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', [
-      'RELEASE_QUARANTINE', 
-      { id, filePath: email.file_path, recipient: email.email }
+      'RELEASE_QUARANTINE',
+      { id: item.id, filePath: item.file_path, recipient: item.email }
     ]);
 
-    res.json({ message: 'Email release task started' });
+    if (addToAllowlist && item.sender) {
+      await query(`
+        INSERT INTO mail_access_control (mail_user_id, sender_pattern, access_type)
+        VALUES ($1, $2, 'allow')
+        ON CONFLICT (mail_user_id, sender_pattern) DO NOTHING
+      `, [item.mail_user_id, item.sender]);
+    }
+
+    res.json({ message: 'Email release queued' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
@@ -388,7 +451,7 @@ router.delete('/quarantine/:id', async (req: AuthRequest, res) => {
       SELECT q.id, q.file_path FROM mail_quarantine q
       JOIN mail_users mu ON q.mail_user_id = mu.id
       JOIN mail_domains md ON mu.domain_id = md.id
-      WHERE q.id = $1 AND md.user_id = $2
+      WHERE q.id = $1 AND md.user_id = $2 AND q.released_at IS NULL
     `, [id, req.userId]);
 
     if (verifyRes.rowCount === 0) return res.status(403).json({ message: 'Access denied' });
