@@ -21,6 +21,13 @@ router.get('/stats', async (_req, res) => {
       scoreDist,
       recent,
       dailyVolume,
+      allTimeTotal,
+      avgScore,
+      topMailboxes,
+      topRecipientDomains,
+      topSenderDomains,
+      weeklyTrend,
+      serverStats,
     ] = await Promise.all([
       query('SELECT COUNT(*) FROM mail_users'),
       query("SELECT COUNT(*) FROM mail_quarantine WHERE released_at IS NULL"),
@@ -53,7 +60,7 @@ router.get('/stats', async (_req, res) => {
       `),
       query(`
         SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.created_at,
-               mu.email AS mailbox_email, u.username AS owner
+               mu.email AS mailbox_email, md.domain_name, u.username AS owner
         FROM mail_quarantine mq
         JOIN mail_users mu ON mq.mail_user_id = mu.id
         JOIN mail_domains md ON mu.domain_id = md.id
@@ -69,19 +76,86 @@ router.get('/stats', async (_req, res) => {
         GROUP BY day
         ORDER BY day ASC
       `),
+      // All-time quarantine total (including released false positives)
+      query('SELECT COUNT(*)::int AS count FROM mail_quarantine'),
+      // Average spam score across all active quarantine
+      query(`
+        SELECT ROUND(AVG(spam_score)::numeric, 2)::real AS avg
+        FROM mail_quarantine
+        WHERE spam_score IS NOT NULL AND released_at IS NULL
+      `),
+      // Top mailboxes by spam received (all-time)
+      query(`
+        SELECT mu.email, md.domain_name, u.username AS owner,
+               COUNT(*)::int AS spam_count,
+               ROUND(AVG(mq.spam_score)::numeric, 1)::real AS avg_score
+        FROM mail_quarantine mq
+        JOIN mail_users mu ON mq.mail_user_id = mu.id
+        JOIN mail_domains md ON mu.domain_id = md.id
+        JOIN users u ON md.user_id = u.id
+        GROUP BY mu.email, md.domain_name, u.username
+        ORDER BY spam_count DESC
+        LIMIT 10
+      `),
+      // Top receiving domains by spam volume
+      query(`
+        SELECT md.domain_name, COUNT(*)::int AS spam_count
+        FROM mail_quarantine mq
+        JOIN mail_users mu ON mq.mail_user_id = mu.id
+        JOIN mail_domains md ON mu.domain_id = md.id
+        GROUP BY md.domain_name
+        ORDER BY spam_count DESC
+        LIMIT 10
+      `),
+      // Top sender domains found in quarantine (extract domain from sender address)
+      query(`
+        SELECT
+          CASE WHEN sender LIKE '%@%' THEN split_part(sender, '@', 2) ELSE sender END AS sender_domain,
+          COUNT(*)::int AS count,
+          ROUND(AVG(spam_score)::numeric, 1)::real AS avg_score
+        FROM mail_quarantine
+        WHERE released_at IS NULL
+        GROUP BY sender_domain
+        ORDER BY count DESC
+        LIMIT 10
+      `),
+      // Week-over-week quarantine volume
+      query(`
+        SELECT
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int  AS this_week,
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '14 days'
+                              AND created_at <  NOW() - INTERVAL '7 days')::int  AS last_week
+        FROM mail_quarantine
+      `),
+      // Total emails received (scanned) from Postfix log tracker
+      query('SELECT COALESCE(SUM(total_received), 0)::int AS total FROM mail_server_stats'),
     ]);
 
+    const totalScanned   = parseInt(serverStats.rows[0].total) || 0;
+    const totalQuarantined = parseInt(quarantined.rows[0].count);
+    const catchRate = totalScanned > 0
+      ? Math.round((totalQuarantined / totalScanned) * 1000) / 10  // one decimal %
+      : null;
+
     res.json({
-      totalMailboxes:    parseInt(mailboxes.rows[0].count),
-      totalQuarantined:  parseInt(quarantined.rows[0].count),
-      releasedCount:     parseInt(released.rows[0].count),
-      filterEnabled:     parseInt(filterEnabled.rows[0].count),
-      totalRules:        parseInt(rules.rows[0].count) + parseInt(globalRules.rows[0].count),
-      highSeverity:      parseInt(highSeverity.rows[0].count),
-      topSenders:        topSenders.rows,
-      scoreDistribution: scoreDist.rows,
-      recentQuarantine:  recent.rows,
-      dailyVolume:       dailyVolume.rows,
+      totalMailboxes:       parseInt(mailboxes.rows[0].count),
+      totalQuarantined,
+      releasedCount:        parseInt(released.rows[0].count),
+      filterEnabled:        parseInt(filterEnabled.rows[0].count),
+      totalRules:           parseInt(rules.rows[0].count) + parseInt(globalRules.rows[0].count),
+      highSeverity:         parseInt(highSeverity.rows[0].count),
+      topSenders:           topSenders.rows,
+      scoreDistribution:    scoreDist.rows,
+      recentQuarantine:     recent.rows,
+      dailyVolume:          dailyVolume.rows,
+      allTimeQuarantined:   parseInt(allTimeTotal.rows[0].count),
+      avgSpamScore:         avgScore.rows[0].avg ?? null,
+      topMailboxesBySpam:   topMailboxes.rows,
+      topRecipientDomains:  topRecipientDomains.rows,
+      topSenderDomains:     topSenderDomains.rows,
+      weeklyTrend:          weeklyTrend.rows[0] ?? { this_week: 0, last_week: 0 },
+      totalScanned,
+      catchRate,
     });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });

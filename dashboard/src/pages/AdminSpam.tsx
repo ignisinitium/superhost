@@ -8,10 +8,11 @@ import adminApi from '../api/admin';
 import api from '../api/client';
 import {
   ShieldAlert, Trash2, CheckCircle2, Filter, Mail,
-  TrendingDown, AlertTriangle, Search, RefreshCw, Send,
+  TrendingDown, TrendingUp, AlertTriangle, Search, RefreshCw, Send,
   UserCheck, UserX, MailOpen, ShieldCheck,
   CircleAlert, Inbox, SquareCheck, Square, X, ArrowUpDown,
-  Globe, Plus, CalendarRange, Undo2,
+  Globe, Plus, CalendarRange, Undo2, ScanLine, Target, Percent,
+  Building2, Activity,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -28,6 +29,15 @@ interface SpamStats {
   scoreDistribution: { range: string; count: number }[];
   recentQuarantine: QuarantineItem[];
   dailyVolume: { day: string; count: number }[];
+  // enriched
+  allTimeQuarantined: number;
+  avgSpamScore: number | null;
+  topMailboxesBySpam: { email: string; domain_name: string; owner: string; spam_count: number; avg_score: number | null }[];
+  topRecipientDomains: { domain_name: string; spam_count: number }[];
+  topSenderDomains: { sender_domain: string; count: number; avg_score: number | null }[];
+  weeklyTrend: { this_week: number; last_week: number };
+  totalScanned: number;
+  catchRate: number | null;
 }
 
 interface GlobalRule {
@@ -189,6 +199,35 @@ const DigestButton: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }>
 
 // ── Overview tab ───────────────────────────────────────────────────────────────
 
+function TrendChip({ thisWeek, lastWeek }: { thisWeek: number; lastWeek: number }) {
+  if (lastWeek === 0 && thisWeek === 0) return null;
+  const pct = lastWeek === 0 ? 100 : Math.round(((thisWeek - lastWeek) / lastWeek) * 100);
+  const up = pct > 0;
+  return (
+    <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+      up ? 'bg-red-50 text-red-600 border-red-100' : 'bg-emerald-50 text-emerald-700 border-emerald-100'
+    }`}>
+      {up ? <TrendingUp size={10} /> : <TrendingDown size={10} />}
+      {up ? '+' : ''}{pct}% vs last week
+    </span>
+  );
+}
+
+function LeaderBar({ value, max, color = 'orange' }: { value: number; max: number; color?: string }) {
+  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+  const colorMap: Record<string, string> = {
+    orange: 'bg-orange-400',
+    red:    'bg-red-400',
+    blue:   'bg-blue-400',
+    violet: 'bg-violet-400',
+  };
+  return (
+    <div className="mt-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+      <div className={`h-full rounded-full transition-all ${colorMap[color] ?? 'bg-orange-400'}`} style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
 const OverviewTab: React.FC = () => {
   const { data: stats, isLoading } = useQuery<SpamStats>({
     queryKey: ['adminSpamStats'],
@@ -205,17 +244,35 @@ const OverviewTab: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {/* Stat cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <StatCard color="orange"  icon={<Inbox size={20} />}       label="Quarantined"     value={stats.totalQuarantined.toLocaleString()} />
-        <StatCard color="red"     icon={<CircleAlert size={20} />}  label="High Severity"   value={stats.highSeverity.toLocaleString()} sub="score > 10" />
-        <StatCard color="emerald" icon={<Undo2 size={20} />}        label="Released (30d)"  value={stats.releasedCount.toLocaleString()} sub="false positives" />
-        <StatCard color="sky"     icon={<Mail size={20} />}         label="Mailboxes"       value={stats.totalMailboxes.toLocaleString()} />
-        <StatCard color="blue"    icon={<ShieldCheck size={20} />}  label="Filter Coverage" value={`${filterPct}%`} sub={`${stats.filterEnabled} of ${stats.totalMailboxes}`} />
-        <StatCard color="violet"  icon={<Filter size={20} />}       label="Rules"           value={stats.totalRules.toLocaleString()} />
+
+      {/* ── Top stat cards ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+        <StatCard color="slate"   icon={<ScanLine size={18} />}      label="Emails Scanned"  value={stats.totalScanned > 0 ? stats.totalScanned.toLocaleString() : '—'} sub={stats.totalScanned > 0 ? 'all time (Postfix)' : 'building history…'} />
+        <StatCard color="orange"  icon={<ShieldAlert size={18} />}   label="All-Time Spam"   value={stats.allTimeQuarantined.toLocaleString()} sub="ever detected" />
+        <StatCard color="amber"   icon={<Inbox size={18} />}         label="Quarantined Now"  value={stats.totalQuarantined.toLocaleString()} sub="awaiting review" />
+        <StatCard color="red"     icon={<CircleAlert size={18} />}   label="High Severity"   value={stats.highSeverity.toLocaleString()} sub="score > 10" />
+        <StatCard color="emerald" icon={<Undo2 size={18} />}         label="Released (30d)"  value={stats.releasedCount.toLocaleString()} sub="false positives" />
+        <StatCard color="blue"    icon={<Percent size={18} />}       label="Catch Rate"      value={stats.catchRate !== null ? `${stats.catchRate}%` : '—'} sub={stats.catchRate !== null ? 'spam / total' : 'need scan data'} />
+        <StatCard color="violet"  icon={<Target size={18} />}        label="Avg Score"       value={stats.avgSpamScore !== null ? stats.avgSpamScore.toFixed(1) : '—'} sub="active quarantine" />
+        <StatCard color="sky"     icon={<ShieldCheck size={18} />}   label="Filter Coverage" value={`${filterPct}%`} sub={`${stats.filterEnabled}/${stats.totalMailboxes} mailboxes`} />
       </div>
 
-      {/* Charts row */}
+      {/* ── Weekly trend banner ── */}
+      <div className="flex items-center gap-4 px-5 py-3 bg-white border border-slate-200 rounded-2xl shadow-sm">
+        <Activity size={16} className="text-slate-400 shrink-0" />
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="text-sm font-bold text-slate-700">This week:</span>
+          <span className="text-sm font-mono font-bold text-slate-900">{stats.weeklyTrend.this_week.toLocaleString()} quarantined</span>
+          <TrendChip thisWeek={stats.weeklyTrend.this_week} lastWeek={stats.weeklyTrend.last_week} />
+          <span className="text-xs text-slate-400 ml-2">Last week: {stats.weeklyTrend.last_week.toLocaleString()}</span>
+        </div>
+        <div className="ml-auto text-right hidden sm:block">
+          <p className="text-[10px] text-slate-400 uppercase tracking-wider">Total rules</p>
+          <p className="text-sm font-bold text-slate-800">{stats.totalRules}</p>
+        </div>
+      </div>
+
+      {/* ── Charts row ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 14-day volume */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
@@ -236,7 +293,7 @@ const OverviewTab: React.FC = () => {
                   contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
                   labelFormatter={v => `Date: ${v}`}
                 />
-                <Area type="monotone" dataKey="count" stroke="#f97316" strokeWidth={2} fill="url(#volGrad)" name="Emails" />
+                <Area type="monotone" dataKey="count" stroke="#f97316" strokeWidth={2} fill="url(#volGrad)" name="Quarantined" />
               </AreaChart>
             </ResponsiveContainer>
           ) : (
@@ -263,32 +320,69 @@ const OverviewTab: React.FC = () => {
         </div>
       </div>
 
-      {/* Bottom row: top senders + recent */}
+      {/* ── Four leaderboard panels ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Top spam senders */}
+
+        {/* Top targeted mailboxes */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
+            <Target size={16} className="text-orange-500" />
+            <h3 className="text-sm font-bold text-slate-800">Most Targeted Mailboxes</h3>
+            <span className="ml-auto text-[10px] text-slate-400">all time</span>
+          </div>
+          {stats.topMailboxesBySpam.length > 0 ? (
+            <div className="divide-y divide-slate-100">
+              {stats.topMailboxesBySpam.map((m, i) => {
+                const max = stats.topMailboxesBySpam[0]?.spam_count ?? 1;
+                return (
+                  <div key={i} className="flex items-center gap-3 px-6 py-3">
+                    <span className="text-xs font-bold text-slate-300 w-4 shrink-0">{i + 1}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="text-xs font-mono text-slate-700 truncate">{m.email}</p>
+                        <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 font-bold shrink-0">{m.owner}</span>
+                      </div>
+                      <LeaderBar value={m.spam_count} max={max} color="orange" />
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className="text-xs font-bold text-slate-700">{m.spam_count}</p>
+                      {m.avg_score !== null && (
+                        <p className="text-[10px] text-slate-400">avg {m.avg_score.toFixed(1)}</p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <EmptyState icon={Mail} text="No quarantine data yet." />
+          )}
+        </div>
+
+        {/* Top sender domains */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
             <AlertTriangle size={16} className="text-red-500" />
-            <h3 className="text-sm font-bold text-slate-800">Top Spam Sources</h3>
+            <h3 className="text-sm font-bold text-slate-800">Top Spam Source Domains</h3>
+            <span className="ml-auto text-[10px] text-slate-400">currently quarantined</span>
           </div>
-          {stats.topSenders.length > 0 ? (
+          {stats.topSenderDomains.length > 0 ? (
             <div className="divide-y divide-slate-100">
-              {stats.topSenders.map((s, i) => {
-                const maxCount = stats.topSenders[0]?.count ?? 1;
-                const pct = Math.round((s.count / maxCount) * 100);
+              {stats.topSenderDomains.map((s, i) => {
+                const max = stats.topSenderDomains[0]?.count ?? 1;
                 return (
-                  <div key={i} className="flex items-center gap-4 px-6 py-3">
+                  <div key={i} className="flex items-center gap-3 px-6 py-3">
                     <span className="text-xs font-bold text-slate-300 w-4 shrink-0">{i + 1}</span>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-mono text-slate-700 truncate">{s.sender}</p>
-                      <div className="mt-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-orange-400 rounded-full transition-all"
-                          style={{ width: `${pct}%` }}
-                        />
-                      </div>
+                      <p className="text-xs font-mono text-slate-700 truncate">{s.sender_domain || '(unknown)'}</p>
+                      <LeaderBar value={s.count} max={max} color="red" />
                     </div>
-                    <span className="text-xs font-bold text-slate-500 shrink-0">{s.count}</span>
+                    <div className="text-right shrink-0">
+                      <p className="text-xs font-bold text-slate-700">{s.count}</p>
+                      {s.avg_score !== null && (
+                        <p className="text-[10px] text-slate-400">avg {s.avg_score.toFixed(1)}</p>
+                      )}
+                    </div>
                   </div>
                 );
               })}
@@ -298,7 +392,35 @@ const OverviewTab: React.FC = () => {
           )}
         </div>
 
-        {/* Recent quarantine */}
+        {/* Top receiving domains */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
+            <Building2 size={16} className="text-blue-500" />
+            <h3 className="text-sm font-bold text-slate-800">Most Targeted Domains</h3>
+            <span className="ml-auto text-[10px] text-slate-400">all time</span>
+          </div>
+          {stats.topRecipientDomains.length > 0 ? (
+            <div className="divide-y divide-slate-100">
+              {stats.topRecipientDomains.map((d, i) => {
+                const max = stats.topRecipientDomains[0]?.spam_count ?? 1;
+                return (
+                  <div key={i} className="flex items-center gap-3 px-6 py-3">
+                    <span className="text-xs font-bold text-slate-300 w-4 shrink-0">{i + 1}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono font-bold text-slate-700 truncate">{d.domain_name}</p>
+                      <LeaderBar value={d.spam_count} max={max} color="blue" />
+                    </div>
+                    <span className="text-xs font-bold text-slate-700 shrink-0">{d.spam_count}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <EmptyState icon={Globe} text="No domain data yet." />
+          )}
+        </div>
+
+        {/* Recently quarantined */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60 flex items-center gap-2">
             <Inbox size={16} className="text-orange-500" />
@@ -314,9 +436,14 @@ const OverviewTab: React.FC = () => {
                     <p className="text-[10px] text-slate-400 truncate font-mono">{q.sender}</p>
                     <p className="text-[10px] text-slate-400">→ {q.mailbox_email}</p>
                   </div>
-                  <span className="text-[10px] text-slate-400 whitespace-nowrap shrink-0">
-                    {new Date(q.created_at).toLocaleDateString()}
-                  </span>
+                  <div className="text-right shrink-0">
+                    <span className="text-[10px] text-slate-400 whitespace-nowrap">
+                      {new Date(q.created_at).toLocaleDateString()}
+                    </span>
+                    {q.domain_name && (
+                      <p className="text-[9px] text-slate-400 font-mono">{q.domain_name}</p>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -324,6 +451,7 @@ const OverviewTab: React.FC = () => {
             <EmptyState icon={Inbox} text="Nothing quarantined yet." />
           )}
         </div>
+
       </div>
     </div>
   );
@@ -1039,21 +1167,28 @@ const StatCard: React.FC<{
   color: string;
   sub?: string;
 }> = ({ icon, label, value, color, sub }) => (
-  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex items-start gap-4">
-    <div className={`p-3 rounded-xl bg-${color}-50 text-${color}-600 shrink-0`}>{icon}</div>
+  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 flex flex-col gap-3">
+    <div className={`p-2 rounded-xl bg-${color}-50 text-${color}-600 w-fit`}>{icon}</div>
     <div className="min-w-0">
-      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest truncate">{label}</p>
-      <p className="text-xl font-bold text-slate-900 mt-0.5">{value}</p>
-      {sub && <p className="text-[10px] text-slate-400 mt-0.5">{sub}</p>}
+      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest leading-tight">{label}</p>
+      <p className="text-lg font-bold text-slate-900 mt-0.5 leading-none">{value}</p>
+      {sub && <p className="text-[10px] text-slate-400 mt-1 leading-tight">{sub}</p>}
     </div>
   </div>
 );
 
 const LoadingGrid: React.FC = () => (
-  <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-    {Array.from({ length: 5 }).map((_, i) => (
-      <div key={i} className="h-24 bg-slate-100 rounded-2xl animate-pulse" />
-    ))}
+  <div className="space-y-6">
+    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div key={i} className="h-24 bg-slate-100 rounded-2xl animate-pulse" />
+      ))}
+    </div>
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="h-48 bg-slate-100 rounded-2xl animate-pulse" />
+      ))}
+    </div>
   </div>
 );
 

@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 export interface AuthRequest extends express.Request {
   adminId?: number;
   userId?: number;
+  mailUserId?: number;
 }
 
 function getJwtSecret(): string {
@@ -48,10 +49,9 @@ export const authenticateClient = (req: AuthRequest, res: express.Response, next
   if (!token) return res.status(401).json({ message: 'Token missing' });
 
   try {
-    const decoded = jwt.verify(token, getJwtSecret()) as { id: number; role: string };
+    const decoded = jwt.verify(token, getJwtSecret()) as { id: number; role: string; mailUserId?: number };
 
-    // Strict role check: only 'client' tokens may access client routes
-    if (!decoded.role || decoded.role !== 'client') {
+    if (!decoded.role || (decoded.role !== 'client' && decoded.role !== 'mail_user')) {
       return res.status(403).json({ message: 'Access denied: client role required' });
     }
 
@@ -60,6 +60,7 @@ export const authenticateClient = (req: AuthRequest, res: express.Response, next
     }
 
     req.userId = decoded.id;
+    if (decoded.mailUserId) req.mailUserId = decoded.mailUserId;
     next();
   } catch (err) {
     res.status(401).json({ message: 'Invalid or expired token' });

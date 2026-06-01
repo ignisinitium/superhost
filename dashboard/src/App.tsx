@@ -43,6 +43,7 @@ import AdminUserWebsitesPage from './pages/AdminUserWebsites';
 import AdminUserDatabasesPage from './pages/AdminUserDatabases';
 import AdminEmailPage from './pages/AdminEmail';
 import SpamDashboard from './pages/SpamDashboard';
+import MailSpamLogin from './pages/MailSpamLogin';
 import AdminMonitoring from './pages/AdminMonitoring';
 import ResellerManager from './pages/ResellerManager';
 import ResellerBranding from './pages/ResellerBranding';
@@ -67,14 +68,23 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
   }
 }
 
-function getTokenRole(): 'admin' | 'client' | null {
+function getTokenRole(): 'admin' | 'client' | 'mail_user' | null {
   const token = localStorage.getItem('token');
   if (!token) return null;
   const payload = decodeJwtPayload(token);
   if (!payload) return null;
   const role = payload['role'];
-  if (role === 'admin' || role === 'client') return role;
+  if (role === 'admin' || role === 'client' || role === 'mail_user') return role;
   return null;
+}
+
+function getMailUserId(): number | null {
+  const token = localStorage.getItem('token');
+  if (!token) return null;
+  const payload = decodeJwtPayload(token);
+  if (!payload) return null;
+  const id = payload['mailUserId'];
+  return typeof id === 'number' ? id : null;
 }
 
 function isTokenExpired(): boolean {
@@ -102,17 +112,26 @@ function safeSetCssVar(varName: string, value: unknown): void {
 // ProtectedRoute — reads role from JWT payload, not a separate localStorage key
 // ---------------------------------------------------------------------------
 const ProtectedRoute = ({ children, role }: { children: React.ReactElement; role?: 'admin' | 'client' }) => {
-  // Check token presence and expiry
   if (isTokenExpired()) {
     localStorage.removeItem('token');
     return <Navigate to={role === 'client' ? '/client/login' : '/login'} replace />;
   }
-
-  // Check role from JWT payload directly
   const tokenRole = getTokenRole();
   if (role && tokenRole !== role) {
-    // Wrong role — redirect to appropriate login
     return <Navigate to={role === 'client' ? '/client/login' : '/login'} replace />;
+  }
+  return children;
+};
+
+// Accepts both 'client' and 'mail_user' tokens — used for the standalone /spam route
+const SpamProtectedRoute = ({ children }: { children: React.ReactElement }) => {
+  if (isTokenExpired()) {
+    localStorage.removeItem('token');
+    return <Navigate to="/spam-login" replace />;
+  }
+  const tokenRole = getTokenRole();
+  if (tokenRole !== 'client' && tokenRole !== 'mail_user') {
+    return <Navigate to="/spam-login" replace />;
   }
 
   return children;
@@ -289,6 +308,15 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/client/login" element={<ClientLogin />} />
+          <Route path="/spam-login" element={<MailSpamLogin />} />
+          <Route
+            path="/my-spam"
+            element={
+              <SpamProtectedRoute>
+                <SpamDashboard mailUserIdOverride={getMailUserId()} />
+              </SpamProtectedRoute>
+            }
+          />
 
           {/* Admin Routes */}
           <Route

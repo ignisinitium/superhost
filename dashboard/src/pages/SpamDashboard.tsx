@@ -37,16 +37,39 @@ function RuleBadge({ type }: { type: 'allow' | 'block' }) {
 
 // ── Main Page ──────────────────────────────────────────────────────────────────
 
-const SpamDashboard: React.FC = () => {
+function getMailUserIdFromToken(): number | null {
+  try {
+    const token = localStorage.getItem('token');
+    if (!token) return null;
+    const payload = JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/')));
+    if (payload?.role !== 'mail_user') return null;
+    const id = payload?.mailUserId;
+    return typeof id === 'number' ? id : typeof id === 'string' ? parseInt(id, 10) : null;
+  } catch { return null; }
+}
+
+const SpamDashboard: React.FC<{ mailUserIdOverride?: number | null }> = ({ mailUserIdOverride }) => {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
+
+  const lockedMailUserId = mailUserIdOverride ?? getMailUserIdFromToken();
+
+  const [selectedMailboxId, setSelectedMailboxId] = useState<string>(
+    lockedMailUserId ? lockedMailUserId.toString() : ''
+  );
   const [activeTab, setActiveTab] = useState<Tab>('quarantine');
 
   const { data: mailboxes } = useQuery<MailUser[]>({
     queryKey: ['clientEmails'],
     queryFn: async () => (await api.get('/client/email')).data,
   });
+
+  // Ensure selection is set once mailboxes load (covers any timing edge case)
+  useEffect(() => {
+    if (lockedMailUserId && !selectedMailboxId) {
+      setSelectedMailboxId(lockedMailUserId.toString());
+    }
+  }, [lockedMailUserId, selectedMailboxId]);
 
   const selectedMailbox = useMemo(
     () => mailboxes?.find(m => m.id.toString() === selectedMailboxId),
@@ -101,14 +124,16 @@ const SpamDashboard: React.FC = () => {
           </h1>
           <p className="text-slate-500 mt-1 ml-1">Quarantine, rules, and spam filter settings for your mailboxes.</p>
         </div>
-        <select
-          className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold text-slate-700 outline-none shadow-sm focus:ring-2 focus:ring-orange-500/20"
-          value={selectedMailboxId}
-          onChange={e => setSelectedMailboxId(e.target.value)}
-        >
-          <option value="" disabled>Select Mailbox</option>
-          {mailboxes?.map(m => <option key={m.id} value={m.id}>{m.email}</option>)}
-        </select>
+        {!lockedMailUserId && (
+          <select
+            className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold text-slate-700 outline-none shadow-sm focus:ring-2 focus:ring-orange-500/20"
+            value={selectedMailboxId}
+            onChange={e => setSelectedMailboxId(e.target.value)}
+          >
+            <option value="" disabled>Select Mailbox</option>
+            {mailboxes?.map(m => <option key={m.id} value={m.id}>{m.email}</option>)}
+          </select>
+        )}
       </div>
 
       {!selectedMailboxId ? (

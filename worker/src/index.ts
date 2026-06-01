@@ -204,6 +204,9 @@ async function handleTask(task: Task) {
       case 'SCAN_QUARANTINE_FOLDERS':
         await handleScanQuarantineFolders(task.payload);
         break;
+      case 'REFRESH_MAIL_STATS':
+        await handleRefreshMailStats();
+        break;
       case 'PROVISION_MAILBOX':
         await handleProvisionMailbox(task.payload);
         break;
@@ -1380,11 +1383,17 @@ async function handleGenerateEmailDns(payload: any) {
     // DMARC
     await upsertRecord('TXT', '_dmarc', 'v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r;');
 
+    // A record for spam subdomain
+    await upsertRecord('A', 'spam', serverIp);
+
     // 5. Sync BIND zone file
     await handleSyncDnsZone({ zoneId, domainName });
 
     // 6. Provision webmail vhost at mail.<domain>
     await handleProvisionWebmailVhost({ domainName });
+
+    // 7. Provision spam vhost at spam.<domain>
+    await handleProvisionSpamVhost({ domainName });
 
     console.log(`Email DNS (MX, SPF, DKIM, DMARC) configured for ${domainName}`);
   } catch (err) {
@@ -1488,6 +1497,95 @@ server {
   await execPromise(`sudo mv /tmp/${mailHost}.nginx ${nginxConf}`);
   await execPromise('sudo nginx -t && sudo systemctl reload nginx');
   console.log(`Webmail vhost provisioned: https://${mailHost}`);
+}
+
+async function handleProvisionSpamVhost({ domainName }: { domainName: string }) {
+  const spamHost  = `spam.${domainName}`;
+  const nginxConf = `/etc/nginx/sites-available/${spamHost}`;
+  const nginxLink = `/etc/nginx/sites-enabled/${spamHost}`;
+  const certPath  = `/etc/letsencrypt/live/${spamHost}/fullchain.pem`;
+  const dashRoot  = '/home/jonathan/superhost/dashboard/dist';
+
+  const httpConf = `server {
+    listen 80;
+    server_name ${spamHost};
+
+    root ${dashRoot};
+    index index.html;
+
+    access_log /var/log/nginx/${spamHost}.access.log;
+    error_log  /var/log/nginx/${spamHost}.error.log;
+
+    location /api {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+`;
+
+  await fs.writeFile(`/tmp/${spamHost}.nginx`, httpConf);
+  await execPromise(`sudo mv /tmp/${spamHost}.nginx ${nginxConf}`);
+  await execPromise(`sudo ln -sf ${nginxConf} ${nginxLink}`);
+  await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+
+  try {
+    await execPromise(
+      `sudo certbot certonly --nginx --non-interactive --agree-tos ` +
+      `--email hostmaster@${domainName} -d ${shellEscape(spamHost)} 2>&1`
+    );
+  } catch (certErr: any) {
+    console.warn(`Certbot failed for ${spamHost} (DNS may still be propagating):`, certErr.stderr?.slice(0, 200));
+    return;
+  }
+
+  const httpsConf = `server {
+    listen 80;
+    server_name ${spamHost};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${spamHost};
+
+    ssl_certificate     ${certPath};
+    ssl_certificate_key /etc/letsencrypt/live/${spamHost}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root ${dashRoot};
+    index index.html;
+
+    access_log /var/log/nginx/${spamHost}.access.log;
+    error_log  /var/log/nginx/${spamHost}.error.log;
+
+    location /api {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+`;
+
+  await fs.writeFile(`/tmp/${spamHost}.nginx`, httpsConf);
+  await execPromise(`sudo mv /tmp/${spamHost}.nginx ${nginxConf}`);
+  await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+  console.log(`Spam vhost provisioned: https://${spamHost}`);
 }
 
 async function handleInstallWordPress(payload: any) {
@@ -1921,6 +2019,10 @@ async function handleConfigureMailServer() {
       'virtual_gid_maps = static:5000',
       // Route virtual delivery through Dovecot LMTP so sieve scripts run
       'virtual_transport = lmtp:unix:private/dovecot-lmtp',
+      // Milters: OpenDKIM (signing) + spamass-milter (SpamAssassin scoring)
+      'smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock',
+      'non_smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock',
+      'milter_default_action = accept',
     ];
     for (const setting of postconfSettings) {
       await execPromise(`sudo postconf -e ${shellEscape(setting)}`);
@@ -2380,7 +2482,8 @@ async function handleSendSpamDigest(payload: any) {
 
       console.log(`Sending spam digest to ${user.email} with ${qRes.rowCount} items...`);
 
-      const dashBase = `https://${process.env.DASHBOARD_DOMAIN}/client/spam`;
+      const emailDomain = user.email.split('@')[1] ?? process.env.MASTER_DOMAIN;
+      const dashBase = `https://spam.${emailDomain}/my-spam`;
       const rows = qRes.rows.map((item: any) => {
         const score = Number(item.spam_score ?? 0).toFixed(1);
         const scoreColor = Number(score) >= 10 ? '#dc2626' : '#ea580c';
@@ -2427,9 +2530,21 @@ async function handleSendSpamDigest(payload: any) {
   </div>
 </body></html>`;
 
-      const tempMail = `/tmp/digest_${user.id}.html`;
-      await fs.writeFile(tempMail, htmlBody);
-      await execPromise(`sudo mail -a "Content-Type: text/html" -s "Daily Spam Digest for ${shellEscape(user.email)}" ${shellEscape(user.email)} < ${shellEscape(tempMail)}`);
+      const masterDomain = process.env.MASTER_DOMAIN ?? 'localhost';
+      const rawSubject = `Daily Spam Digest for ${user.email}`;
+      const encodedSubject = `=?UTF-8?B?${Buffer.from(rawSubject).toString('base64')}?=`;
+      const fullMessage = [
+        `From: Superhost Spam Filter <noreply@${masterDomain}>`,
+        `To: ${user.email}`,
+        `Subject: ${encodedSubject}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/html; charset=utf-8',
+        '',
+        htmlBody,
+      ].join('\r\n');
+      const tempMail = `/tmp/digest_${user.id}.eml`;
+      await fs.writeFile(tempMail, fullMessage);
+      await execPromise(`/usr/sbin/sendmail -t < ${shellEscape(tempMail)}`);
       await fs.rm(tempMail);
     }
   } catch (err) {
@@ -2457,6 +2572,33 @@ async function handlePurgeExpiredQuarantine() {
     await client.query('DELETE FROM mail_quarantine WHERE id = ANY($1)', [expired.rows.map((r: any) => r.id)]);
     console.log(`Purged ${expired.rows.length} expired quarantine records`);
   }
+}
+
+// ── REFRESH_MAIL_STATS ─────────────────────────────────────────────────────────
+
+async function handleRefreshMailStats() {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+  // Count emails delivered to Dovecot today by parsing the Postfix mail log.
+  // Each "status=sent" from a postfix/lmtp process represents one delivery to Dovecot
+  // (and thus one email scanned by SpamAssassin/Sieve).
+  let totalReceived = 0;
+  try {
+    const { stdout } = await execPromise(
+      `sudo grep "$(date +'%b %e')" /var/log/mail.log 2>/dev/null | grep "postfix/lmtp" | grep -c "status=sent" || echo 0`
+    );
+    totalReceived = parseInt(stdout.trim(), 10) || 0;
+  } catch { /* best effort — log may not exist or be unreadable */ }
+
+  await client.query(`
+    INSERT INTO mail_server_stats (date, total_received, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (date) DO UPDATE SET
+      total_received = GREATEST(EXCLUDED.total_received, mail_server_stats.total_received),
+      updated_at = NOW()
+  `, [today, totalReceived]);
+
+  console.log(`Mail stats refreshed: ${totalReceived} received today (${today})`);
 }
 
 async function handleScanMalware(payload: any, taskId: number) {
@@ -3007,6 +3149,13 @@ async function start() {
     try { await handleScanQuarantineFolders({}); }
     catch (err) { console.error('Quarantine scan error:', err instanceof Error ? err.message : err); }
   }, 5 * 60 * 1000);
+
+  // Refresh Postfix delivery stats every hour
+  setInterval(async () => {
+    try { await handleRefreshMailStats(); }
+    catch (err) { console.error('Refresh mail stats error:', err instanceof Error ? err.message : err); }
+  }, 60 * 60 * 1000);
+  handleRefreshMailStats().catch(err => console.error('Initial mail stats error:', err));
 
   collectMetrics().catch(err => console.error('Initial collectMetrics error:', err));
   collectTrafficStats().catch(err => console.error('Initial collectTrafficStats error:', err));

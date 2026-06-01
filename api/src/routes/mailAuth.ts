@@ -1,0 +1,52 @@
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { query } from '../db.js';
+
+const router = express.Router();
+
+function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('FATAL: JWT_SECRET not set');
+  return secret;
+}
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body as { email?: string; password?: string };
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
+  }
+
+  try {
+    const muRes = await query(`
+      SELECT mu.id, mu.password_hash, md.user_id
+      FROM mail_users mu
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE mu.email = $1
+    `, [email.toLowerCase().trim()]);
+
+    if (muRes.rowCount === 0) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    const mu = muRes.rows[0];
+    // Stored as {BLF-CRYPT}$2b$... — strip the scheme prefix before comparing
+    const rawHash: string = (mu.password_hash as string).replace(/^\{[^}]+\}/, '');
+    const match = await bcrypt.compare(password, rawHash);
+    if (!match) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { id: mu.user_id, role: 'mail_user', mailUserId: mu.id },
+      getJwtSecret(),
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, email });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+export default router;
