@@ -249,7 +249,7 @@ const OverviewTab: React.FC = () => {
     <div className="space-y-6">
 
       {/* ── Top stat cards ── */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-9 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         <StatCard color="slate"   icon={<ScanLine size={18} />}      label="Emails Scanned"  value={stats.totalScanned > 0 ? stats.totalScanned.toLocaleString() : '—'} sub={stats.totalScanned > 0 ? 'all time (Postfix)' : 'building history…'} />
         <StatCard color="orange"  icon={<ShieldAlert size={18} />}   label="All-Time Spam"   value={stats.allTimeQuarantined.toLocaleString()} sub="ever detected" />
         <StatCard color="amber"   icon={<Inbox size={18} />}         label="Quarantined Now"  value={stats.totalQuarantined.toLocaleString()} sub="awaiting review" />
@@ -1225,7 +1225,7 @@ const StatCard: React.FC<{
 
 const LoadingGrid: React.FC = () => (
   <div className="space-y-6">
-    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
       {Array.from({ length: 8 }).map((_, i) => (
         <div key={i} className="h-24 bg-slate-100 rounded-2xl animate-pulse" />
       ))}
