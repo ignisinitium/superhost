@@ -12,7 +12,7 @@ import {
   UserCheck, UserX, MailOpen, ShieldCheck,
   CircleAlert, Inbox, SquareCheck, Square, X, ArrowUpDown,
   Globe, Plus, CalendarRange, Undo2, ScanLine, Target, Percent,
-  Building2, Activity,
+  Building2, Activity, Bug,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -38,6 +38,8 @@ interface SpamStats {
   weeklyTrend: { this_week: number; last_week: number };
   totalScanned: number;
   catchRate: number | null;
+  virusCount: number;
+  topViruses: { name: string; count: number }[];
 }
 
 interface GlobalRule {
@@ -53,6 +55,7 @@ interface QuarantineItem {
   sender: string;
   subject: string;
   spam_score: number | null;
+  virus_name?: string | null;
   created_at: string;
   file_path?: string;
   mail_user_id: number;
@@ -246,11 +249,12 @@ const OverviewTab: React.FC = () => {
     <div className="space-y-6">
 
       {/* ── Top stat cards ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-9 gap-3">
         <StatCard color="slate"   icon={<ScanLine size={18} />}      label="Emails Scanned"  value={stats.totalScanned > 0 ? stats.totalScanned.toLocaleString() : '—'} sub={stats.totalScanned > 0 ? 'all time (Postfix)' : 'building history…'} />
         <StatCard color="orange"  icon={<ShieldAlert size={18} />}   label="All-Time Spam"   value={stats.allTimeQuarantined.toLocaleString()} sub="ever detected" />
         <StatCard color="amber"   icon={<Inbox size={18} />}         label="Quarantined Now"  value={stats.totalQuarantined.toLocaleString()} sub="awaiting review" />
         <StatCard color="red"     icon={<CircleAlert size={18} />}   label="High Severity"   value={stats.highSeverity.toLocaleString()} sub="score > 10" />
+        <StatCard color="rose"    icon={<Bug size={18} />}           label="Viruses Found"   value={stats.virusCount.toLocaleString()} sub="in quarantine" />
         <StatCard color="emerald" icon={<Undo2 size={18} />}         label="Released (30d)"  value={stats.releasedCount.toLocaleString()} sub="false positives" />
         <StatCard color="blue"    icon={<Percent size={18} />}       label="Catch Rate"      value={stats.catchRate !== null ? `${stats.catchRate}%` : '—'} sub={stats.catchRate !== null ? 'spam / total' : 'need scan data'} />
         <StatCard color="violet"  icon={<Target size={18} />}        label="Avg Score"       value={stats.avgSpamScore !== null ? stats.avgSpamScore.toFixed(1) : '—'} sub="active quarantine" />
@@ -432,9 +436,19 @@ const OverviewTab: React.FC = () => {
                 <div key={q.id} className="flex items-start gap-3 px-6 py-3">
                   <ScoreBadge score={q.spam_score} />
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold text-slate-700 truncate">{q.subject || '(no subject)'}</p>
+                    <div className="flex items-center gap-1.5">
+                      <p className="text-xs font-bold text-slate-700 truncate">{q.subject || '(no subject)'}</p>
+                      {q.virus_name && (
+                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-100 text-rose-700 border border-rose-200 shrink-0">
+                          <Bug size={8} />VIRUS
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[10px] text-slate-400 truncate font-mono">{q.sender}</p>
                     <p className="text-[10px] text-slate-400">→ {q.mailbox_email}</p>
+                    {q.virus_name && (
+                      <p className="text-[9px] font-mono text-rose-600 mt-0.5 truncate">{q.virus_name}</p>
+                    )}
                   </div>
                   <div className="text-right shrink-0">
                     <span className="text-[10px] text-slate-400 whitespace-nowrap">
@@ -453,6 +467,29 @@ const OverviewTab: React.FC = () => {
         </div>
 
       </div>
+
+      {/* ── Virus detections panel (shown only when any found) ── */}
+      {stats.topViruses.length > 0 && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl overflow-hidden shadow-sm">
+          <div className="px-6 py-4 border-b border-rose-200 bg-rose-100/60 flex items-center gap-2">
+            <Bug size={16} className="text-rose-600" />
+            <h3 className="text-sm font-bold text-rose-800">Viruses Detected in Quarantine</h3>
+            <span className="ml-auto text-xs font-bold text-rose-700 bg-rose-200 px-2 py-0.5 rounded-full">
+              {stats.virusCount} infected {stats.virusCount === 1 ? 'email' : 'emails'}
+            </span>
+          </div>
+          <div className="px-6 py-4 flex flex-wrap gap-3">
+            {stats.topViruses.map((v, i) => (
+              <div key={i} className="flex items-center gap-2 px-3 py-2 bg-white border border-rose-200 rounded-xl">
+                <Bug size={12} className="text-rose-500 shrink-0" />
+                <span className="text-xs font-mono font-bold text-rose-800">{v.name}</span>
+                <span className="text-[10px] font-bold text-rose-500 bg-rose-100 px-1.5 py-0.5 rounded-full">{v.count}×</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
     </div>
   );
 };
@@ -669,7 +706,16 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
                   </td>
                   <td className="px-4 py-3"><ScoreBadge score={q.spam_score} /></td>
                   <td className="px-4 py-3 font-mono text-xs text-slate-700 max-w-[180px] truncate">{q.sender}</td>
-                  <td className="px-4 py-3 text-xs text-slate-600 max-w-[220px] truncate">{q.subject || <span className="italic text-slate-400">no subject</span>}</td>
+                  <td className="px-4 py-3 text-xs text-slate-600 max-w-[220px]">
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate">{q.subject || <span className="italic text-slate-400">no subject</span>}</span>
+                      {q.virus_name && (
+                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-100 text-rose-700 border border-rose-200 shrink-0" title={q.virus_name}>
+                          <Bug size={8} />VIRUS
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td className="px-4 py-3 text-[11px] text-slate-500 font-mono">{q.mailbox_email}</td>
                   <td className="px-4 py-3">
                     <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold">{q.owner}</span>

@@ -2019,9 +2019,9 @@ async function handleConfigureMailServer() {
       'virtual_gid_maps = static:5000',
       // Route virtual delivery through Dovecot LMTP so sieve scripts run
       'virtual_transport = lmtp:unix:private/dovecot-lmtp',
-      // Milters: OpenDKIM (signing) + spamass-milter (SpamAssassin scoring)
-      'smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock',
-      'non_smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock',
+      // Milters: OpenDKIM (signing) + spamass-milter (SpamAssassin) + clamav-milter (AV)
+      'smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock, unix:clamav/clamav-milter.ctl',
+      'non_smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock, unix:clamav/clamav-milter.ctl',
       'milter_default_action = accept',
     ];
     for (const setting of postconfSettings) {
@@ -2397,11 +2397,21 @@ async function handleScanQuarantineFolders(payload: any) {
             if (scoreMatch) spamScore = parseFloat(scoreMatch[1]!);
           } catch { /* unreadable — still record it */ }
 
+          // ClamAV scan — clamdscan returns exit 1 if infected, stdout: "file: VIRUS.NAME FOUND"
+          let virusName: string | null = null;
+          try {
+            const { stdout: clamOut } = await execPromise(
+              `sudo clamdscan --no-summary --infected ${shellEscape(filePath)} 2>/dev/null || true`
+            );
+            const virusMatch = clamOut.match(/:\s+(.+?)\s+FOUND/i);
+            if (virusMatch) virusName = virusMatch[1]!.trim();
+          } catch { /* clamd unavailable — skip */ }
+
           await client.query(`
-            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, file_path)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, virus_name, file_path)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT DO NOTHING
-          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, filePath]);
+          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, virusName, filePath]);
 
           found++;
         }

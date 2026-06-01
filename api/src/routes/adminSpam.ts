@@ -28,6 +28,7 @@ router.get('/stats', async (_req, res) => {
       topSenderDomains,
       weeklyTrend,
       serverStats,
+      virusTotal,
     ] = await Promise.all([
       query('SELECT COUNT(*) FROM mail_users'),
       query("SELECT COUNT(*) FROM mail_quarantine WHERE released_at IS NULL"),
@@ -59,7 +60,7 @@ router.get('/stats', async (_req, res) => {
         ORDER BY MIN(spam_score)
       `),
       query(`
-        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.created_at,
+        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at,
                mu.email AS mailbox_email, md.domain_name, u.username AS owner
         FROM mail_quarantine mq
         JOIN mail_users mu ON mq.mail_user_id = mu.id
@@ -129,6 +130,19 @@ router.get('/stats', async (_req, res) => {
       `),
       // Total emails received (scanned) from Postfix log tracker
       query('SELECT COALESCE(SUM(total_received), 0)::int AS total FROM mail_server_stats'),
+      // Virus detections in quarantined mail
+      query(`
+        SELECT COUNT(*)::int AS count,
+               COALESCE(json_agg(json_build_object('name', virus_name, 'count', cnt) ORDER BY cnt DESC), '[]') AS top_viruses
+        FROM (
+          SELECT virus_name, COUNT(*)::int AS cnt
+          FROM mail_quarantine
+          WHERE virus_name IS NOT NULL AND released_at IS NULL
+          GROUP BY virus_name
+          ORDER BY cnt DESC
+          LIMIT 5
+        ) sub
+      `),
     ]);
 
     const totalScanned   = parseInt(serverStats.rows[0].total) || 0;
@@ -156,6 +170,8 @@ router.get('/stats', async (_req, res) => {
       weeklyTrend:          weeklyTrend.rows[0] ?? { this_week: 0, last_week: 0 },
       totalScanned,
       catchRate,
+      virusCount:           parseInt(virusTotal.rows[0].count),
+      topViruses:           virusTotal.rows[0].top_viruses ?? [],
     });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -193,7 +209,7 @@ router.get('/quarantine', async (req, res) => {
 
     const [rows, countRow] = await Promise.all([
       query(`
-        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.created_at, mq.file_path,
+        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at, mq.file_path,
                mq.mail_user_id, mu.email AS mailbox_email, md.domain_name, u.username AS owner
         FROM mail_quarantine mq
         JOIN mail_users mu ON mq.mail_user_id = mu.id
