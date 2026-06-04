@@ -99,6 +99,9 @@ async function handleTask(task: Task) {
       case 'PURGE_USER_ARCHIVE':
         await handlePurgeUserArchive(task.payload);
         break;
+      case 'TOGGLE_SSH_ACCESS':
+        await handleToggleSshAccess(task.payload);
+        break;
       case 'CREATE_DOMAIN':
         await handleCreateDomain(task.payload);
         break;
@@ -306,6 +309,15 @@ async function handleTask(task: Task) {
       case 'ADMIN_BACKUP':
         await handleAdminBackup(task.id);
         break;
+      case 'TEST_SSH_CONNECTION':
+        await handleTestSshConnection(task.id, task.payload);
+        break;
+      case 'DISCOVER_CWP':
+        await handleDiscoverCwp(task.payload);
+        break;
+      case 'MIGRATE_CWP':
+        await handleMigrateCwp(task.payload);
+        break;
       default:
         throw new Error(`Unknown command: ${task.command}`);
     }
@@ -327,8 +339,9 @@ async function handleCreateUser(payload: any) {
 
   try {
     // Check if user already exists (safe: no shell interpolation)
+    // Default shell is nologin — SSH access is explicitly enabled via TOGGLE_SSH_ACCESS
     await execPromise(`id -u ${shellEscape(username)}`).catch(async () => {
-      await execPromise(`sudo useradd -m -s /bin/bash ${shellEscape(username)}`);
+      await execPromise(`sudo useradd -m -s /usr/sbin/nologin ${shellEscape(username)}`);
     });
 
     // Create default public_html
@@ -547,6 +560,14 @@ Your app will survive reboots — PM2 saves its state after every start/stop.
   }
 }
 
+async function handleToggleSshAccess(payload: any) {
+  const username = validateUsername(payload?.username);
+  const enabled: boolean = payload?.enabled === true;
+  const shell = enabled ? '/bin/bash' : '/usr/sbin/nologin';
+  await execPromise(`sudo usermod -s ${shellEscape(shell)} ${shellEscape(username)}`);
+  console.log(`SSH access ${enabled ? 'enabled' : 'disabled'} for ${username}`);
+}
+
 async function handleArchiveAndDeleteUser(payload: any) {
   const { userId } = payload;
   if (!userId) throw new Error('userId is required');
@@ -680,10 +701,13 @@ async function handleRestoreUser(payload: any) {
   await fs.mkdir(stagingDir, { recursive: true });
   await execPromise(`sudo tar -xzf ${shellEscape(deleted.archive_path)} -C ${shellEscape(stagingDir)}`);
 
-  // Re-create Linux user
+  // Re-create Linux user; restore SSH shell setting from snapshot
+  const restoredShell = user.ssh_enabled ? '/bin/bash' : '/usr/sbin/nologin';
   await execPromise(`id -u ${shellEscape(username)}`).catch(async () => {
-    await execPromise(`sudo useradd -m -s /bin/bash ${shellEscape(username)}`);
+    await execPromise(`sudo useradd -m -s ${shellEscape(restoredShell)} ${shellEscape(username)}`);
   });
+  // If the user already existed, still enforce the correct shell
+  await execPromise(`sudo usermod -s ${shellEscape(restoredShell)} ${shellEscape(username)}`);
 
   // Restore home directory
   const homeStaging = `${stagingDir}/home`;
@@ -696,11 +720,11 @@ async function handleRestoreUser(payload: any) {
 
   // Re-insert user in PostgreSQL
   const newUserRes = await client.query(
-    `INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+    `INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id, ssh_enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email, ssh_enabled = EXCLUDED.ssh_enabled RETURNING id`,
     [user.username, user.email, user.home_dir, user.password_hash,
-     user.disk_limit_mb, user.bandwidth_limit_mb, user.package_id]
+     user.disk_limit_mb, user.bandwidth_limit_mb, user.package_id, user.ssh_enabled ?? false]
   );
   const newUserId = newUserRes.rows[0]!.id as number;
 
@@ -820,9 +844,11 @@ async function handleCreateDomain(payload: any) {
     await execPromise(`sudo mkdir -p ${shellEscape(docRoot)}`);
     await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(docRoot)}`);
 
-    // Write a default welcome page only if one does not already exist
+    // Write a default welcome page only if the doc root has no existing content
     const indexPath = `${docRoot}/index.html`;
-    const indexExists = await execPromise(`sudo test -f ${shellEscape(indexPath)}`).then(() => true).catch(() => false);
+    const hasContent = await execPromise(`sudo find ${shellEscape(docRoot)} -maxdepth 1 -not -name '.' -print -quit 2>/dev/null`)
+      .then(({ stdout }) => stdout.trim().length > 0).catch(() => false);
+    const indexExists = hasContent || await execPromise(`sudo test -f ${shellEscape(indexPath)}`).then(() => true).catch(() => false);
     if (!indexExists) {
       const welcomeHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -947,6 +973,24 @@ www     IN      A       ${serverIp}
       );
       await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
       console.log(`SSL certificate issued for ${domainName}`);
+      // Update WordPress siteurl/home to https if present
+      await execPromise(
+        `sudo mysql -e "UPDATE wp_options SET option_value=REPLACE(option_value,'http://','https://') WHERE option_name IN ('siteurl','home');" ${shellEscape(docRoot.split('/')[2] ?? '')} 2>/dev/null || true`
+      ).catch(() => {});
+      // Also try common table prefixes by checking all databases for tables with the domain
+      await execPromise(
+        `sudo find ${shellEscape(docRoot)} -maxdepth 2 -name 'wp-config.php' -exec grep -l ${shellEscape(domainName)} {} \\; 2>/dev/null | head -1`
+      ).then(async ({ stdout }) => {
+        const cfg = stdout.trim();
+        if (!cfg) return;
+        const dbName = (await execPromise(`sudo grep "DB_NAME" ${shellEscape(cfg)} 2>/dev/null`).catch(() => ({ stdout: '' }))).stdout.match(/'([^']+)'/)?.[1];
+        const prefix = (await execPromise(`sudo grep "table_prefix" ${shellEscape(cfg)} 2>/dev/null`).catch(() => ({ stdout: '' }))).stdout.match(/'([^']+)'/)?.[1] ?? 'wp_';
+        if (dbName) {
+          await execPromise(
+            `sudo mysql ${shellEscape(dbName)} -e "UPDATE ${shellEscape(prefix)}options SET option_value=REPLACE(option_value,'http://','https://') WHERE option_name IN ('siteurl','home');" 2>/dev/null || true`
+          ).catch(() => {});
+        }
+      }).catch(() => {});
     } catch (sslErr) {
       console.warn(`SSL immediate issue failed for ${domainName}, queuing PROVISION_SSL retry:`, sslErr);
       // Queue a retry — the worker will pick it up on the next poll cycle by
@@ -3508,6 +3552,947 @@ async function handleAdminBackup(taskId: number) {
     [JSON.stringify({ path: backupPath, sizeBytes, dirs: existingDirs }), taskId]
   );
   console.log(`Admin config backup created: ${backupPath} (${sizeBytes} bytes)`);
+}
+
+// ─── CWP Migration ──────────────────────────────────────────────────────────
+
+type SshCred =
+  | { type: 'key'; keyPath: string }
+  | { type: 'password'; password: string };
+
+async function cwpLog(migrationId: number, msg: string): Promise<void> {
+  const ts = new Date().toISOString().slice(11, 19);
+  await client.query(
+    "UPDATE cwp_migrations SET logs = logs || $1::jsonb, updated_at = NOW() WHERE id = $2",
+    [JSON.stringify([`[${ts}] ${msg}`]), migrationId]
+  );
+  console.log(`[Migration ${migrationId}] ${msg}`);
+}
+
+async function cwpProgress(migrationId: number, progress: object): Promise<void> {
+  await client.query(
+    "UPDATE cwp_migrations SET progress = $1, updated_at = NOW() WHERE id = $2",
+    [JSON.stringify(progress), migrationId]
+  );
+}
+
+async function handleTestSshConnection(taskId: number, payload: Record<string, unknown>) {
+  const { remoteHost, remotePort, remoteUser, authType, sshPassword, sshKey } = payload as {
+    remoteHost: string; remotePort: number; remoteUser: string;
+    authType: string; sshPassword?: string; sshKey?: string;
+  };
+  const cred = await setupSshCred(taskId, authType, sshPassword, sshKey);
+  try {
+    await sshRun(remoteHost, remotePort, remoteUser, cred, 'echo ok');
+  } finally {
+    if (cred.type === 'key') await fs.unlink(cred.keyPath).catch(() => {});
+  }
+}
+
+async function setupSshCred(migrationId: number, authType: string, sshPassword?: string, sshKey?: string): Promise<SshCred> {
+  if (authType === 'key' && sshKey) {
+    const keyPath = `/tmp/cwp_key_${migrationId}`;
+    await fs.writeFile(keyPath, sshKey.trim() + '\n', { mode: 0o600 });
+    return { type: 'key', keyPath };
+  }
+  // Verify sshpass is available before attempting password auth
+  await execPromise('which sshpass').catch(() => {
+    throw new Error('sshpass is not installed on this server. Install it with: sudo apt-get install -y sshpass');
+  });
+  return { type: 'password', password: sshPassword ?? '' };
+}
+
+function sshBaseArgs(port: number, cred: SshCred): string[] {
+  return [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'ConnectTimeout=30',
+    '-o', 'ServerAliveInterval=30',
+    '-p', String(port),
+    ...(cred.type === 'key' ? ['-i', cred.keyPath] : ['-o', 'PubkeyAuthentication=no']),
+  ];
+}
+
+async function sshRun(host: string, port: number, user: string, cred: SshCred, script: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const args = [...sshBaseArgs(port, cred), `${user}@${host}`, 'bash -s'];
+    const env: NodeJS.ProcessEnv = cred.type === 'password'
+      ? { ...process.env, SSHPASS: cred.password }
+      : { ...process.env };
+
+    const cmd = cred.type === 'password' ? 'sshpass' : 'ssh';
+    const finalArgs = cred.type === 'password' ? ['-e', 'ssh', ...args] : args;
+
+    const proc = spawn(cmd, finalArgs, { env });
+    let out = '', err = '';
+    proc.stdout.on('data', (d: Buffer) => out += d.toString());
+    proc.stderr.on('data', (d: Buffer) => err += d.toString());
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) reject(new Error(`SSH failed (${code}): ${err.slice(0, 500)}`));
+      else resolve(out);
+    });
+    proc.stdin!.write(script);
+    proc.stdin!.end();
+  });
+}
+
+async function rsyncFromRemote(
+  host: string, port: number, remoteUser: string, cred: SshCred,
+  remotePath: string, localPath: string,
+  extraArgs: string[] = []
+): Promise<void> {
+  const sshCmd = [
+    'ssh', '-o', 'StrictHostKeyChecking=no', '-p', String(port),
+    ...(cred.type === 'key' ? ['-i', cred.keyPath] : ['-o', 'PubkeyAuthentication=no']),
+  ].join(' ');
+
+  const env: NodeJS.ProcessEnv = cred.type === 'password'
+    ? { ...process.env, SSHPASS: cred.password }
+    : { ...process.env };
+
+  const base = cred.type === 'password' ? 'sshpass -e rsync' : 'rsync';
+  const args = [
+    '-avz', '--stats', '--timeout=120',
+    '-e', shellEscape(sshCmd),
+    ...extraArgs,
+    `${shellEscape(remoteUser)}@${shellEscape(host)}:${shellEscape(remotePath)}`,
+    shellEscape(localPath),
+  ].join(' ');
+
+  await execPromise(`${base} ${args}`, { env, timeout: 20 * 60 * 1000 });
+}
+
+async function importRemoteDb(
+  host: string, port: number, remoteUser: string, cred: SshCred,
+  remoteDb: string, localDb: string, localDbUser: string, localDbPass: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const dumpScript = `mysqldump --single-transaction --no-tablespaces --skip-lock-tables ${shellEscape(remoteDb)}`;
+    const sshArgs = [...sshBaseArgs(port, cred)];
+    const env: NodeJS.ProcessEnv = cred.type === 'password'
+      ? { ...process.env, SSHPASS: cred.password }
+      : { ...process.env };
+
+    const dumpCmd = cred.type === 'password' ? 'sshpass' : 'ssh';
+    const dumpArgs = cred.type === 'password'
+      ? ['-e', 'ssh', ...sshArgs, `${remoteUser}@${host}`, dumpScript]
+      : [...sshArgs, `${remoteUser}@${host}`, dumpScript];
+
+    const dumpProc = spawn(dumpCmd, dumpArgs, { env });
+    const importProc = spawn('mysql', [`-u${localDbUser}`, `-p${localDbPass}`, localDb]);
+
+    dumpProc.stdout.pipe(importProc.stdin);
+
+    let importErr = '', dumpErr = '';
+    dumpProc.stderr.on('data', (d: Buffer) => dumpErr += d.toString());
+    importProc.stderr.on('data', (d: Buffer) => importErr += d.toString());
+    dumpProc.on('error', reject);
+    importProc.on('error', reject);
+    importProc.on('close', (code) => {
+      if (code !== 0) reject(new Error(`DB import failed: ${(importErr + dumpErr).slice(0, 300)}`));
+      else resolve();
+    });
+  });
+}
+
+// Discovery script — runs via bash heredoc on remote server
+const DISCOVERY_SCRIPT = `python3 << 'CWPEOF'
+import os, json, subprocess, re, socket
+from datetime import datetime
+
+SKIP = {'root','nobody','cwp','cwpsrv','postfix','dovecot','mysql','www-data','nginx','apache','apache2','vmail','named','bind','mail','daemon','sync','games','man','lp','news','uucp','proxy','backup','list','irc','gnats','systemd-network','systemd-resolve','_apt','messagebus','ntp','sshd','dnsmasq','tcpdump','pollinate'}
+
+sh_errors = []
+def sh(cmd, timeout=30):
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=timeout)
+        return out.decode('utf-8', errors='replace').strip()
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b'').decode('utf-8', errors='replace').strip()[:120]
+        if err:  # suppress empty-stderr exits (e.g. grep finding no matches)
+            sh_errors.append((cmd[0] if isinstance(cmd,list) else str(cmd)[:40], err))
+        return ''
+    except Exception as e:
+        sh_errors.append((str(cmd)[:40], str(e)[:120]))
+        return ''
+
+CHECK_DIRS = [
+    '/usr/local/cwpsrv/conf/nginx/conf.d','/etc/nginx/conf.d','/usr/local/nginx/conf/vhosts',
+    '/etc/nginx/sites-enabled','/usr/local/cwpsrv/conf/nginx','/usr/local/cwpsrv/var/services/nginx/conf',
+    '/usr/local/apache/conf.d','/etc/httpd/conf.d','/usr/local/apache/conf/userdata','/etc/httpd/conf/vhosts.d',
+    '/usr/local/cwpsrv/conf/apache','/usr/local/apache/conf/vhosts',
+    '/etc/virtual','/etc/dovecot/virtual','/var/mail/virtual',
+    '/usr/local/cwpsrv/var/services/users','/usr/local/cwpsrv/conf/users','/usr/local/cwp/conf/users',
+]
+existing_dirs = [d for d in CHECK_DIRS if os.path.isdir(d)]
+
+# Probe CWP Apache conf directories to understand where vhosts live
+apache_diag = {}
+for probe_dir in ['/usr/local/apache/conf','/usr/local/apache/conf/vhosts',
+                  '/usr/local/apache/conf/extra',
+                  '/usr/local/cwpsrv/conf/apache','/etc/httpd/conf.d']:
+    try:
+        if os.path.isdir(probe_dir):
+            files = sorted(os.listdir(probe_dir))
+            apache_diag[probe_dir] = files[:40]
+    except: pass
+
+# Read httpd-vhosts.conf and httpd.conf Include lines to find where user vhosts actually live
+apache_vhost_sample = ''
+vhosts_conf_head = ''
+httpd_includes = ''
+try:
+    with open('/usr/local/apache/conf/extra/httpd-vhosts.conf') as f:
+        raw = f.read()
+    lines = [l.strip() for l in raw.splitlines() if l.strip() and not l.strip().startswith('#')]
+    vhosts_conf_head = ' | '.join(lines[:20])
+except: pass
+try:
+    with open('/usr/local/apache/conf/httpd.conf') as f:
+        raw = f.read()
+    inc_lines = [l.strip() for l in raw.splitlines() if re.match(r'^\s*[Ii]nclude', l) or 'VirtualHost' in l]
+    httpd_includes = ' | '.join(inc_lines[:20])
+except: pass
+apache_vhost_sample = ('vhosts.conf: '+vhosts_conf_head if vhosts_conf_head else '') + (' || httpd includes: '+httpd_includes if httpd_includes else '')
+
+# Size of main httpd.conf
+httpd_conf_size = 0
+try:
+    httpd_conf_size = os.path.getsize('/usr/local/apache/conf/httpd.conf')
+except: pass
+
+httpd_conf_sample = list(apache_diag.get('/etc/httpd/conf.d', []))
+httpd_conf_content_sample = apache_vhost_sample
+
+raw_users = []
+user_domains = []
+debug = {'scanned':0,'skip_uid':[],'skip_home':[],'skip_name':[],'skip_nodir':[],'accepted':[],'sh_errors':sh_errors,'existing_dirs':existing_dirs,'user_domains':user_domains,'apache_diag':apache_diag,'apache_vhost_sample':apache_vhost_sample,'httpd_conf_size':httpd_conf_size,'httpd_conf_files':httpd_conf_sample,'httpd_conf_sample':httpd_conf_content_sample}
+try:
+    with open('/etc/passwd') as f:
+        for line in f:
+            p = line.strip().split(':')
+            if len(p) < 7: continue
+            uname, uid, home = p[0], int(p[2]), p[5]
+            debug['scanned'] += 1
+            if uid < 500 or uid >= 65000: debug['skip_uid'].append(uname); continue
+            if not home.startswith('/home/'): debug['skip_home'].append(uname); continue
+            if uname in SKIP: debug['skip_name'].append(uname); continue
+            if not os.path.isdir(home): debug['skip_nodir'].append(uname); continue
+            debug['accepted'].append(uname)
+            raw_users.append((uname, home))
+except Exception as e:
+    print(json.dumps({'error': str(e), 'users': [], 'debug': debug})); raise SystemExit(1)
+
+result = []
+for uname, home in raw_users:
+    # Read CWP user.conf for email and primary domain
+    email = ''
+    primary_domain = ''
+    conf_sample = ''
+    for cp in ['/usr/local/cwpsrv/var/services/users/'+uname+'/user.conf',
+               '/usr/local/cwpsrv/conf/users/'+uname+'.conf',
+               '/usr/local/cwp/conf/users/'+uname+'.conf']:
+        try:
+            with open(cp) as f:
+                lines = f.readlines()
+            if not conf_sample and uname == raw_users[0][0]:
+                conf_sample = '|'.join(l.strip() for l in lines[:10])
+                debug['conf_sample'] = cp+': '+conf_sample
+            for line in lines:
+                k, _, v = line.strip().partition('=')
+                kl = k.lower().strip()
+                if kl in ('email','e-mail') and not email: email = v.strip()
+                if kl in ('domain','maindomain','main_domain','site','website') and not primary_domain:
+                    primary_domain = v.strip()
+            if email or primary_domain: break
+        except: pass
+    if not email: email = uname + '@localhost'
+    if primary_domain: user_domains.append(uname+':'+primary_domain)
+
+    disk_raw = sh(['du','-sm',home]).split()
+    disk_mb = int(disk_raw[0]) if disk_raw else 0
+
+    domains = []
+    seen_d = set()
+
+    def add_domain(dom, docroot, php, has_ssl):
+        if not dom or '.' not in dom or dom in seen_d: return
+        if dom.startswith('www.') or dom in ('localhost','_') or '~' in dom: return
+        seen_d.add(dom)
+        domains.append({'domain':dom,'document_root':docroot,'php_version':php,'has_ssl':has_ssl,'disk_mb':0})
+
+    # 1. Primary domain from CWP user.conf
+    if primary_domain:
+        add_domain(primary_domain, home+'/public_html', '8.1',
+                   os.path.exists('/etc/letsencrypt/live/'+primary_domain+'/fullchain.pem'))
+
+    # 2. /usr/local/apache/conf/userdata/{...}/{username}/{domain}/ directory structure
+    userdata = '/usr/local/apache/conf/userdata'
+    if os.path.isdir(userdata):
+        for dirpath, _, filenames in os.walk(userdata):
+            parts = dirpath.replace('\\\\','').split('/')
+            if uname not in parts: continue
+            uidx = len(parts) - 1 - parts[::-1].index(uname)
+            if uidx + 1 < len(parts):
+                dom_cand = parts[uidx + 1]
+                add_domain(dom_cand, home+'/public_html', '8.1',
+                           os.path.exists('/etc/letsencrypt/live/'+dom_cand+'/fullchain.pem'))
+
+    # 3. CWP database — most complete source of domain→user mapping
+    for cwp_db in ['cwp', 'cwpdb']:
+        raw_dom = sh(['mysql', cwp_db, '-N', '-e',
+            "SELECT domain FROM accounts WHERE user='"+uname+"' UNION SELECT domain FROM domains WHERE user='"+uname+"'"])
+        if raw_dom:
+            for dom in (d.strip() for d in raw_dom.split('\\n') if d.strip()):
+                add_domain(dom, home+'/public_html', '8.1',
+                           os.path.exists('/etc/letsencrypt/live/'+dom+'/fullchain.pem'))
+            break
+
+    def parse_apache_vhosts(content, match_home):
+        """Extract (ServerName, docroot, has_ssl) from VirtualHost blocks containing match_home."""
+        results = []
+        for blk in re.finditer(r'<VirtualHost[^>]*>(.*?)</VirtualHost>', content, re.DOTALL|re.IGNORECASE):
+            bt = blk.group(1)
+            if match_home not in bt: continue
+            sn = re.search(r'ServerName\\s+(\\S+)', bt)
+            if not sn: continue
+            dr = re.search(r'DocumentRoot\\s+(\\S+)', bt)
+            docroot = dr.group(1) if dr else match_home+'/public_html'
+            ssl = 'SSLEngine' in bt or os.path.exists('/etc/letsencrypt/live/'+sn.group(1)+'/fullchain.pem')
+            results.append((sn.group(1), docroot, ssl))
+        return results
+
+    # 4. Filename-based Apache conf lookup (CWP names files after username or domain)
+    for conf_fp in ['/usr/local/apache/conf.d/'+uname+'.conf',
+                    '/usr/local/apache/conf.d/vhost_'+uname+'.conf',
+                    '/etc/httpd/conf.d/'+uname+'.conf',
+                    '/etc/httpd/conf.d/vhost_'+uname+'.conf',
+                    '/etc/httpd/conf.d/'+uname+'_vhost.conf']:
+        if not os.path.exists(conf_fp): continue
+        try: content = open(conf_fp).read()
+        except: continue
+        for sn, docroot, ssl in parse_apache_vhosts(content, home):
+            add_domain(sn, docroot, '8.1', ssl)
+
+    # 5. grep Apache conf files (CWP's conf.d, then fallbacks) for this user's home
+    apache_seen_files = set()
+    for confdir in ['/usr/local/apache/conf.d', '/etc/httpd/conf.d',
+                    '/usr/local/apache/conf/vhosts', '/etc/httpd/conf/vhosts.d',
+                    '/usr/local/cwpsrv/conf/apache', '/usr/local/apache/conf/extra',
+                    '/usr/local/apache/conf']:
+        if not os.path.isdir(confdir) and not os.path.isfile(confdir): continue
+        search_target = confdir if os.path.isdir(confdir) else os.path.dirname(confdir)
+        hits = sh(['grep', '-rl', home, search_target])
+        for fp in (l.strip() for l in hits.split('\\n') if l.strip()):
+            if fp in apache_seen_files: continue
+            apache_seen_files.add(fp)
+            try: content = open(fp).read()
+            except: continue
+            for sn, docroot, ssl in parse_apache_vhosts(content, home):
+                add_domain(sn, docroot, '8.1', ssl)
+
+    # 6. Filename-based Nginx conf lookup (CWP stores confs named after username or domain)
+    for conf_fp in [
+            '/usr/local/cwpsrv/conf/nginx/conf.d/'+uname+'.conf',
+            '/usr/local/cwpsrv/conf/nginx/conf.d/vhost_'+uname+'.conf',
+            '/etc/nginx/conf.d/'+uname+'.conf',
+            '/etc/nginx/conf.d/vhost_'+uname+'.conf',
+            '/usr/local/nginx/conf/vhosts/'+uname+'.conf',
+            '/etc/nginx/sites-enabled/'+uname+'.conf']:
+        if not os.path.exists(conf_fp): continue
+        try: content = open(conf_fp).read()
+        except: continue
+        rm = re.search(r'root\\s+([^\\s;\\r\\n<]+)', content)
+        docroot = rm.group(1) if rm else home+'/public_html'
+        has_ssl = 'ssl_certificate' in content
+        for sm in re.finditer(r'server_name\\s+([^;\\r\\n<]+)', content):
+            for sn in sm.group(1).split():
+                sn = sn.strip().rstrip(';')
+                add_domain(sn, docroot, '8.1', has_ssl or os.path.exists('/etc/letsencrypt/live/'+sn+'/fullchain.pem'))
+
+    # 7. grep Nginx conf dirs for this user's home directory
+    for confdir in [
+            '/usr/local/cwpsrv/conf/nginx/conf.d',
+            '/usr/local/cwpsrv/conf/nginx',
+            '/etc/nginx/conf.d',
+            '/etc/nginx/sites-enabled',
+            '/usr/local/nginx/conf/vhosts',
+            '/usr/local/cwpsrv/var/services/nginx/conf']:
+        if not os.path.isdir(confdir): continue
+        hits = sh(['grep', '-rl', home, confdir])
+        for fp in (l.strip() for l in hits.split('\\n') if l.strip()):
+            try: content = open(fp).read()
+            except: continue
+            rm = re.search(r'root\\s+([^\\s;\\r\\n<]+)', content)
+            docroot = rm.group(1) if rm else home+'/public_html'
+            has_ssl = 'ssl_certificate' in content
+            for sm in re.finditer(r'server_name\\s+([^;\\r\\n<]+)', content):
+                for sn in sm.group(1).split():
+                    sn = sn.strip().rstrip(';')
+                    add_domain(sn, docroot, '8.1', has_ssl or os.path.exists('/etc/letsencrypt/live/'+sn+'/fullchain.pem'))
+
+    # DNS records — read BIND zone files from common CWP paths
+    def read_zone_dns(domain):
+        """Parse a BIND zone file and return list of record dicts, excluding SOA/NS."""
+        zone_paths = [
+            '/var/named/'+domain,
+            '/var/named/'+domain+'.db',
+            '/var/named/'+domain+'.zone',
+            '/etc/named/'+domain+'.db',
+            '/etc/bind/zones/db.'+domain,
+            '/etc/bind/'+domain+'.db',
+            '/var/named/data/'+domain+'.db',
+        ]
+        content = ''
+        for zp in zone_paths:
+            try:
+                with open(zp) as f: content = f.read(); break
+            except: pass
+        if not content:
+            # Try named-compilezone or just grep named.conf for zone file path
+            raw = sh(['grep', '-r', '"'+domain+'"', '/etc/named.conf', '/etc/named/', '/etc/bind/named.conf'], timeout=5)
+            for line in raw.split('\\n'):
+                m = re.search(r'file\\s+["\\']+([^"\\']+)["\\']+', line)
+                if m:
+                    try:
+                        with open(m.group(1)) as f: content = f.read(); break
+                    except: pass
+        if not content:
+            return []
+        records = []
+        current_ttl = 3600
+        origin = domain + '.'
+        for line in content.split('\\n'):
+            line = line.strip()
+            if not line or line.startswith(';'): continue
+            if line.startswith('$TTL'):
+                try: current_ttl = int(line.split()[1])
+                except: pass
+                continue
+            if line.startswith('$ORIGIN'):
+                try: origin = line.split()[1]
+                except: pass
+                continue
+            # Skip SOA and NS — we generate these fresh
+            if ' SOA ' in line or '\\tSOA\\t' in line: continue
+            if (' NS ' in line or '\\tNS\\t' in line) and 'IN' in line: continue
+            # Parse: [name] [ttl] [class] type rdata
+            m = re.match(r'^(\\S+)?\\s+(?:(\\d+)\\s+)?(?:IN\\s+)?(A|AAAA|MX|TXT|CNAME|SRV|CAA|PTR)\\s+(.+)$', line, re.IGNORECASE)
+            if not m: continue
+            name_raw, ttl_raw, rtype, rdata = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+            ttl = int(ttl_raw) if ttl_raw else current_ttl
+            # Strip inline BIND comments from rdata (semicolon outside TXT quotes)
+            if rtype != 'TXT':
+                rdata = re.sub(r'\\s*;.*$', '', rdata).strip()
+            # Normalise name — handle full domain name used in place of @
+            if not name_raw or name_raw == '@': name = '@'
+            elif name_raw.rstrip('.') in (domain, ''): name = '@'
+            elif name_raw.endswith('.'): name = name_raw[:-len(domain)-2] if name_raw.endswith('.'+domain+'.') else name_raw.rstrip('.')
+            else: name = name_raw
+            # Clean TXT — join quoted segments
+            if rtype == 'TXT':
+                rdata = ''.join(re.findall(r'"([^"]*)"', rdata)) or rdata.strip('"')
+            # MX: split priority from exchange
+            priority = None
+            if rtype == 'MX':
+                parts = rdata.split()
+                if len(parts) == 2:
+                    try: priority = int(parts[0]); rdata = parts[1].rstrip('.')
+                    except: rdata = rdata.rstrip('.')
+                else: rdata = rdata.rstrip('.')
+            else:
+                if rdata.endswith('.'): rdata = rdata[:-1]
+            rec = {'name': name, 'type': rtype, 'content': rdata, 'ttl': ttl}
+            if priority is not None: rec['priority'] = priority
+            records.append(rec)
+        return records
+
+    # CWP-generated boilerplate subdomain names — never worth migrating
+    CWP_STD_NAMES = {
+        '@','www','mail','smtp','smtps','pop','pop3','imap','imaps',
+        'webmail','ftp','sftp','cpanel','cwp','whm','whmcs','localhost',
+        'spam','default._domainkey','_dmarc','autodiscover','autoconfig',
+    }
+
+    def is_custom_record(r, domain, old_ips):
+        """Return True only for genuinely custom records worth migrating."""
+        if r['type'] in ('SOA','NS'): return False
+        if r['name'].lower() in CWP_STD_NAMES: return False
+        # Skip CNAMEs that point directly to the apex domain (CWP boilerplate)
+        if r['type'] == 'CNAME' and r['content'].rstrip('.') in (domain, domain+'.'): return False
+        # Skip A/AAAA records pointing to the old server's IPs
+        if r['type'] in ('A','AAAA') and r['content'] in old_ips: return False
+        # Skip boilerplate TXT records we regenerate
+        for prefix in ('v=spf1','v=DKIM1','v=DMARC1'):
+            if r['content'].startswith(prefix): return False
+        return True
+
+    # Attach DNS records to each discovered domain
+    # Collect all IPs from A records for @ — these are the old server IPs to skip
+    for dom in domains:
+        all_recs = read_zone_dns(dom['domain'])
+        old_ips = {r['content'] for r in all_recs if r['type'] == 'A' and r['name'] == '@'}
+        dom['dns_records'] = [r for r in all_recs if is_custom_record(r, dom['domain'], old_ips)]
+
+    # Databases — information_schema is readable without special grants
+    dbs = []
+    raw_db = sh(['mysql','-N','-e',
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '"+uname+"\\_%' OR SCHEMA_NAME='"+uname+"'"])
+    if not raw_db:
+        # fallback: mysql.db grants table
+        raw_db = sh(['mysql','-N','-e',
+            "SELECT DISTINCT Db FROM mysql.db WHERE User='"+uname+"' OR User LIKE '"+uname+"\\_%'"])
+    for db_name in raw_db.split('\\n'):
+        db_name = db_name.strip()
+        if not db_name or db_name in ('information_schema','performance_schema','mysql','sys'): continue
+        sz_raw = sh(['mysql','-N','-e',
+            "SELECT ROUND(SUM(data_length+index_length)/1024/1024,1) FROM information_schema.tables WHERE table_schema='"+db_name+"'"]) or '0'
+        try: size = float(sz_raw.split()[0]) if sz_raw.split() else 0.0
+        except: size = 0.0
+        dbs.append({'db_name':db_name,'db_user':uname,'size_mb':size})
+
+    # Email accounts
+    email_accs = []
+    seen_e = set()
+    dom_set = {d['domain'] for d in domains}
+
+    # /var/vmail/{domain}/{user}/ — Dovecot Maildir structure used by CWP
+    if os.path.isdir('/var/vmail'):
+        try:
+            for dom_dir in os.listdir('/var/vmail'):
+                dom_path = '/var/vmail/' + dom_dir
+                if not os.path.isdir(dom_path) or '.' not in dom_dir: continue
+                if dom_dir not in dom_set:
+                    # Domain wasn't found in web-hosting discovery; confirm via conf files
+                    confirmed = False
+                    for confdir in ['/usr/local/cwpsrv/conf/nginx/conf.d','/etc/nginx/conf.d',
+                                    '/usr/local/cwpsrv/conf/nginx','/etc/httpd/conf.d',
+                                    '/etc/nginx/sites-enabled']:
+                        if not os.path.isdir(confdir): continue
+                        probe = sh(['grep', '-rl', dom_dir, confdir])
+                        for fp in (l.strip() for l in probe.split('\\n') if l.strip()):
+                            try:
+                                c = open(fp).read()
+                                if home in c:
+                                    confirmed = True
+                                    add_domain(dom_dir, home+'/public_html', '8.1',
+                                               os.path.exists('/etc/letsencrypt/live/'+dom_dir+'/fullchain.pem'))
+                                    break
+                            except: pass
+                        if confirmed: break
+                    if not confirmed: continue
+                for mbox in os.listdir(dom_path):
+                    if mbox.startswith('.'): continue
+                    if not os.path.isdir(dom_path+'/'+mbox): continue
+                    addr = mbox+'@'+dom_dir
+                    if addr not in seen_e:
+                        seen_e.add(addr)
+                        email_accs.append({'email':addr,'domain':dom_dir,'quota_mb':1024})
+        except: pass
+
+    # Fallback: file-based virtual mailbox lists (/etc/virtual, /etc/dovecot/virtual)
+    if not email_accs:
+        for vdir in ['/etc/virtual', '/etc/dovecot/virtual', '/var/mail/virtual']:
+            if not os.path.isdir(vdir): continue
+            try:
+                for root2, _, files in os.walk(vdir):
+                    dom2 = os.path.basename(root2)
+                    for fname in files:
+                        if fname not in ('passwd','accounts','passwd.db'): continue
+                        try:
+                            with open(os.path.join(root2, fname)) as ef:
+                                for line in ef:
+                                    if not line.strip(): continue
+                                    addr = line.strip().split(':')[0]
+                                    if '@' not in addr: addr = addr+'@'+dom2
+                                    if addr in seen_e: continue
+                                    seen_e.add(addr)
+                                    em_dom = addr.split('@')[1]
+                                    if em_dom not in dom_set: continue  # can't attribute to this user
+                                    email_accs.append({'email':addr,'domain':em_dom,'quota_mb':1024})
+                        except: pass
+            except: pass
+
+    result.append({'username':uname,'email':email,'home_dir':home,'disk_usage_mb':disk_mb,'domains':domains,'databases':dbs,'email_accounts':email_accs})
+
+print(json.dumps({'users':result,'debug':debug,'discovered_at':datetime.utcnow().isoformat()+'Z','remote_host':socket.gethostname()}))
+CWPEOF
+`;
+
+async function handleDiscoverCwp(payload: any): Promise<void> {
+  const { migrationId, remoteHost, remotePort, remoteUser, authType, sshPassword, sshKey } = payload;
+  const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+
+  try {
+    await cwpLog(migrationId, `Connecting to ${remoteUser}@${remoteHost}:${remotePort}…`);
+
+    // Test connectivity first
+    await sshRun(remoteHost, remotePort, remoteUser, cred, 'echo ok');
+    await cwpLog(migrationId, 'SSH connection established. Running discovery…');
+
+    const output = await sshRun(remoteHost, remotePort, remoteUser, cred, DISCOVERY_SCRIPT);
+    let discoveryData: any;
+    try {
+      discoveryData = JSON.parse(output);
+    } catch {
+      throw new Error(`Discovery returned invalid JSON. Output: ${output.slice(0, 300)}`);
+    }
+
+    if (discoveryData.error) throw new Error(`Discovery error: ${discoveryData.error as string}`);
+
+    const users = (discoveryData.users ?? []) as any[];
+    const dbg = discoveryData.debug as any;
+    if (dbg) {
+      await cwpLog(migrationId,
+        `Scanned ${dbg.scanned as number} passwd entries → accepted: [${(dbg.accepted as string[]).join(', ') || 'none'}]`
+      );
+      if ((dbg.skip_uid as string[]).length)
+        await cwpLog(migrationId, `  Skipped (UID out of range): ${(dbg.skip_uid as string[]).join(', ')}`);
+      if ((dbg.skip_home as string[]).length)
+        await cwpLog(migrationId, `  Skipped (home not /home/): ${(dbg.skip_home as string[]).join(', ')}`);
+      if ((dbg.skip_name as string[]).length)
+        await cwpLog(migrationId, `  Skipped (system name): ${(dbg.skip_name as string[]).join(', ')}`);
+      if ((dbg.skip_nodir as string[]).length)
+        await cwpLog(migrationId, `  Skipped (home dir missing): ${(dbg.skip_nodir as string[]).join(', ')}`);
+      const shErrs = (dbg.sh_errors as [string, string][]) ?? [];
+      for (const [cmd, err] of shErrs)
+        await cwpLog(migrationId, `  sh() error [${cmd}]: ${err}`);
+      if ((dbg.existing_dirs as string[])?.length)
+        await cwpLog(migrationId, `  Dirs found: ${(dbg.existing_dirs as string[]).join(', ')}`);
+      else
+        await cwpLog(migrationId, `  No expected dirs found`);
+      if (dbg.conf_sample)
+        await cwpLog(migrationId, `  user.conf sample: ${dbg.conf_sample as string}`);
+      if ((dbg.user_domains as string[])?.length)
+        await cwpLog(migrationId, `  Domains from user.conf: ${(dbg.user_domains as string[]).join(', ')}`);
+      if (dbg.httpd_conf_size)
+        await cwpLog(migrationId, `  /usr/local/apache/conf/httpd.conf size: ${dbg.httpd_conf_size as number} bytes`);
+      const apacheDiag = dbg.apache_diag as Record<string, string[]> ?? {};
+      for (const [dir, files] of Object.entries(apacheDiag))
+        await cwpLog(migrationId, `  ${dir}: [${(files as string[]).join(', ')}]`);
+      if (dbg.apache_vhost_sample)
+        await cwpLog(migrationId, `  vhost sample: ${dbg.apache_vhost_sample as string}`);
+    }
+
+    const totalDomains = users.reduce((s: number, u: any) => s + (u.domains?.length ?? 0), 0);
+    const totalDbs = users.reduce((s: number, u: any) => s + (u.databases?.length ?? 0), 0);
+    const totalEmails = users.reduce((s: number, u: any) => s + (u.email_accounts?.length ?? 0), 0);
+
+    await client.query(
+      `UPDATE cwp_migrations SET status = 'ready', discovery_data = $1, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(discoveryData), migrationId]
+    );
+
+    await cwpLog(migrationId,
+      `Discovery complete: ${users.length} user(s), ${totalDomains} domain(s), ${totalDbs} database(s), ${totalEmails} email account(s)`
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await client.query(
+      `UPDATE cwp_migrations SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
+      [msg, migrationId]
+    );
+    await cwpLog(migrationId, `ERROR: ${msg}`);
+    throw err;
+  } finally {
+    if (cred.type === 'key') await fs.unlink(cred.keyPath).catch(() => {});
+  }
+}
+
+function resolvePhpVersion(requested: string): string {
+  // Find the best available PHP-FPM socket on this server.
+  // Prefer exact match, then nearest higher version, then any available.
+  const { readdirSync } = require('fs') as typeof import('fs');
+  let available: string[] = [];
+  try {
+    available = readdirSync('/run/php')
+      .map((f: string) => { const m = f.match(/^php(\d+\.\d+)-fpm\.sock$/); return m ? m[1] : null; })
+      .filter(Boolean) as string[];
+  } catch { /* /run/php not accessible */ }
+  if (available.length === 0) return requested;
+  if (available.includes(requested)) return requested;
+  // Pick the closest version >= requested, or the highest available
+  const sorted = available.sort((a, b) => parseFloat(a) - parseFloat(b));
+  return sorted.find(v => parseFloat(v) >= parseFloat(requested)) ?? sorted[sorted.length - 1]!;
+}
+
+async function patchCmsDbConfig(configPath: string, dbUser: string, dbPass: string): Promise<void> {
+  // Rewrites DB_USER / DB_PASSWORD / DB_HOST in WordPress (and compatible) config files.
+  // Uses a temp Python script so special chars in credentials are never interpolated by the shell.
+  const script = [
+    'import sys',
+    'path, u, p = sys.argv[1], sys.argv[2], sys.argv[3]',
+    'out = []',
+    'with open(path) as f:',
+    '    for line in f:',
+    '        if "DB_USER" in line and "define" in line:',
+    "            line = \"define('DB_USER', '\" + u + \"');\\n\"",
+    '        elif "DB_PASSWORD" in line and "define" in line:',
+    "            line = \"define('DB_PASSWORD', '\" + p + \"');\\n\"",
+    '        elif "DB_HOST" in line and "define" in line:',
+    "            line = \"define('DB_HOST', 'localhost');\\n\"",
+    '        out.append(line)',
+    'with open(path, "w") as f:',
+    '    f.writelines(out)',
+  ].join('\n');
+  const tmp = `/tmp/.cms_patch_${process.pid}.py`;
+  await fs.writeFile(tmp, script, { mode: 0o600 });
+  try {
+    await execPromise(`sudo python3 ${shellEscape(tmp)} ${shellEscape(configPath)} ${shellEscape(dbUser)} ${shellEscape(dbPass)}`);
+  } finally {
+    await fs.unlink(tmp).catch(() => {});
+  }
+}
+
+async function handleMigrateCwp(payload: any): Promise<void> {
+  const { migrationId, remoteHost, remotePort, remoteUser, selectedUsers, authType, sshPassword, sshKey } = payload;
+  const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+
+  try {
+    const migRes = await client.query('SELECT * FROM cwp_migrations WHERE id = $1', [migrationId]);
+    const mig = migRes.rows[0];
+    if (!mig) throw new Error('Migration record not found');
+
+    const discoveryData = mig.discovery_data as any;
+    const allUsers = (discoveryData?.users ?? []) as any[];
+    const usersToMigrate = allUsers.filter((u: any) => (selectedUsers as string[]).includes(u.username));
+
+    await cwpLog(migrationId, `Starting migration of ${usersToMigrate.length} user(s)…`);
+
+    for (let i = 0; i < usersToMigrate.length; i++) {
+      const cwpUser = usersToMigrate[i] as any;
+      const { username } = cwpUser as { username: string };
+
+      await cwpProgress(migrationId, {
+        users_total: usersToMigrate.length,
+        users_done: i,
+        current_user: username,
+        current_step: 'Creating user account',
+      });
+      await cwpLog(migrationId, `━━━ Migrating user: ${username} ━━━`);
+
+      // ── 1. Create Superhost user account ──────────────────────────────────
+      const existingUser = await client.query('SELECT id FROM users WHERE username = $1', [username]);
+      let userId: number;
+
+      if (existingUser.rows[0]) {
+        userId = existingUser.rows[0].id as number;
+        await cwpLog(migrationId, `  [${username}] User already exists — skipping account creation`);
+      } else {
+        const homeDir = `/home/${username}`;
+        const email = (cwpUser.email as string) || `${username}@localhost`;
+
+        const insertRes = await client.query(
+          `INSERT INTO users (username, email, home_dir) VALUES ($1, $2, $3)
+           ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+          [username, email, homeDir]
+        );
+        userId = insertRes.rows[0].id as number;
+
+        // System setup (creates Linux user, default DB, staging domain)
+        await handleCreateUser({ username, email });
+        await cwpLog(migrationId, `  [${username}] Superhost account created`);
+      }
+
+      // ── 2. Rsync home directory ───────────────────────────────────────────
+      await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: 'Syncing files' });
+      await cwpLog(migrationId, `  [${username}] Syncing home directory from remote…`);
+      try {
+        await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred,
+          `/home/${username}/`, `/home/${username}/`,
+          ['--exclude=.env', '--exclude=logs/']
+        );
+        await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} /home/${shellEscape(username)}/`);
+        await cwpLog(migrationId, `  [${username}] Files synced`);
+      } catch (e) {
+        await cwpLog(migrationId, `  [${username}] File sync warning: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      // Re-apply permissions — rsync preserves source server's mode bits (source used Apache-as-user;
+      // this server uses nginx/www-data which needs world-read on public_html).
+      try {
+        const h = `/home/${shellEscape(username)}`;
+        await execPromise(`sudo chmod 711 ${h}`);
+        await execPromise(`sudo setfacl -m user:jonathan:rwx,default:user:jonathan:rwx ${h}`);
+        await execPromise(`sudo find ${h}/public_html -type d -exec chmod 755 {} +`);
+        await execPromise(`sudo find ${h}/public_html -type f -exec chmod 644 {} +`);
+        await execPromise(`sudo find ${h}/public_html -type d -exec setfacl -m user:jonathan:rwx,default:user:jonathan:rwx {} +`);
+        await execPromise(`sudo find ${h}/public_html -type f -exec setfacl -m user:jonathan:rw- {} +`);
+      } catch (e) {
+        await cwpLog(migrationId, `  [${username}] Permission fix warning: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // ── 3. Set up domains ─────────────────────────────────────────────────
+      const domains = (cwpUser.domains ?? []) as any[];
+      for (const dom of domains) {
+        await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Domain: ${dom.domain as string}` });
+        await cwpLog(migrationId, `  [${username}] Setting up domain: ${dom.domain as string}`);
+        try {
+          const existingDom = await client.query('SELECT id FROM domains WHERE domain_name = $1', [dom.domain]);
+          if (existingDom.rows[0]) {
+            await cwpLog(migrationId, `  [${username}] Domain ${dom.domain as string} already exists — skipping`);
+            continue;
+          }
+          const phpVersion = resolvePhpVersion(dom.php_version || '8.3');
+          const domainInsert = await client.query<{ id: number }>(
+            `INSERT INTO domains (user_id, domain_name, document_root, is_ssl, php_version)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [userId, dom.domain, dom.document_root || `/home/${username}/public_html`, dom.has_ssl ?? false, phpVersion]
+          );
+          const domainId = domainInsert.rows[0]!.id;
+          await handleCreateDomain({
+            domainName: dom.domain,
+            username,
+            phpVersion,
+            docRoot: dom.document_root || `/home/${username}/public_html`,
+            domainId,
+          });
+          await cwpLog(migrationId, `  [${username}] Domain ${dom.domain as string} configured`);
+
+          // Import custom DNS records from the source zone (skip CWP boilerplate we manage ourselves)
+          const sourceRecords = (dom.dns_records ?? []) as any[];
+          // Discovery script already pre-filters; this is a safety net for any that slip through
+          const cwpStdNames = new Set([
+            '@','www','mail','smtp','smtps','pop','pop3','imap','imaps',
+            'webmail','ftp','sftp','cpanel','cwp','whm','whmcs','localhost',
+            'spam','default._domainkey','_dmarc','autodiscover','autoconfig',
+          ]);
+          const customRecords = sourceRecords.filter((r: any) => {
+            if (['SOA', 'NS'].includes(String(r.type))) return false;
+            if (cwpStdNames.has(String(r.name).toLowerCase())) return false;
+            if (String(r.type) === 'CNAME' && String(r.content).replace(/\.$/, '') === String(dom.domain)) return false;
+            if (['v=spf1', 'v=DKIM1', 'v=DMARC1'].some(p => String(r.content).startsWith(p))) return false;
+            return true;
+          });
+          if (customRecords.length > 0) {
+            const zoneRes = await client.query<{ id: number }>('SELECT id FROM dns_zones WHERE domain_name = $1', [dom.domain]);
+            const zoneId = zoneRes.rows[0]?.id;
+            if (zoneId) {
+              for (const r of customRecords) {
+                await client.query(
+                  `INSERT INTO dns_records (zone_id, type, name, content, priority, ttl)
+                   VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
+                  [zoneId, r.type, r.name, r.content, r.priority ?? null, r.ttl ?? 3600]
+                );
+              }
+              // Rebuild the zone file with all records
+              await client.query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+                ['SYNC_DNS_ZONE', JSON.stringify({ domainName: dom.domain })]);
+              await cwpLog(migrationId, `  [${username}] Imported ${customRecords.length} custom DNS record(s) for ${dom.domain as string}`);
+            }
+          }
+        } catch (e) {
+          await cwpLog(migrationId, `  [${username}] Domain error (${dom.domain as string}): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // ── 4. Import databases ───────────────────────────────────────────────
+      const dbs = (cwpUser.databases ?? []) as any[];
+      for (const db of dbs) {
+        await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Database: ${db.db_name as string}` });
+        await cwpLog(migrationId, `  [${username}] Importing database: ${db.db_name as string}`);
+        try {
+          const localDbName = validateMysqlIdentifier(db.db_name as string);
+          const localDbUser = validateMysqlIdentifier(username);
+          const localDbPass = crypto.randomBytes(16).toString('hex');
+
+          // Create the DB locally
+          await handleCreateDatabase({ dbName: localDbName, dbUser: localDbUser, dbPassword: localDbPass });
+
+          // Track in PostgreSQL
+          await client.query(
+            `INSERT INTO databases (user_id, db_name, db_user) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [userId, localDbName, localDbUser]
+          );
+
+          // Import data from remote
+          await importRemoteDb(remoteHost, remotePort, remoteUser, cred, db.db_name as string, localDbName, localDbUser, localDbPass);
+          await cwpLog(migrationId, `  [${username}] Database ${db.db_name as string} imported`);
+
+          // Patch CMS config files that reference this database
+          const { stdout: cfgHits } = await execPromise(
+            `sudo grep -rl ${shellEscape(localDbName)} /home/${shellEscape(username)}/ --include='wp-config.php' 2>/dev/null || true`
+          ).catch(() => ({ stdout: '' }));
+          for (const cfgPath of cfgHits.trim().split('\n').filter(Boolean)) {
+            try {
+              await patchCmsDbConfig(cfgPath, localDbUser, localDbPass);
+              await execPromise(`sudo setfacl -m user:jonathan:rw- ${shellEscape(cfgPath)}`);
+              await cwpLog(migrationId, `  [${username}] Patched DB credentials in ${cfgPath.split('/').pop()}`);
+            } catch (e) {
+              await cwpLog(migrationId, `  [${username}] Config patch warning (${cfgPath.split('/').pop()}): ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+        } catch (e) {
+          await cwpLog(migrationId, `  [${username}] DB error (${db.db_name as string}): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // ── 5. Set up email accounts ──────────────────────────────────────────
+      const emailAccounts = (cwpUser.email_accounts ?? []) as any[];
+      for (const acc of emailAccounts) {
+        await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Email: ${acc.email as string}` });
+        await cwpLog(migrationId, `  [${username}] Creating email: ${acc.email as string}`);
+        try {
+          const emailAddr = acc.email as string;
+          const [, emailDomain] = emailAddr.split('@') as [string, string];
+
+          // Ensure mail_domains record exists
+          const mdRes = await client.query(
+            `INSERT INTO mail_domains (domain_name, user_id)
+             VALUES ($1, $2) ON CONFLICT (domain_name) DO UPDATE SET user_id = EXCLUDED.user_id RETURNING id`,
+            [emailDomain, userId]
+          );
+          const domainId = mdRes.rows[0].id as number;
+
+          // Create mail_users record (no password — admin must set one)
+          await client.query(
+            `INSERT INTO mail_users (domain_id, email, password_hash, quota)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING`,
+            [domainId, emailAddr, '$MIGRATED$', acc.quota_mb ?? 1024]
+          );
+
+          // Provision the Dovecot mailbox directory
+          await handleProvisionMailbox({ email: emailAddr });
+
+          // Rsync Maildir if available on remote
+          const [localPart] = emailAddr.split('@') as [string];
+          const remoteMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
+          const localMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
+          try {
+            await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred, remoteMaildir, localMaildir);
+            await cwpLog(migrationId, `  [${username}] Email ${emailAddr} + Maildir synced`);
+          } catch {
+            await cwpLog(migrationId, `  [${username}] Email ${emailAddr} created (no remote Maildir found)`);
+          }
+        } catch (e) {
+          await cwpLog(migrationId, `  [${username}] Email error (${acc.email as string}): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      await cwpProgress(migrationId, {
+        users_total: usersToMigrate.length,
+        users_done: i + 1,
+        current_user: username,
+        current_step: 'Done',
+      });
+      await cwpLog(migrationId, `  [${username}] ✓ Migration complete`);
+    }
+
+    await client.query(
+      `UPDATE cwp_migrations SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [migrationId]
+    );
+    await cwpLog(migrationId, `All ${usersToMigrate.length} user(s) migrated successfully.`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await client.query(
+      `UPDATE cwp_migrations SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
+      [msg, migrationId]
+    );
+    await cwpLog(migrationId, `FATAL ERROR: ${msg}`);
+    throw err;
+  } finally {
+    if (cred.type === 'key') await fs.unlink(cred.keyPath).catch(() => {});
+  }
 }
 
 start().catch(console.error);

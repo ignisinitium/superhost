@@ -59,6 +59,9 @@ async function handleTask(task) {
             case 'PURGE_USER_ARCHIVE':
                 await handlePurgeUserArchive(task.payload);
                 break;
+            case 'TOGGLE_SSH_ACCESS':
+                await handleToggleSshAccess(task.payload);
+                break;
             case 'CREATE_DOMAIN':
                 await handleCreateDomain(task.payload);
                 break;
@@ -154,6 +157,18 @@ async function handleTask(task) {
                 break;
             case 'SEND_SPAM_DIGEST':
                 await handleSendSpamDigest(task.payload);
+                break;
+            case 'PURGE_EXPIRED_QUARANTINE':
+                await handlePurgeExpiredQuarantine();
+                break;
+            case 'SYNC_SPAM_RULES':
+                await handleSyncSpamRules(task.payload);
+                break;
+            case 'SCAN_QUARANTINE_FOLDERS':
+                await handleScanQuarantineFolders(task.payload);
+                break;
+            case 'REFRESH_MAIL_STATS':
+                await handleRefreshMailStats();
                 break;
             case 'PROVISION_MAILBOX':
                 await handleProvisionMailbox(task.payload);
@@ -254,6 +269,15 @@ async function handleTask(task) {
             case 'ADMIN_BACKUP':
                 await handleAdminBackup(task.id);
                 break;
+            case 'TEST_SSH_CONNECTION':
+                await handleTestSshConnection(task.id, task.payload);
+                break;
+            case 'DISCOVER_CWP':
+                await handleDiscoverCwp(task.payload);
+                break;
+            case 'MIGRATE_CWP':
+                await handleMigrateCwp(task.payload);
+                break;
             default:
                 throw new Error(`Unknown command: ${task.command}`);
         }
@@ -270,8 +294,9 @@ async function handleCreateUser(payload) {
     const username = validateUsername(payload?.username);
     try {
         // Check if user already exists (safe: no shell interpolation)
+        // Default shell is nologin — SSH access is explicitly enabled via TOGGLE_SSH_ACCESS
         await execPromise(`id -u ${shellEscape(username)}`).catch(async () => {
-            await execPromise(`sudo useradd -m -s /bin/bash ${shellEscape(username)}`);
+            await execPromise(`sudo useradd -m -s /usr/sbin/nologin ${shellEscape(username)}`);
         });
         // Create default public_html
         const homeDir = `/home/${username}`;
@@ -465,6 +490,13 @@ Your app will survive reboots — PM2 saves its state after every start/stop.
         throw err;
     }
 }
+async function handleToggleSshAccess(payload) {
+    const username = validateUsername(payload?.username);
+    const enabled = payload?.enabled === true;
+    const shell = enabled ? '/bin/bash' : '/usr/sbin/nologin';
+    await execPromise(`sudo usermod -s ${shellEscape(shell)} ${shellEscape(username)}`);
+    console.log(`SSH access ${enabled ? 'enabled' : 'disabled'} for ${username}`);
+}
 async function handleArchiveAndDeleteUser(payload) {
     const { userId } = payload;
     if (!userId)
@@ -574,10 +606,13 @@ async function handleRestoreUser(payload) {
     const stagingDir = `/tmp/superhost_restore_${username}_${Date.now()}`;
     await fs.mkdir(stagingDir, { recursive: true });
     await execPromise(`sudo tar -xzf ${shellEscape(deleted.archive_path)} -C ${shellEscape(stagingDir)}`);
-    // Re-create Linux user
+    // Re-create Linux user; restore SSH shell setting from snapshot
+    const restoredShell = user.ssh_enabled ? '/bin/bash' : '/usr/sbin/nologin';
     await execPromise(`id -u ${shellEscape(username)}`).catch(async () => {
-        await execPromise(`sudo useradd -m -s /bin/bash ${shellEscape(username)}`);
+        await execPromise(`sudo useradd -m -s ${shellEscape(restoredShell)} ${shellEscape(username)}`);
     });
+    // If the user already existed, still enforce the correct shell
+    await execPromise(`sudo usermod -s ${shellEscape(restoredShell)} ${shellEscape(username)}`);
     // Restore home directory
     const homeStaging = `${stagingDir}/home`;
     const homeExists = await fs.access(homeStaging).then(() => true).catch(() => false);
@@ -587,10 +622,10 @@ async function handleRestoreUser(payload) {
         await execPromise(`sudo chmod 711 /home/${shellEscape(username)}`);
     }
     // Re-insert user in PostgreSQL
-    const newUserRes = await client.query(`INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email RETURNING id`, [user.username, user.email, user.home_dir, user.password_hash,
-        user.disk_limit_mb, user.bandwidth_limit_mb, user.package_id]);
+    const newUserRes = await client.query(`INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id, ssh_enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email, ssh_enabled = EXCLUDED.ssh_enabled RETURNING id`, [user.username, user.email, user.home_dir, user.password_hash,
+        user.disk_limit_mb, user.bandwidth_limit_mb, user.package_id, user.ssh_enabled ?? false]);
     const newUserId = newUserRes.rows[0].id;
     // Restore MariaDB databases
     const dbAdminUser = process.env.DB_ADMIN_USER ?? 'superhost_worker';
@@ -680,9 +715,11 @@ async function handleCreateDomain(payload) {
     try {
         await execPromise(`sudo mkdir -p ${shellEscape(docRoot)}`);
         await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(docRoot)}`);
-        // Write a default welcome page only if one does not already exist
+        // Write a default welcome page only if the doc root has no existing content
         const indexPath = `${docRoot}/index.html`;
-        const indexExists = await execPromise(`sudo test -f ${shellEscape(indexPath)}`).then(() => true).catch(() => false);
+        const hasContent = await execPromise(`sudo find ${shellEscape(docRoot)} -maxdepth 1 -not -name '.' -print -quit 2>/dev/null`)
+            .then(({ stdout }) => stdout.trim().length > 0).catch(() => false);
+        const indexExists = hasContent || await execPromise(`sudo test -f ${shellEscape(indexPath)}`).then(() => true).catch(() => false);
         if (!indexExists) {
             const welcomeHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -794,6 +831,19 @@ www     IN      A       ${serverIp}
             await execPromise(`sudo certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
             await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
             console.log(`SSL certificate issued for ${domainName}`);
+            // Update WordPress siteurl/home to https if present
+            await execPromise(`sudo mysql -e "UPDATE wp_options SET option_value=REPLACE(option_value,'http://','https://') WHERE option_name IN ('siteurl','home');" ${shellEscape(docRoot.split('/')[2] ?? '')} 2>/dev/null || true`).catch(() => { });
+            // Also try common table prefixes by checking all databases for tables with the domain
+            await execPromise(`sudo find ${shellEscape(docRoot)} -maxdepth 2 -name 'wp-config.php' -exec grep -l ${shellEscape(domainName)} {} \\; 2>/dev/null | head -1`).then(async ({ stdout }) => {
+                const cfg = stdout.trim();
+                if (!cfg)
+                    return;
+                const dbName = (await execPromise(`sudo grep "DB_NAME" ${shellEscape(cfg)} 2>/dev/null`).catch(() => ({ stdout: '' }))).stdout.match(/'([^']+)'/)?.[1];
+                const prefix = (await execPromise(`sudo grep "table_prefix" ${shellEscape(cfg)} 2>/dev/null`).catch(() => ({ stdout: '' }))).stdout.match(/'([^']+)'/)?.[1] ?? 'wp_';
+                if (dbName) {
+                    await execPromise(`sudo mysql ${shellEscape(dbName)} -e "UPDATE ${shellEscape(prefix)}options SET option_value=REPLACE(option_value,'http://','https://') WHERE option_name IN ('siteurl','home');" 2>/dev/null || true`).catch(() => { });
+                }
+            }).catch(() => { });
         }
         catch (sslErr) {
             console.warn(`SSL immediate issue failed for ${domainName}, queuing PROVISION_SSL retry:`, sslErr);
@@ -1157,10 +1207,14 @@ async function handleGenerateEmailDns(payload) {
         await upsertRecord('TXT', `${selector}._domainkey`, dkimRecord);
         // DMARC
         await upsertRecord('TXT', '_dmarc', 'v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r;');
+        // A record for spam subdomain
+        await upsertRecord('A', 'spam', serverIp);
         // 5. Sync BIND zone file
         await handleSyncDnsZone({ zoneId, domainName });
         // 6. Provision webmail vhost at mail.<domain>
         await handleProvisionWebmailVhost({ domainName });
+        // 7. Provision spam vhost at spam.<domain>
+        await handleProvisionSpamVhost({ domainName });
         console.log(`Email DNS (MX, SPF, DKIM, DMARC) configured for ${domainName}`);
     }
     catch (err) {
@@ -1257,6 +1311,88 @@ server {
     await execPromise(`sudo mv /tmp/${mailHost}.nginx ${nginxConf}`);
     await execPromise('sudo nginx -t && sudo systemctl reload nginx');
     console.log(`Webmail vhost provisioned: https://${mailHost}`);
+}
+async function handleProvisionSpamVhost({ domainName }) {
+    const spamHost = `spam.${domainName}`;
+    const nginxConf = `/etc/nginx/sites-available/${spamHost}`;
+    const nginxLink = `/etc/nginx/sites-enabled/${spamHost}`;
+    const certPath = `/etc/letsencrypt/live/${spamHost}/fullchain.pem`;
+    const dashRoot = '/home/jonathan/superhost/dashboard/dist';
+    const httpConf = `server {
+    listen 80;
+    server_name ${spamHost};
+
+    root ${dashRoot};
+    index index.html;
+
+    access_log /var/log/nginx/${spamHost}.access.log;
+    error_log  /var/log/nginx/${spamHost}.error.log;
+
+    location /api {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+`;
+    await fs.writeFile(`/tmp/${spamHost}.nginx`, httpConf);
+    await execPromise(`sudo mv /tmp/${spamHost}.nginx ${nginxConf}`);
+    await execPromise(`sudo ln -sf ${nginxConf} ${nginxLink}`);
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+    try {
+        await execPromise(`sudo certbot certonly --nginx --non-interactive --agree-tos ` +
+            `--email hostmaster@${domainName} -d ${shellEscape(spamHost)} 2>&1`);
+    }
+    catch (certErr) {
+        console.warn(`Certbot failed for ${spamHost} (DNS may still be propagating):`, certErr.stderr?.slice(0, 200));
+        return;
+    }
+    const httpsConf = `server {
+    listen 80;
+    server_name ${spamHost};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${spamHost};
+
+    ssl_certificate     ${certPath};
+    ssl_certificate_key /etc/letsencrypt/live/${spamHost}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root ${dashRoot};
+    index index.html;
+
+    access_log /var/log/nginx/${spamHost}.access.log;
+    error_log  /var/log/nginx/${spamHost}.error.log;
+
+    location /api {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+`;
+    await fs.writeFile(`/tmp/${spamHost}.nginx`, httpsConf);
+    await execPromise(`sudo mv /tmp/${spamHost}.nginx ${nginxConf}`);
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+    console.log(`Spam vhost provisioned: https://${spamHost}`);
 }
 async function handleInstallWordPress(payload) {
     const { domainName, username, dbName, dbUser, dbPassword, siteTitle, adminUser, adminPassword, adminEmail } = payload;
@@ -1640,6 +1776,12 @@ async function handleConfigureMailServer() {
             'virtual_minimum_uid = 100',
             'virtual_uid_maps = static:5000',
             'virtual_gid_maps = static:5000',
+            // Route virtual delivery through Dovecot LMTP so sieve scripts run
+            'virtual_transport = lmtp:unix:private/dovecot-lmtp',
+            // Milters: OpenDKIM (signing) + spamass-milter (SpamAssassin) + clamav-milter (AV)
+            'smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock, unix:clamav/clamav-milter.ctl',
+            'non_smtpd_milters = inet:localhost:12301, unix:spamass/spamass.sock, unix:clamav/clamav-milter.ctl',
+            'milter_default_action = accept',
         ];
         for (const setting of postconfSettings) {
             await execPromise(`sudo postconf -e ${shellEscape(setting)}`);
@@ -1710,6 +1852,26 @@ sieve_script personal {
         await fs.writeFile(tempQuota, dovecotPlugins);
         await execPromise(`sudo mv ${tempQuota} /etc/dovecot/conf.d/91-superhost-plugins.conf`);
         await execPromise('sudo chown root:root /etc/dovecot/conf.d/91-superhost-plugins.conf');
+        // 4b. Expose Dovecot LMTP socket inside Postfix chroot so virtual_transport can reach it
+        const dovecotLmtpConf = `# Superhost-managed: expose LMTP socket inside Postfix chroot for sieve delivery
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
+
+# Override Debian default: our SQL userdb stores full email addresses (user@domain),
+# so don't strip the domain before lookup. 20-lmtp.conf strips it for /etc/passwd.
+protocol lmtp {
+  auth_username_format = %{user | lower}
+}
+`;
+        const tempLmtp = '/tmp/92-superhost-lmtp.conf';
+        await fs.writeFile(tempLmtp, dovecotLmtpConf);
+        await execPromise(`sudo mv ${tempLmtp} /etc/dovecot/conf.d/92-superhost-lmtp.conf`);
+        await execPromise('sudo chown root:root /etc/dovecot/conf.d/92-superhost-lmtp.conf');
         // 5. Ensure vmail user + /var/mail/vhosts exist
         await execPromise(`id vmail`).catch(async () => {
             await execPromise(`sudo groupadd -g 5000 vmail`).catch(() => { });
@@ -1761,37 +1923,204 @@ async function handleApplyEmailQuota(payload) {
     });
     console.log(`Quota applied for ${email}`);
 }
-async function handleUpdateAutoresponder(payload) {
-    const { email, message, enabled } = payload;
-    if (!email || !email.includes('@'))
-        throw new Error('Valid email address required');
+// ── Sieve script generation ────────────────────────────────────────────────────
+function sieveStr(s) {
+    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+function sieveEnvelopeTest(pattern) {
+    if (pattern.startsWith('@')) {
+        return `envelope :domain :is "from" ${sieveStr(pattern.slice(1))}`;
+    }
+    return `envelope :is "from" ${sieveStr(pattern)}`;
+}
+function buildSieveScript(opts) {
+    const { email, spamFilterEnabled, spamAction, globalAllows, globalBlocks, mbAllows, mbBlocks, arEnabled, arMessage } = opts;
+    const allAllows = [...globalAllows, ...mbAllows];
+    const allBlocks = [...globalBlocks, ...mbBlocks];
+    const needFileinto = spamFilterEnabled && (allBlocks.length > 0 || spamAction === 'quarantine');
+    const needEnvelope = spamFilterEnabled && (allAllows.length > 0 || allBlocks.length > 0);
+    const needVacation = arEnabled && !!arMessage?.trim();
+    const exts = [];
+    if (needFileinto)
+        exts.push('fileinto');
+    if (needEnvelope)
+        exts.push('envelope');
+    if (needVacation)
+        exts.push('vacation');
+    if (exts.length === 0)
+        return '';
+    const lines = [`require [${exts.map(e => `"${e}"`).join(', ')}];`, ''];
+    if (spamFilterEnabled) {
+        // Allow rules — whitelist bypasses all spam checks
+        for (const p of allAllows) {
+            lines.push(`if ${sieveEnvelopeTest(p)} {`, '  keep;', '  stop;', '}');
+        }
+        if (allAllows.length > 0)
+            lines.push('');
+        // Block rules — quarantine the message
+        for (const p of allBlocks) {
+            lines.push(`if ${sieveEnvelopeTest(p)} {`, '  fileinto "Quarantine";', '  stop;', '}');
+        }
+        if (allBlocks.length > 0)
+            lines.push('');
+        // SpamAssassin flag
+        if (spamAction !== 'deliver') {
+            lines.push('if header :contains "X-Spam-Flag" "YES" {');
+            if (spamAction === 'quarantine') {
+                lines.push('  fileinto "Quarantine";', '  stop;');
+            }
+            else {
+                // tag — SA already rewrote subject, just keep
+                lines.push('  keep;', '  stop;');
+            }
+            lines.push('}', '');
+        }
+    }
+    if (needVacation) {
+        lines.push('vacation', '  :days 1', '  :subject "Auto-reply"', `  :from ${sieveStr(email)}`, `  ${sieveStr(arMessage)};`, '');
+    }
+    return lines.join('\n');
+}
+async function writeSieve(mailboxId, email, script) {
     const [user, domain] = email.split('@');
-    const maildirBase = `/var/mail/vhosts/${shellEscape(domain)}/${shellEscape(user)}`;
+    const maildirBase = `/var/mail/vhosts/${domain}/${user}`;
     const sievePath = `${maildirBase}/.dovecot.sieve`;
-    // Ensure maildir exists before writing sieve
-    await execPromise(`sudo mkdir -p ${maildirBase}`).catch(() => { });
-    if (!enabled || !message?.trim()) {
+    await execPromise(`sudo mkdir -p ${shellEscape(maildirBase)}`).catch(() => { });
+    if (!script.trim()) {
         await execPromise(`sudo rm -f ${shellEscape(sievePath)}`).catch(() => { });
-        console.log(`Auto-responder disabled for ${email}`);
         return;
     }
-    // Escape double-quotes and backslashes for the Sieve string literal
-    const safeMsg = message.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const sieveScript = `require ["vacation"];
-
-vacation
-  :days 1
-  :subject "Auto-reply"
-  :from "${email}"
-  "${safeMsg}";
-`;
-    const tempSieve = `/tmp/sieve_${shellEscape(user)}_${shellEscape(domain)}.sieve`;
-    await fs.writeFile(tempSieve, sieveScript);
-    await execPromise(`sudo mv ${shellEscape(tempSieve)} ${shellEscape(sievePath)}`);
+    const temp = `/tmp/sieve_${mailboxId}.sieve`;
+    await fs.writeFile(temp, script + '\n');
+    await execPromise(`sudo mv ${shellEscape(temp)} ${shellEscape(sievePath)}`);
     await execPromise(`sudo chown vmail:vmail ${shellEscape(sievePath)}`);
     await execPromise(`sudo chmod 600 ${shellEscape(sievePath)}`);
-    // Compile — non-fatal, Dovecot will compile at first use if sievec is missing
     await execPromise(`sudo sievec ${shellEscape(sievePath)}`).catch(() => { });
+}
+async function ensureQuarantineMaildir(email) {
+    const [user, domain] = email.split('@');
+    const base = `/var/mail/vhosts/${domain}/${user}/.Quarantine`;
+    for (const sub of ['cur', 'new', 'tmp']) {
+        await execPromise(`sudo mkdir -p ${shellEscape(`${base}/${sub}`)}`).catch(() => { });
+    }
+    await execPromise(`sudo chown -R vmail:vmail ${shellEscape(base)}`).catch(() => { });
+}
+// ── SYNC_SPAM_RULES ────────────────────────────────────────────────────────────
+async function handleSyncSpamRules(payload) {
+    const { mailUserId } = payload;
+    const mailboxRes = await client.query(`
+    SELECT id, email, spam_filter_enabled, spam_score_threshold, spam_action
+    FROM mail_users
+    WHERE ($1::int IS NULL OR id = $1)
+  `, [mailUserId ?? null]);
+    const globalRes = await client.query('SELECT sender_pattern, access_type FROM mail_global_rules');
+    const globalAllows = globalRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
+    const globalBlocks = globalRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
+    for (const mailbox of mailboxRes.rows) {
+        try {
+            const mbRes = await client.query('SELECT sender_pattern, access_type FROM mail_access_control WHERE mail_user_id = $1', [mailbox.id]);
+            const mbAllows = mbRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
+            const mbBlocks = mbRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
+            const arRes = await client.query('SELECT message, enabled FROM mail_autoresponders WHERE mail_user_id = $1', [mailbox.id]);
+            const ar = arRes.rows[0];
+            const script = buildSieveScript({
+                email: mailbox.email,
+                spamFilterEnabled: mailbox.spam_filter_enabled,
+                spamAction: mailbox.spam_action ?? 'quarantine',
+                globalAllows, globalBlocks, mbAllows, mbBlocks,
+                arEnabled: ar?.enabled ?? false,
+                arMessage: ar?.message ?? '',
+            });
+            await writeSieve(mailbox.id, mailbox.email, script);
+            if (mailbox.spam_filter_enabled) {
+                await ensureQuarantineMaildir(mailbox.email);
+            }
+            console.log(`Spam rules synced for ${mailbox.email}`);
+        }
+        catch (err) {
+            console.error(`Failed to sync spam rules for mailbox ${mailbox.id}:`, err.message);
+        }
+    }
+}
+// ── SCAN_QUARANTINE_FOLDERS ────────────────────────────────────────────────────
+async function handleScanQuarantineFolders(payload) {
+    const { mailUserId } = payload;
+    const mailboxRes = await client.query(`SELECT id, email FROM mail_users WHERE ($1::int IS NULL OR id = $1) AND spam_filter_enabled = true`, [mailUserId ?? null]);
+    let found = 0;
+    for (const mailbox of mailboxRes.rows) {
+        try {
+            const [user, domain] = mailbox.email.split('@');
+            const qBase = `/var/mail/vhosts/${domain}/${user}/.Quarantine`;
+            for (const sub of ['new', 'cur']) {
+                const dir = `${qBase}/${sub}`;
+                let listing = '';
+                try {
+                    const r = await execPromise(`sudo ls -1 ${shellEscape(dir)} 2>/dev/null`);
+                    listing = r.stdout.trim();
+                }
+                catch {
+                    continue;
+                }
+                if (!listing)
+                    continue;
+                for (const filename of listing.split('\n').filter(Boolean)) {
+                    const filePath = `${dir}/${filename}`;
+                    const existing = await client.query('SELECT id FROM mail_quarantine WHERE file_path = $1 AND released_at IS NULL', [filePath]);
+                    if ((existing.rowCount ?? 0) > 0)
+                        continue;
+                    let sender = '', subject = '', spamScore = null;
+                    try {
+                        const { stdout } = await execPromise(`sudo head -150 ${shellEscape(filePath)}`);
+                        const angleMatch = stdout.match(/^From:\s*.*?<([^>]+)>/mi);
+                        const plainMatch = stdout.match(/^From:\s*(\S+@\S+)/mi);
+                        sender = (angleMatch?.[1] ?? plainMatch?.[1] ?? '').trim();
+                        const subjectMatch = stdout.match(/^Subject:\s*(.+?)(?=\r?\n[^\s]|\r?\n\r?\n|$)/mis);
+                        if (subjectMatch)
+                            subject = subjectMatch[1].replace(/\r?\n\s+/g, ' ').trim();
+                        const scoreMatch = stdout.match(/^X-Spam-Score:\s*([\d.-]+)/mi)
+                            ?? stdout.match(/score=([\d.-]+)/i);
+                        if (scoreMatch)
+                            spamScore = parseFloat(scoreMatch[1]);
+                    }
+                    catch { /* unreadable — still record it */ }
+                    // ClamAV scan — clamdscan returns exit 1 if infected, stdout: "file: VIRUS.NAME FOUND"
+                    let virusName = null;
+                    try {
+                        const { stdout: clamOut } = await execPromise(`sudo clamdscan --no-summary --infected ${shellEscape(filePath)} 2>/dev/null || true`);
+                        const virusMatch = clamOut.match(/:\s+(.+?)\s+FOUND/i);
+                        if (virusMatch)
+                            virusName = virusMatch[1].trim();
+                    }
+                    catch { /* clamd unavailable — skip */ }
+                    await client.query(`
+            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, virus_name, file_path)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT DO NOTHING
+          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, virusName, filePath]);
+                    found++;
+                }
+            }
+        }
+        catch (err) {
+            console.error(`Quarantine scan failed for mailbox ${mailbox.id}:`, err.message);
+        }
+    }
+    if (found > 0)
+        console.log(`Quarantine scan: recorded ${found} new emails`);
+}
+// ── UPDATE_AUTORESPONDER (updated to include spam rules) ───────────────────────
+async function handleUpdateAutoresponder(payload) {
+    const { email } = payload;
+    if (!email || !email.includes('@'))
+        throw new Error('Valid email address required');
+    // Find the mailbox id and delegate to handleSyncSpamRules, which reads all
+    // current DB state (spam rules + autoresponder) and writes a combined script.
+    const mbRes = await client.query('SELECT id FROM mail_users WHERE email = $1', [email]);
+    if (mbRes.rows.length === 0) {
+        console.warn(`handleUpdateAutoresponder: mailbox not found for ${email}`);
+        return;
+    }
+    await handleSyncSpamRules({ mailUserId: mbRes.rows[0].id });
     console.log(`Auto-responder updated for ${email}`);
 }
 async function handleReleaseQuarantine(payload) {
@@ -1799,60 +2128,103 @@ async function handleReleaseQuarantine(payload) {
     if (!filePath || !recipient)
         throw new Error('filePath and recipient are required');
     try {
-        // 1. Deliver the file to the user's Maildir
-        // We assume standard Maildir structure: /var/mail/vhosts/domain/user/new/
         const [user, domain] = recipient.split('@');
         const destDir = `/var/mail/vhosts/${domain}/${user}/new`;
         const fileName = path.basename(filePath);
         await execPromise(`sudo mkdir -p ${destDir}`);
-        await execPromise(`sudo mv ${filePath} ${destDir}/${fileName}`);
-        await execPromise(`sudo chown vmail:vmail ${destDir}/${fileName}`);
-        // 2. Clean up DB record
-        await client.query('DELETE FROM mail_quarantine WHERE id = $1', [id]);
-        console.log(`Released quarantined email to ${recipient}.`);
+        await execPromise(`sudo mv ${shellEscape(filePath)} ${shellEscape(destDir + '/' + fileName)}`);
+        await execPromise(`sudo chown vmail:vmail ${shellEscape(destDir + '/' + fileName)}`);
+        // Mark as released (keep for FP stats; purge job cleans up after 7 days)
+        await client.query('UPDATE mail_quarantine SET released_at = NOW() WHERE id = $1', [id]);
+        console.log(`Released quarantined email ${id} to ${recipient}.`);
     }
     catch (err) {
         console.error(`Failed to release quarantine for ${id}:`, err);
         throw err;
     }
 }
+function htmlEscape(s) {
+    return (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 async function handleSendSpamDigest(payload) {
     const { mailUserId } = payload;
     try {
-        // 1. Get user and their quarantined items from the last 24h
         const userRes = await client.query(`
-      SELECT mu.email, mu.id 
-      FROM mail_users mu 
+      SELECT mu.email, mu.id
+      FROM mail_users mu
       WHERE ($1::int IS NULL OR mu.id = $1) AND mu.spam_digest_enabled = true
-    `, [mailUserId || null]);
+    `, [mailUserId ?? null]);
         for (const user of userRes.rows) {
             const qRes = await client.query(`
-        SELECT * FROM mail_quarantine 
-        WHERE mail_user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+        SELECT id, sender, subject, spam_score, created_at
+        FROM mail_quarantine
+        WHERE mail_user_id = $1 AND released_at IS NULL AND created_at > NOW() - INTERVAL '24 hours'
+        ORDER BY created_at DESC
       `, [user.id]);
             if (qRes.rowCount === 0)
                 continue;
-            // 2. Build the Digest Email (Simplified)
             console.log(`Sending spam digest to ${user.email} with ${qRes.rowCount} items...`);
-            let htmlBody = `<h1>Daily Spam Digest for ${user.email}</h1>`;
-            htmlBody += `<p>The following emails were quarantined in the last 24 hours:</p><table border="1">`;
-            htmlBody += `<tr><th>From</th><th>Subject</th><th>Score</th><th>Action</th></tr>`;
-            for (const item of qRes.rows) {
-                htmlBody += `<tr>
-          <td>${item.sender}</td>
-          <td>${item.subject}</td>
-          <td>${item.spam_score}</td>
-          <td>
-            <a href="https://${process.env.DASHBOARD_DOMAIN}/client/spam?release=${item.id}">Allow</a> | 
-            <a href="https://${process.env.DASHBOARD_DOMAIN}/client/spam?delete=${item.id}">Delete</a>
-          </td>
-        </tr>`;
-            }
-            htmlBody += `</table>`;
-            // 3. Send via sendmail or internal transport
-            const tempMail = `/tmp/digest_${user.id}.html`;
-            await fs.writeFile(tempMail, htmlBody);
-            await execPromise(`sudo mail -a "Content-Type: text/html" -s "Daily Spam Digest" ${user.email} < ${tempMail}`);
+            const emailDomain = user.email.split('@')[1] ?? process.env.MASTER_DOMAIN;
+            const dashBase = `https://spam.${emailDomain}/my-spam`;
+            const rows = qRes.rows.map((item) => {
+                const score = Number(item.spam_score ?? 0).toFixed(1);
+                const scoreColor = Number(score) >= 10 ? '#dc2626' : '#ea580c';
+                const date = new Date(item.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                return `
+          <tr>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-family:monospace;font-size:13px;color:#374151">${htmlEscape(item.sender)}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#374151">${htmlEscape(item.subject) || '<em style="color:#9ca3af">no subject</em>'}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;text-align:center">
+              <span style="background:#fff7ed;color:${scoreColor};border:1px solid #fed7aa;border-radius:4px;padding:2px 6px;font-family:monospace;font-size:11px;font-weight:700">${score}</span>
+            </td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;white-space:nowrap">${date}</td>
+            <td style="padding:10px 16px;border-bottom:1px solid #f1f5f9;white-space:nowrap">
+              <a href="${dashBase}?release=${item.id}" style="background:#16a34a;color:#fff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;margin-right:6px">Release</a>
+              <a href="${dashBase}?delete=${item.id}"  style="background:#dc2626;color:#fff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700">Delete</a>
+            </td>
+          </tr>`;
+            }).join('');
+            const htmlBody = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:system-ui,sans-serif">
+  <div style="max-width:680px;margin:32px auto;background:#fff;border-radius:12px;border:1px solid #e2e8f0;overflow:hidden">
+    <div style="background:#ea580c;padding:24px 32px">
+      <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700">Daily Spam Digest</h1>
+      <p style="margin:4px 0 0;color:#fed7aa;font-size:14px">${htmlEscape(user.email)} — ${qRes.rowCount} email${qRes.rowCount === 1 ? '' : 's'} quarantined in the last 24 hours</p>
+    </div>
+    <div style="padding:24px 32px">
+      <p style="margin:0 0 16px;color:#475569;font-size:14px">Review these emails and release any that were incorrectly flagged.</p>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden">
+        <thead>
+          <tr style="background:#f8fafc">
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">From</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Subject</th>
+            <th style="padding:10px 16px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Score</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Time</th>
+            <th style="padding:10px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e2e8f0">Action</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">Quarantined emails are automatically deleted after 30 days. <a href="${dashBase}" style="color:#ea580c">Manage spam settings →</a></p>
+    </div>
+  </div>
+</body></html>`;
+            const masterDomain = process.env.MASTER_DOMAIN ?? 'localhost';
+            const rawSubject = `Daily Spam Digest for ${user.email}`;
+            const encodedSubject = `=?UTF-8?B?${Buffer.from(rawSubject).toString('base64')}?=`;
+            const fullMessage = [
+                `From: Superhost Spam Filter <noreply@${masterDomain}>`,
+                `To: ${user.email}`,
+                `Subject: ${encodedSubject}`,
+                'MIME-Version: 1.0',
+                'Content-Type: text/html; charset=utf-8',
+                '',
+                htmlBody,
+            ].join('\r\n');
+            const tempMail = `/tmp/digest_${user.id}.eml`;
+            await fs.writeFile(tempMail, fullMessage);
+            await execPromise(`/usr/sbin/sendmail -t < ${shellEscape(tempMail)}`);
             await fs.rm(tempMail);
         }
     }
@@ -1860,6 +2232,46 @@ async function handleSendSpamDigest(payload) {
         console.error('Failed to send spam digest:', err);
         throw err;
     }
+}
+async function handlePurgeExpiredQuarantine() {
+    const expired = await client.query(`
+    SELECT id, file_path FROM mail_quarantine
+    WHERE expires_at < NOW()
+       OR (released_at IS NOT NULL AND released_at < NOW() - INTERVAL '7 days')
+  `);
+    for (const row of expired.rows) {
+        if (row.file_path) {
+            try {
+                await execPromise(`sudo rm -f ${shellEscape(row.file_path)}`);
+            }
+            catch { /* file may already be gone */ }
+        }
+    }
+    if (expired.rows.length > 0) {
+        await client.query('DELETE FROM mail_quarantine WHERE id = ANY($1)', [expired.rows.map((r) => r.id)]);
+        console.log(`Purged ${expired.rows.length} expired quarantine records`);
+    }
+}
+// ── REFRESH_MAIL_STATS ─────────────────────────────────────────────────────────
+async function handleRefreshMailStats() {
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    // Count emails delivered to Dovecot today by parsing the Postfix mail log.
+    // Each "status=sent" from a postfix/lmtp process represents one delivery to Dovecot
+    // (and thus one email scanned by SpamAssassin/Sieve).
+    let totalReceived = 0;
+    try {
+        const { stdout } = await execPromise(`sudo grep "$(date +'%b %e')" /var/log/mail.log 2>/dev/null | grep "postfix/lmtp" | grep -c "status=sent" || echo 0`);
+        totalReceived = parseInt(stdout.trim(), 10) || 0;
+    }
+    catch { /* best effort — log may not exist or be unreadable */ }
+    await client.query(`
+    INSERT INTO mail_server_stats (date, total_received, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (date) DO UPDATE SET
+      total_received = GREATEST(EXCLUDED.total_received, mail_server_stats.total_received),
+      updated_at = NOW()
+  `, [today, totalReceived]);
+    console.log(`Mail stats refreshed: ${totalReceived} received today (${today})`);
 }
 async function handleScanMalware(payload, taskId) {
     const { username, userId } = payload;
@@ -2320,6 +2732,25 @@ async function start() {
             console.error('collectTrafficStats error:', err instanceof Error ? err.message : err);
         }
     }, 15 * 60 * 1000);
+    // Scan quarantine folders every 5 minutes to populate mail_quarantine table
+    setInterval(async () => {
+        try {
+            await handleScanQuarantineFolders({});
+        }
+        catch (err) {
+            console.error('Quarantine scan error:', err instanceof Error ? err.message : err);
+        }
+    }, 5 * 60 * 1000);
+    // Refresh Postfix delivery stats every hour
+    setInterval(async () => {
+        try {
+            await handleRefreshMailStats();
+        }
+        catch (err) {
+            console.error('Refresh mail stats error:', err instanceof Error ? err.message : err);
+        }
+    }, 60 * 60 * 1000);
+    handleRefreshMailStats().catch(err => console.error('Initial mail stats error:', err));
     collectMetrics().catch(err => console.error('Initial collectMetrics error:', err));
     collectTrafficStats().catch(err => console.error('Initial collectTrafficStats error:', err));
     // --- System Security Log Monitor (SSH Brute Force Protection) ---
@@ -2584,6 +3015,862 @@ async function handleAdminBackup(taskId) {
     const sizeBytes = parseInt(sizeOut.trim(), 10);
     await client.query('UPDATE tasks SET payload = payload || $1 WHERE id = $2', [JSON.stringify({ path: backupPath, sizeBytes, dirs: existingDirs }), taskId]);
     console.log(`Admin config backup created: ${backupPath} (${sizeBytes} bytes)`);
+}
+async function cwpLog(migrationId, msg) {
+    const ts = new Date().toISOString().slice(11, 19);
+    await client.query("UPDATE cwp_migrations SET logs = logs || $1::jsonb, updated_at = NOW() WHERE id = $2", [JSON.stringify([`[${ts}] ${msg}`]), migrationId]);
+    console.log(`[Migration ${migrationId}] ${msg}`);
+}
+async function cwpProgress(migrationId, progress) {
+    await client.query("UPDATE cwp_migrations SET progress = $1, updated_at = NOW() WHERE id = $2", [JSON.stringify(progress), migrationId]);
+}
+async function handleTestSshConnection(taskId, payload) {
+    const { remoteHost, remotePort, remoteUser, authType, sshPassword, sshKey } = payload;
+    const cred = await setupSshCred(taskId, authType, sshPassword, sshKey);
+    try {
+        await sshRun(remoteHost, remotePort, remoteUser, cred, 'echo ok');
+    }
+    finally {
+        if (cred.type === 'key')
+            await fs.unlink(cred.keyPath).catch(() => { });
+    }
+}
+async function setupSshCred(migrationId, authType, sshPassword, sshKey) {
+    if (authType === 'key' && sshKey) {
+        const keyPath = `/tmp/cwp_key_${migrationId}`;
+        await fs.writeFile(keyPath, sshKey.trim() + '\n', { mode: 0o600 });
+        return { type: 'key', keyPath };
+    }
+    // Verify sshpass is available before attempting password auth
+    await execPromise('which sshpass').catch(() => {
+        throw new Error('sshpass is not installed on this server. Install it with: sudo apt-get install -y sshpass');
+    });
+    return { type: 'password', password: sshPassword ?? '' };
+}
+function sshBaseArgs(port, cred) {
+    return [
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ConnectTimeout=30',
+        '-o', 'ServerAliveInterval=30',
+        '-p', String(port),
+        ...(cred.type === 'key' ? ['-i', cred.keyPath] : ['-o', 'PubkeyAuthentication=no']),
+    ];
+}
+async function sshRun(host, port, user, cred, script) {
+    return new Promise((resolve, reject) => {
+        const args = [...sshBaseArgs(port, cred), `${user}@${host}`, 'bash -s'];
+        const env = cred.type === 'password'
+            ? { ...process.env, SSHPASS: cred.password }
+            : { ...process.env };
+        const cmd = cred.type === 'password' ? 'sshpass' : 'ssh';
+        const finalArgs = cred.type === 'password' ? ['-e', 'ssh', ...args] : args;
+        const proc = spawn(cmd, finalArgs, { env });
+        let out = '', err = '';
+        proc.stdout.on('data', (d) => out += d.toString());
+        proc.stderr.on('data', (d) => err += d.toString());
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+            if (code !== 0)
+                reject(new Error(`SSH failed (${code}): ${err.slice(0, 500)}`));
+            else
+                resolve(out);
+        });
+        proc.stdin.write(script);
+        proc.stdin.end();
+    });
+}
+async function rsyncFromRemote(host, port, remoteUser, cred, remotePath, localPath, extraArgs = []) {
+    const sshCmd = [
+        'ssh', '-o', 'StrictHostKeyChecking=no', '-p', String(port),
+        ...(cred.type === 'key' ? ['-i', cred.keyPath] : ['-o', 'PubkeyAuthentication=no']),
+    ].join(' ');
+    const env = cred.type === 'password'
+        ? { ...process.env, SSHPASS: cred.password }
+        : { ...process.env };
+    const base = cred.type === 'password' ? 'sshpass -e rsync' : 'rsync';
+    const args = [
+        '-avz', '--stats', '--timeout=120',
+        '-e', shellEscape(sshCmd),
+        ...extraArgs,
+        `${shellEscape(remoteUser)}@${shellEscape(host)}:${shellEscape(remotePath)}`,
+        shellEscape(localPath),
+    ].join(' ');
+    await execPromise(`${base} ${args}`, { env, timeout: 20 * 60 * 1000 });
+}
+async function importRemoteDb(host, port, remoteUser, cred, remoteDb, localDb, localDbUser, localDbPass) {
+    return new Promise((resolve, reject) => {
+        const dumpScript = `mysqldump --single-transaction --no-tablespaces --skip-lock-tables ${shellEscape(remoteDb)}`;
+        const sshArgs = [...sshBaseArgs(port, cred)];
+        const env = cred.type === 'password'
+            ? { ...process.env, SSHPASS: cred.password }
+            : { ...process.env };
+        const dumpCmd = cred.type === 'password' ? 'sshpass' : 'ssh';
+        const dumpArgs = cred.type === 'password'
+            ? ['-e', 'ssh', ...sshArgs, `${remoteUser}@${host}`, dumpScript]
+            : [...sshArgs, `${remoteUser}@${host}`, dumpScript];
+        const dumpProc = spawn(dumpCmd, dumpArgs, { env });
+        const importProc = spawn('mysql', [`-u${localDbUser}`, `-p${localDbPass}`, localDb]);
+        dumpProc.stdout.pipe(importProc.stdin);
+        let importErr = '', dumpErr = '';
+        dumpProc.stderr.on('data', (d) => dumpErr += d.toString());
+        importProc.stderr.on('data', (d) => importErr += d.toString());
+        dumpProc.on('error', reject);
+        importProc.on('error', reject);
+        importProc.on('close', (code) => {
+            if (code !== 0)
+                reject(new Error(`DB import failed: ${(importErr + dumpErr).slice(0, 300)}`));
+            else
+                resolve();
+        });
+    });
+}
+// Discovery script — runs via bash heredoc on remote server
+const DISCOVERY_SCRIPT = `python3 << 'CWPEOF'
+import os, json, subprocess, re, socket
+from datetime import datetime
+
+SKIP = {'root','nobody','cwp','cwpsrv','postfix','dovecot','mysql','www-data','nginx','apache','apache2','vmail','named','bind','mail','daemon','sync','games','man','lp','news','uucp','proxy','backup','list','irc','gnats','systemd-network','systemd-resolve','_apt','messagebus','ntp','sshd','dnsmasq','tcpdump','pollinate'}
+
+sh_errors = []
+def sh(cmd, timeout=30):
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=timeout)
+        return out.decode('utf-8', errors='replace').strip()
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b'').decode('utf-8', errors='replace').strip()[:120]
+        if err:  # suppress empty-stderr exits (e.g. grep finding no matches)
+            sh_errors.append((cmd[0] if isinstance(cmd,list) else str(cmd)[:40], err))
+        return ''
+    except Exception as e:
+        sh_errors.append((str(cmd)[:40], str(e)[:120]))
+        return ''
+
+CHECK_DIRS = [
+    '/usr/local/cwpsrv/conf/nginx/conf.d','/etc/nginx/conf.d','/usr/local/nginx/conf/vhosts',
+    '/etc/nginx/sites-enabled','/usr/local/cwpsrv/conf/nginx','/usr/local/cwpsrv/var/services/nginx/conf',
+    '/usr/local/apache/conf.d','/etc/httpd/conf.d','/usr/local/apache/conf/userdata','/etc/httpd/conf/vhosts.d',
+    '/usr/local/cwpsrv/conf/apache','/usr/local/apache/conf/vhosts',
+    '/etc/virtual','/etc/dovecot/virtual','/var/mail/virtual',
+    '/usr/local/cwpsrv/var/services/users','/usr/local/cwpsrv/conf/users','/usr/local/cwp/conf/users',
+]
+existing_dirs = [d for d in CHECK_DIRS if os.path.isdir(d)]
+
+# Probe CWP Apache conf directories to understand where vhosts live
+apache_diag = {}
+for probe_dir in ['/usr/local/apache/conf','/usr/local/apache/conf/vhosts',
+                  '/usr/local/apache/conf/extra',
+                  '/usr/local/cwpsrv/conf/apache','/etc/httpd/conf.d']:
+    try:
+        if os.path.isdir(probe_dir):
+            files = sorted(os.listdir(probe_dir))
+            apache_diag[probe_dir] = files[:40]
+    except: pass
+
+# Read httpd-vhosts.conf and httpd.conf Include lines to find where user vhosts actually live
+apache_vhost_sample = ''
+vhosts_conf_head = ''
+httpd_includes = ''
+try:
+    with open('/usr/local/apache/conf/extra/httpd-vhosts.conf') as f:
+        raw = f.read()
+    lines = [l.strip() for l in raw.splitlines() if l.strip() and not l.strip().startswith('#')]
+    vhosts_conf_head = ' | '.join(lines[:20])
+except: pass
+try:
+    with open('/usr/local/apache/conf/httpd.conf') as f:
+        raw = f.read()
+    inc_lines = [l.strip() for l in raw.splitlines() if re.match(r'^\s*[Ii]nclude', l) or 'VirtualHost' in l]
+    httpd_includes = ' | '.join(inc_lines[:20])
+except: pass
+apache_vhost_sample = ('vhosts.conf: '+vhosts_conf_head if vhosts_conf_head else '') + (' || httpd includes: '+httpd_includes if httpd_includes else '')
+
+# Size of main httpd.conf
+httpd_conf_size = 0
+try:
+    httpd_conf_size = os.path.getsize('/usr/local/apache/conf/httpd.conf')
+except: pass
+
+httpd_conf_sample = list(apache_diag.get('/etc/httpd/conf.d', []))
+httpd_conf_content_sample = apache_vhost_sample
+
+raw_users = []
+user_domains = []
+debug = {'scanned':0,'skip_uid':[],'skip_home':[],'skip_name':[],'skip_nodir':[],'accepted':[],'sh_errors':sh_errors,'existing_dirs':existing_dirs,'user_domains':user_domains,'apache_diag':apache_diag,'apache_vhost_sample':apache_vhost_sample,'httpd_conf_size':httpd_conf_size,'httpd_conf_files':httpd_conf_sample,'httpd_conf_sample':httpd_conf_content_sample}
+try:
+    with open('/etc/passwd') as f:
+        for line in f:
+            p = line.strip().split(':')
+            if len(p) < 7: continue
+            uname, uid, home = p[0], int(p[2]), p[5]
+            debug['scanned'] += 1
+            if uid < 500 or uid >= 65000: debug['skip_uid'].append(uname); continue
+            if not home.startswith('/home/'): debug['skip_home'].append(uname); continue
+            if uname in SKIP: debug['skip_name'].append(uname); continue
+            if not os.path.isdir(home): debug['skip_nodir'].append(uname); continue
+            debug['accepted'].append(uname)
+            raw_users.append((uname, home))
+except Exception as e:
+    print(json.dumps({'error': str(e), 'users': [], 'debug': debug})); raise SystemExit(1)
+
+result = []
+for uname, home in raw_users:
+    # Read CWP user.conf for email and primary domain
+    email = ''
+    primary_domain = ''
+    conf_sample = ''
+    for cp in ['/usr/local/cwpsrv/var/services/users/'+uname+'/user.conf',
+               '/usr/local/cwpsrv/conf/users/'+uname+'.conf',
+               '/usr/local/cwp/conf/users/'+uname+'.conf']:
+        try:
+            with open(cp) as f:
+                lines = f.readlines()
+            if not conf_sample and uname == raw_users[0][0]:
+                conf_sample = '|'.join(l.strip() for l in lines[:10])
+                debug['conf_sample'] = cp+': '+conf_sample
+            for line in lines:
+                k, _, v = line.strip().partition('=')
+                kl = k.lower().strip()
+                if kl in ('email','e-mail') and not email: email = v.strip()
+                if kl in ('domain','maindomain','main_domain','site','website') and not primary_domain:
+                    primary_domain = v.strip()
+            if email or primary_domain: break
+        except: pass
+    if not email: email = uname + '@localhost'
+    if primary_domain: user_domains.append(uname+':'+primary_domain)
+
+    disk_raw = sh(['du','-sm',home]).split()
+    disk_mb = int(disk_raw[0]) if disk_raw else 0
+
+    domains = []
+    seen_d = set()
+
+    def add_domain(dom, docroot, php, has_ssl):
+        if not dom or '.' not in dom or dom in seen_d: return
+        if dom.startswith('www.') or dom in ('localhost','_') or '~' in dom: return
+        seen_d.add(dom)
+        domains.append({'domain':dom,'document_root':docroot,'php_version':php,'has_ssl':has_ssl,'disk_mb':0})
+
+    # 1. Primary domain from CWP user.conf
+    if primary_domain:
+        add_domain(primary_domain, home+'/public_html', '8.1',
+                   os.path.exists('/etc/letsencrypt/live/'+primary_domain+'/fullchain.pem'))
+
+    # 2. /usr/local/apache/conf/userdata/{...}/{username}/{domain}/ directory structure
+    userdata = '/usr/local/apache/conf/userdata'
+    if os.path.isdir(userdata):
+        for dirpath, _, filenames in os.walk(userdata):
+            parts = dirpath.replace('\\\\','').split('/')
+            if uname not in parts: continue
+            uidx = len(parts) - 1 - parts[::-1].index(uname)
+            if uidx + 1 < len(parts):
+                dom_cand = parts[uidx + 1]
+                add_domain(dom_cand, home+'/public_html', '8.1',
+                           os.path.exists('/etc/letsencrypt/live/'+dom_cand+'/fullchain.pem'))
+
+    # 3. CWP database — most complete source of domain→user mapping
+    for cwp_db in ['cwp', 'cwpdb']:
+        raw_dom = sh(['mysql', cwp_db, '-N', '-e',
+            "SELECT domain FROM accounts WHERE user='"+uname+"' UNION SELECT domain FROM domains WHERE user='"+uname+"'"])
+        if raw_dom:
+            for dom in (d.strip() for d in raw_dom.split('\\n') if d.strip()):
+                add_domain(dom, home+'/public_html', '8.1',
+                           os.path.exists('/etc/letsencrypt/live/'+dom+'/fullchain.pem'))
+            break
+
+    def parse_apache_vhosts(content, match_home):
+        """Extract (ServerName, docroot, has_ssl) from VirtualHost blocks containing match_home."""
+        results = []
+        for blk in re.finditer(r'<VirtualHost[^>]*>(.*?)</VirtualHost>', content, re.DOTALL|re.IGNORECASE):
+            bt = blk.group(1)
+            if match_home not in bt: continue
+            sn = re.search(r'ServerName\\s+(\\S+)', bt)
+            if not sn: continue
+            dr = re.search(r'DocumentRoot\\s+(\\S+)', bt)
+            docroot = dr.group(1) if dr else match_home+'/public_html'
+            ssl = 'SSLEngine' in bt or os.path.exists('/etc/letsencrypt/live/'+sn.group(1)+'/fullchain.pem')
+            results.append((sn.group(1), docroot, ssl))
+        return results
+
+    # 4. Filename-based Apache conf lookup (CWP names files after username or domain)
+    for conf_fp in ['/usr/local/apache/conf.d/'+uname+'.conf',
+                    '/usr/local/apache/conf.d/vhost_'+uname+'.conf',
+                    '/etc/httpd/conf.d/'+uname+'.conf',
+                    '/etc/httpd/conf.d/vhost_'+uname+'.conf',
+                    '/etc/httpd/conf.d/'+uname+'_vhost.conf']:
+        if not os.path.exists(conf_fp): continue
+        try: content = open(conf_fp).read()
+        except: continue
+        for sn, docroot, ssl in parse_apache_vhosts(content, home):
+            add_domain(sn, docroot, '8.1', ssl)
+
+    # 5. grep Apache conf files (CWP's conf.d, then fallbacks) for this user's home
+    apache_seen_files = set()
+    for confdir in ['/usr/local/apache/conf.d', '/etc/httpd/conf.d',
+                    '/usr/local/apache/conf/vhosts', '/etc/httpd/conf/vhosts.d',
+                    '/usr/local/cwpsrv/conf/apache', '/usr/local/apache/conf/extra',
+                    '/usr/local/apache/conf']:
+        if not os.path.isdir(confdir) and not os.path.isfile(confdir): continue
+        search_target = confdir if os.path.isdir(confdir) else os.path.dirname(confdir)
+        hits = sh(['grep', '-rl', home, search_target])
+        for fp in (l.strip() for l in hits.split('\\n') if l.strip()):
+            if fp in apache_seen_files: continue
+            apache_seen_files.add(fp)
+            try: content = open(fp).read()
+            except: continue
+            for sn, docroot, ssl in parse_apache_vhosts(content, home):
+                add_domain(sn, docroot, '8.1', ssl)
+
+    # 6. Filename-based Nginx conf lookup (CWP stores confs named after username or domain)
+    for conf_fp in [
+            '/usr/local/cwpsrv/conf/nginx/conf.d/'+uname+'.conf',
+            '/usr/local/cwpsrv/conf/nginx/conf.d/vhost_'+uname+'.conf',
+            '/etc/nginx/conf.d/'+uname+'.conf',
+            '/etc/nginx/conf.d/vhost_'+uname+'.conf',
+            '/usr/local/nginx/conf/vhosts/'+uname+'.conf',
+            '/etc/nginx/sites-enabled/'+uname+'.conf']:
+        if not os.path.exists(conf_fp): continue
+        try: content = open(conf_fp).read()
+        except: continue
+        rm = re.search(r'root\\s+([^\\s;\\r\\n<]+)', content)
+        docroot = rm.group(1) if rm else home+'/public_html'
+        has_ssl = 'ssl_certificate' in content
+        for sm in re.finditer(r'server_name\\s+([^;\\r\\n<]+)', content):
+            for sn in sm.group(1).split():
+                sn = sn.strip().rstrip(';')
+                add_domain(sn, docroot, '8.1', has_ssl or os.path.exists('/etc/letsencrypt/live/'+sn+'/fullchain.pem'))
+
+    # 7. grep Nginx conf dirs for this user's home directory
+    for confdir in [
+            '/usr/local/cwpsrv/conf/nginx/conf.d',
+            '/usr/local/cwpsrv/conf/nginx',
+            '/etc/nginx/conf.d',
+            '/etc/nginx/sites-enabled',
+            '/usr/local/nginx/conf/vhosts',
+            '/usr/local/cwpsrv/var/services/nginx/conf']:
+        if not os.path.isdir(confdir): continue
+        hits = sh(['grep', '-rl', home, confdir])
+        for fp in (l.strip() for l in hits.split('\\n') if l.strip()):
+            try: content = open(fp).read()
+            except: continue
+            rm = re.search(r'root\\s+([^\\s;\\r\\n<]+)', content)
+            docroot = rm.group(1) if rm else home+'/public_html'
+            has_ssl = 'ssl_certificate' in content
+            for sm in re.finditer(r'server_name\\s+([^;\\r\\n<]+)', content):
+                for sn in sm.group(1).split():
+                    sn = sn.strip().rstrip(';')
+                    add_domain(sn, docroot, '8.1', has_ssl or os.path.exists('/etc/letsencrypt/live/'+sn+'/fullchain.pem'))
+
+    # DNS records — read BIND zone files from common CWP paths
+    def read_zone_dns(domain):
+        """Parse a BIND zone file and return list of record dicts, excluding SOA/NS."""
+        zone_paths = [
+            '/var/named/'+domain,
+            '/var/named/'+domain+'.db',
+            '/var/named/'+domain+'.zone',
+            '/etc/named/'+domain+'.db',
+            '/etc/bind/zones/db.'+domain,
+            '/etc/bind/'+domain+'.db',
+            '/var/named/data/'+domain+'.db',
+        ]
+        content = ''
+        for zp in zone_paths:
+            try:
+                with open(zp) as f: content = f.read(); break
+            except: pass
+        if not content:
+            # Try named-compilezone or just grep named.conf for zone file path
+            raw = sh(['grep', '-r', '"'+domain+'"', '/etc/named.conf', '/etc/named/', '/etc/bind/named.conf'], timeout=5)
+            for line in raw.split('\\n'):
+                m = re.search(r'file\\s+["\\']+([^"\\']+)["\\']+', line)
+                if m:
+                    try:
+                        with open(m.group(1)) as f: content = f.read(); break
+                    except: pass
+        if not content:
+            return []
+        records = []
+        current_ttl = 3600
+        origin = domain + '.'
+        for line in content.split('\\n'):
+            line = line.strip()
+            if not line or line.startswith(';'): continue
+            if line.startswith('$TTL'):
+                try: current_ttl = int(line.split()[1])
+                except: pass
+                continue
+            if line.startswith('$ORIGIN'):
+                try: origin = line.split()[1]
+                except: pass
+                continue
+            # Skip SOA and NS — we generate these fresh
+            if ' SOA ' in line or '\\tSOA\\t' in line: continue
+            if (' NS ' in line or '\\tNS\\t' in line) and 'IN' in line: continue
+            # Parse: [name] [ttl] [class] type rdata
+            m = re.match(r'^(\\S+)?\\s+(?:(\\d+)\\s+)?(?:IN\\s+)?(A|AAAA|MX|TXT|CNAME|SRV|CAA|PTR)\\s+(.+)$', line, re.IGNORECASE)
+            if not m: continue
+            name_raw, ttl_raw, rtype, rdata = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+            ttl = int(ttl_raw) if ttl_raw else current_ttl
+            # Strip inline BIND comments from rdata (semicolon outside TXT quotes)
+            if rtype != 'TXT':
+                rdata = re.sub(r'\\s*;.*$', '', rdata).strip()
+            # Normalise name — handle full domain name used in place of @
+            if not name_raw or name_raw == '@': name = '@'
+            elif name_raw.rstrip('.') in (domain, ''): name = '@'
+            elif name_raw.endswith('.'): name = name_raw[:-len(domain)-2] if name_raw.endswith('.'+domain+'.') else name_raw.rstrip('.')
+            else: name = name_raw
+            # Clean TXT — join quoted segments
+            if rtype == 'TXT':
+                rdata = ''.join(re.findall(r'"([^"]*)"', rdata)) or rdata.strip('"')
+            # MX: split priority from exchange
+            priority = None
+            if rtype == 'MX':
+                parts = rdata.split()
+                if len(parts) == 2:
+                    try: priority = int(parts[0]); rdata = parts[1].rstrip('.')
+                    except: rdata = rdata.rstrip('.')
+                else: rdata = rdata.rstrip('.')
+            else:
+                if rdata.endswith('.'): rdata = rdata[:-1]
+            rec = {'name': name, 'type': rtype, 'content': rdata, 'ttl': ttl}
+            if priority is not None: rec['priority'] = priority
+            records.append(rec)
+        return records
+
+    # CWP-generated boilerplate subdomain names — never worth migrating
+    CWP_STD_NAMES = {
+        '@','www','mail','smtp','smtps','pop','pop3','imap','imaps',
+        'webmail','ftp','sftp','cpanel','cwp','whm','whmcs','localhost',
+        'spam','default._domainkey','_dmarc','autodiscover','autoconfig',
+    }
+
+    def is_custom_record(r, domain, old_ips):
+        """Return True only for genuinely custom records worth migrating."""
+        if r['type'] in ('SOA','NS'): return False
+        if r['name'].lower() in CWP_STD_NAMES: return False
+        # Skip CNAMEs that point directly to the apex domain (CWP boilerplate)
+        if r['type'] == 'CNAME' and r['content'].rstrip('.') in (domain, domain+'.'): return False
+        # Skip A/AAAA records pointing to the old server's IPs
+        if r['type'] in ('A','AAAA') and r['content'] in old_ips: return False
+        # Skip boilerplate TXT records we regenerate
+        for prefix in ('v=spf1','v=DKIM1','v=DMARC1'):
+            if r['content'].startswith(prefix): return False
+        return True
+
+    # Attach DNS records to each discovered domain
+    # Collect all IPs from A records for @ — these are the old server IPs to skip
+    for dom in domains:
+        all_recs = read_zone_dns(dom['domain'])
+        old_ips = {r['content'] for r in all_recs if r['type'] == 'A' and r['name'] == '@'}
+        dom['dns_records'] = [r for r in all_recs if is_custom_record(r, dom['domain'], old_ips)]
+
+    # Databases — information_schema is readable without special grants
+    dbs = []
+    raw_db = sh(['mysql','-N','-e',
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '"+uname+"\\_%' OR SCHEMA_NAME='"+uname+"'"])
+    if not raw_db:
+        # fallback: mysql.db grants table
+        raw_db = sh(['mysql','-N','-e',
+            "SELECT DISTINCT Db FROM mysql.db WHERE User='"+uname+"' OR User LIKE '"+uname+"\\_%'"])
+    for db_name in raw_db.split('\\n'):
+        db_name = db_name.strip()
+        if not db_name or db_name in ('information_schema','performance_schema','mysql','sys'): continue
+        sz_raw = sh(['mysql','-N','-e',
+            "SELECT ROUND(SUM(data_length+index_length)/1024/1024,1) FROM information_schema.tables WHERE table_schema='"+db_name+"'"]) or '0'
+        try: size = float(sz_raw.split()[0]) if sz_raw.split() else 0.0
+        except: size = 0.0
+        dbs.append({'db_name':db_name,'db_user':uname,'size_mb':size})
+
+    # Email accounts
+    email_accs = []
+    seen_e = set()
+    dom_set = {d['domain'] for d in domains}
+
+    # /var/vmail/{domain}/{user}/ — Dovecot Maildir structure used by CWP
+    if os.path.isdir('/var/vmail'):
+        try:
+            for dom_dir in os.listdir('/var/vmail'):
+                dom_path = '/var/vmail/' + dom_dir
+                if not os.path.isdir(dom_path) or '.' not in dom_dir: continue
+                if dom_dir not in dom_set:
+                    # Domain wasn't found in web-hosting discovery; confirm via conf files
+                    confirmed = False
+                    for confdir in ['/usr/local/cwpsrv/conf/nginx/conf.d','/etc/nginx/conf.d',
+                                    '/usr/local/cwpsrv/conf/nginx','/etc/httpd/conf.d',
+                                    '/etc/nginx/sites-enabled']:
+                        if not os.path.isdir(confdir): continue
+                        probe = sh(['grep', '-rl', dom_dir, confdir])
+                        for fp in (l.strip() for l in probe.split('\\n') if l.strip()):
+                            try:
+                                c = open(fp).read()
+                                if home in c:
+                                    confirmed = True
+                                    add_domain(dom_dir, home+'/public_html', '8.1',
+                                               os.path.exists('/etc/letsencrypt/live/'+dom_dir+'/fullchain.pem'))
+                                    break
+                            except: pass
+                        if confirmed: break
+                    if not confirmed: continue
+                for mbox in os.listdir(dom_path):
+                    if mbox.startswith('.'): continue
+                    if not os.path.isdir(dom_path+'/'+mbox): continue
+                    addr = mbox+'@'+dom_dir
+                    if addr not in seen_e:
+                        seen_e.add(addr)
+                        email_accs.append({'email':addr,'domain':dom_dir,'quota_mb':1024})
+        except: pass
+
+    # Fallback: file-based virtual mailbox lists (/etc/virtual, /etc/dovecot/virtual)
+    if not email_accs:
+        for vdir in ['/etc/virtual', '/etc/dovecot/virtual', '/var/mail/virtual']:
+            if not os.path.isdir(vdir): continue
+            try:
+                for root2, _, files in os.walk(vdir):
+                    dom2 = os.path.basename(root2)
+                    for fname in files:
+                        if fname not in ('passwd','accounts','passwd.db'): continue
+                        try:
+                            with open(os.path.join(root2, fname)) as ef:
+                                for line in ef:
+                                    if not line.strip(): continue
+                                    addr = line.strip().split(':')[0]
+                                    if '@' not in addr: addr = addr+'@'+dom2
+                                    if addr in seen_e: continue
+                                    seen_e.add(addr)
+                                    em_dom = addr.split('@')[1]
+                                    if em_dom not in dom_set: continue  # can't attribute to this user
+                                    email_accs.append({'email':addr,'domain':em_dom,'quota_mb':1024})
+                        except: pass
+            except: pass
+
+    result.append({'username':uname,'email':email,'home_dir':home,'disk_usage_mb':disk_mb,'domains':domains,'databases':dbs,'email_accounts':email_accs})
+
+print(json.dumps({'users':result,'debug':debug,'discovered_at':datetime.utcnow().isoformat()+'Z','remote_host':socket.gethostname()}))
+CWPEOF
+`;
+async function handleDiscoverCwp(payload) {
+    const { migrationId, remoteHost, remotePort, remoteUser, authType, sshPassword, sshKey } = payload;
+    const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+    try {
+        await cwpLog(migrationId, `Connecting to ${remoteUser}@${remoteHost}:${remotePort}…`);
+        // Test connectivity first
+        await sshRun(remoteHost, remotePort, remoteUser, cred, 'echo ok');
+        await cwpLog(migrationId, 'SSH connection established. Running discovery…');
+        const output = await sshRun(remoteHost, remotePort, remoteUser, cred, DISCOVERY_SCRIPT);
+        let discoveryData;
+        try {
+            discoveryData = JSON.parse(output);
+        }
+        catch {
+            throw new Error(`Discovery returned invalid JSON. Output: ${output.slice(0, 300)}`);
+        }
+        if (discoveryData.error)
+            throw new Error(`Discovery error: ${discoveryData.error}`);
+        const users = (discoveryData.users ?? []);
+        const dbg = discoveryData.debug;
+        if (dbg) {
+            await cwpLog(migrationId, `Scanned ${dbg.scanned} passwd entries → accepted: [${dbg.accepted.join(', ') || 'none'}]`);
+            if (dbg.skip_uid.length)
+                await cwpLog(migrationId, `  Skipped (UID out of range): ${dbg.skip_uid.join(', ')}`);
+            if (dbg.skip_home.length)
+                await cwpLog(migrationId, `  Skipped (home not /home/): ${dbg.skip_home.join(', ')}`);
+            if (dbg.skip_name.length)
+                await cwpLog(migrationId, `  Skipped (system name): ${dbg.skip_name.join(', ')}`);
+            if (dbg.skip_nodir.length)
+                await cwpLog(migrationId, `  Skipped (home dir missing): ${dbg.skip_nodir.join(', ')}`);
+            const shErrs = dbg.sh_errors ?? [];
+            for (const [cmd, err] of shErrs)
+                await cwpLog(migrationId, `  sh() error [${cmd}]: ${err}`);
+            if (dbg.existing_dirs?.length)
+                await cwpLog(migrationId, `  Dirs found: ${dbg.existing_dirs.join(', ')}`);
+            else
+                await cwpLog(migrationId, `  No expected dirs found`);
+            if (dbg.conf_sample)
+                await cwpLog(migrationId, `  user.conf sample: ${dbg.conf_sample}`);
+            if (dbg.user_domains?.length)
+                await cwpLog(migrationId, `  Domains from user.conf: ${dbg.user_domains.join(', ')}`);
+            if (dbg.httpd_conf_size)
+                await cwpLog(migrationId, `  /usr/local/apache/conf/httpd.conf size: ${dbg.httpd_conf_size} bytes`);
+            const apacheDiag = dbg.apache_diag ?? {};
+            for (const [dir, files] of Object.entries(apacheDiag))
+                await cwpLog(migrationId, `  ${dir}: [${files.join(', ')}]`);
+            if (dbg.apache_vhost_sample)
+                await cwpLog(migrationId, `  vhost sample: ${dbg.apache_vhost_sample}`);
+        }
+        const totalDomains = users.reduce((s, u) => s + (u.domains?.length ?? 0), 0);
+        const totalDbs = users.reduce((s, u) => s + (u.databases?.length ?? 0), 0);
+        const totalEmails = users.reduce((s, u) => s + (u.email_accounts?.length ?? 0), 0);
+        await client.query(`UPDATE cwp_migrations SET status = 'ready', discovery_data = $1, updated_at = NOW() WHERE id = $2`, [JSON.stringify(discoveryData), migrationId]);
+        await cwpLog(migrationId, `Discovery complete: ${users.length} user(s), ${totalDomains} domain(s), ${totalDbs} database(s), ${totalEmails} email account(s)`);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await client.query(`UPDATE cwp_migrations SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`, [msg, migrationId]);
+        await cwpLog(migrationId, `ERROR: ${msg}`);
+        throw err;
+    }
+    finally {
+        if (cred.type === 'key')
+            await fs.unlink(cred.keyPath).catch(() => { });
+    }
+}
+function resolvePhpVersion(requested) {
+    // Find the best available PHP-FPM socket on this server.
+    // Prefer exact match, then nearest higher version, then any available.
+    const { readdirSync } = require('fs');
+    let available = [];
+    try {
+        available = readdirSync('/run/php')
+            .map((f) => { const m = f.match(/^php(\d+\.\d+)-fpm\.sock$/); return m ? m[1] : null; })
+            .filter(Boolean);
+    }
+    catch { /* /run/php not accessible */ }
+    if (available.length === 0)
+        return requested;
+    if (available.includes(requested))
+        return requested;
+    // Pick the closest version >= requested, or the highest available
+    const sorted = available.sort((a, b) => parseFloat(a) - parseFloat(b));
+    return sorted.find(v => parseFloat(v) >= parseFloat(requested)) ?? sorted[sorted.length - 1];
+}
+async function patchCmsDbConfig(configPath, dbUser, dbPass) {
+    // Rewrites DB_USER / DB_PASSWORD / DB_HOST in WordPress (and compatible) config files.
+    // Uses a temp Python script so special chars in credentials are never interpolated by the shell.
+    const script = [
+        'import sys',
+        'path, u, p = sys.argv[1], sys.argv[2], sys.argv[3]',
+        'out = []',
+        'with open(path) as f:',
+        '    for line in f:',
+        '        if "DB_USER" in line and "define" in line:',
+        "            line = \"define('DB_USER', '\" + u + \"');\\n\"",
+        '        elif "DB_PASSWORD" in line and "define" in line:',
+        "            line = \"define('DB_PASSWORD', '\" + p + \"');\\n\"",
+        '        elif "DB_HOST" in line and "define" in line:',
+        "            line = \"define('DB_HOST', 'localhost');\\n\"",
+        '        out.append(line)',
+        'with open(path, "w") as f:',
+        '    f.writelines(out)',
+    ].join('\n');
+    const tmp = `/tmp/.cms_patch_${process.pid}.py`;
+    await fs.writeFile(tmp, script, { mode: 0o600 });
+    try {
+        await execPromise(`sudo python3 ${shellEscape(tmp)} ${shellEscape(configPath)} ${shellEscape(dbUser)} ${shellEscape(dbPass)}`);
+    }
+    finally {
+        await fs.unlink(tmp).catch(() => { });
+    }
+}
+async function handleMigrateCwp(payload) {
+    const { migrationId, remoteHost, remotePort, remoteUser, selectedUsers, authType, sshPassword, sshKey } = payload;
+    const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+    try {
+        const migRes = await client.query('SELECT * FROM cwp_migrations WHERE id = $1', [migrationId]);
+        const mig = migRes.rows[0];
+        if (!mig)
+            throw new Error('Migration record not found');
+        const discoveryData = mig.discovery_data;
+        const allUsers = (discoveryData?.users ?? []);
+        const usersToMigrate = allUsers.filter((u) => selectedUsers.includes(u.username));
+        await cwpLog(migrationId, `Starting migration of ${usersToMigrate.length} user(s)…`);
+        for (let i = 0; i < usersToMigrate.length; i++) {
+            const cwpUser = usersToMigrate[i];
+            const { username } = cwpUser;
+            await cwpProgress(migrationId, {
+                users_total: usersToMigrate.length,
+                users_done: i,
+                current_user: username,
+                current_step: 'Creating user account',
+            });
+            await cwpLog(migrationId, `━━━ Migrating user: ${username} ━━━`);
+            // ── 1. Create Superhost user account ──────────────────────────────────
+            const existingUser = await client.query('SELECT id FROM users WHERE username = $1', [username]);
+            let userId;
+            if (existingUser.rows[0]) {
+                userId = existingUser.rows[0].id;
+                await cwpLog(migrationId, `  [${username}] User already exists — skipping account creation`);
+            }
+            else {
+                const homeDir = `/home/${username}`;
+                const email = cwpUser.email || `${username}@localhost`;
+                const insertRes = await client.query(`INSERT INTO users (username, email, home_dir) VALUES ($1, $2, $3)
+           ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email RETURNING id`, [username, email, homeDir]);
+                userId = insertRes.rows[0].id;
+                // System setup (creates Linux user, default DB, staging domain)
+                await handleCreateUser({ username, email });
+                await cwpLog(migrationId, `  [${username}] Superhost account created`);
+            }
+            // ── 2. Rsync home directory ───────────────────────────────────────────
+            await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: 'Syncing files' });
+            await cwpLog(migrationId, `  [${username}] Syncing home directory from remote…`);
+            try {
+                await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred, `/home/${username}/`, `/home/${username}/`, ['--exclude=.env', '--exclude=logs/']);
+                await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} /home/${shellEscape(username)}/`);
+                await cwpLog(migrationId, `  [${username}] Files synced`);
+            }
+            catch (e) {
+                await cwpLog(migrationId, `  [${username}] File sync warning: ${e instanceof Error ? e.message : String(e)}`);
+            }
+            // Re-apply permissions — rsync preserves source server's mode bits (source used Apache-as-user;
+            // this server uses nginx/www-data which needs world-read on public_html).
+            try {
+                const h = `/home/${shellEscape(username)}`;
+                await execPromise(`sudo chmod 711 ${h}`);
+                await execPromise(`sudo setfacl -m user:jonathan:rwx,default:user:jonathan:rwx ${h}`);
+                await execPromise(`sudo find ${h}/public_html -type d -exec chmod 755 {} +`);
+                await execPromise(`sudo find ${h}/public_html -type f -exec chmod 644 {} +`);
+                await execPromise(`sudo find ${h}/public_html -type d -exec setfacl -m user:jonathan:rwx,default:user:jonathan:rwx {} +`);
+                await execPromise(`sudo find ${h}/public_html -type f -exec setfacl -m user:jonathan:rw- {} +`);
+            }
+            catch (e) {
+                await cwpLog(migrationId, `  [${username}] Permission fix warning: ${e instanceof Error ? e.message : String(e)}`);
+            }
+            // ── 3. Set up domains ─────────────────────────────────────────────────
+            const domains = (cwpUser.domains ?? []);
+            for (const dom of domains) {
+                await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Domain: ${dom.domain}` });
+                await cwpLog(migrationId, `  [${username}] Setting up domain: ${dom.domain}`);
+                try {
+                    const existingDom = await client.query('SELECT id FROM domains WHERE domain_name = $1', [dom.domain]);
+                    if (existingDom.rows[0]) {
+                        await cwpLog(migrationId, `  [${username}] Domain ${dom.domain} already exists — skipping`);
+                        continue;
+                    }
+                    const phpVersion = resolvePhpVersion(dom.php_version || '8.3');
+                    const domainInsert = await client.query(`INSERT INTO domains (user_id, domain_name, document_root, is_ssl, php_version)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`, [userId, dom.domain, dom.document_root || `/home/${username}/public_html`, dom.has_ssl ?? false, phpVersion]);
+                    const domainId = domainInsert.rows[0].id;
+                    await handleCreateDomain({
+                        domainName: dom.domain,
+                        username,
+                        phpVersion,
+                        docRoot: dom.document_root || `/home/${username}/public_html`,
+                        domainId,
+                    });
+                    await cwpLog(migrationId, `  [${username}] Domain ${dom.domain} configured`);
+                    // Import custom DNS records from the source zone (skip CWP boilerplate we manage ourselves)
+                    const sourceRecords = (dom.dns_records ?? []);
+                    // Discovery script already pre-filters; this is a safety net for any that slip through
+                    const cwpStdNames = new Set([
+                        '@', 'www', 'mail', 'smtp', 'smtps', 'pop', 'pop3', 'imap', 'imaps',
+                        'webmail', 'ftp', 'sftp', 'cpanel', 'cwp', 'whm', 'whmcs', 'localhost',
+                        'spam', 'default._domainkey', '_dmarc', 'autodiscover', 'autoconfig',
+                    ]);
+                    const customRecords = sourceRecords.filter((r) => {
+                        if (['SOA', 'NS'].includes(String(r.type)))
+                            return false;
+                        if (cwpStdNames.has(String(r.name).toLowerCase()))
+                            return false;
+                        if (String(r.type) === 'CNAME' && String(r.content).replace(/\.$/, '') === String(dom.domain))
+                            return false;
+                        if (['v=spf1', 'v=DKIM1', 'v=DMARC1'].some(p => String(r.content).startsWith(p)))
+                            return false;
+                        return true;
+                    });
+                    if (customRecords.length > 0) {
+                        const zoneRes = await client.query('SELECT id FROM dns_zones WHERE domain_name = $1', [dom.domain]);
+                        const zoneId = zoneRes.rows[0]?.id;
+                        if (zoneId) {
+                            for (const r of customRecords) {
+                                await client.query(`INSERT INTO dns_records (zone_id, type, name, content, priority, ttl)
+                   VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, [zoneId, r.type, r.name, r.content, r.priority ?? null, r.ttl ?? 3600]);
+                            }
+                            // Rebuild the zone file with all records
+                            await client.query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_DNS_ZONE', JSON.stringify({ domainName: dom.domain })]);
+                            await cwpLog(migrationId, `  [${username}] Imported ${customRecords.length} custom DNS record(s) for ${dom.domain}`);
+                        }
+                    }
+                }
+                catch (e) {
+                    await cwpLog(migrationId, `  [${username}] Domain error (${dom.domain}): ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+            // ── 4. Import databases ───────────────────────────────────────────────
+            const dbs = (cwpUser.databases ?? []);
+            for (const db of dbs) {
+                await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Database: ${db.db_name}` });
+                await cwpLog(migrationId, `  [${username}] Importing database: ${db.db_name}`);
+                try {
+                    const localDbName = validateMysqlIdentifier(db.db_name);
+                    const localDbUser = validateMysqlIdentifier(username);
+                    const localDbPass = crypto.randomBytes(16).toString('hex');
+                    // Create the DB locally
+                    await handleCreateDatabase({ dbName: localDbName, dbUser: localDbUser, dbPassword: localDbPass });
+                    // Track in PostgreSQL
+                    await client.query(`INSERT INTO databases (user_id, db_name, db_user) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [userId, localDbName, localDbUser]);
+                    // Import data from remote
+                    await importRemoteDb(remoteHost, remotePort, remoteUser, cred, db.db_name, localDbName, localDbUser, localDbPass);
+                    await cwpLog(migrationId, `  [${username}] Database ${db.db_name} imported`);
+                    // Patch CMS config files that reference this database
+                    const { stdout: cfgHits } = await execPromise(`sudo grep -rl ${shellEscape(localDbName)} /home/${shellEscape(username)}/ --include='wp-config.php' 2>/dev/null || true`).catch(() => ({ stdout: '' }));
+                    for (const cfgPath of cfgHits.trim().split('\n').filter(Boolean)) {
+                        try {
+                            await patchCmsDbConfig(cfgPath, localDbUser, localDbPass);
+                            await execPromise(`sudo setfacl -m user:jonathan:rw- ${shellEscape(cfgPath)}`);
+                            await cwpLog(migrationId, `  [${username}] Patched DB credentials in ${cfgPath.split('/').pop()}`);
+                        }
+                        catch (e) {
+                            await cwpLog(migrationId, `  [${username}] Config patch warning (${cfgPath.split('/').pop()}): ${e instanceof Error ? e.message : String(e)}`);
+                        }
+                    }
+                }
+                catch (e) {
+                    await cwpLog(migrationId, `  [${username}] DB error (${db.db_name}): ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+            // ── 5. Set up email accounts ──────────────────────────────────────────
+            const emailAccounts = (cwpUser.email_accounts ?? []);
+            for (const acc of emailAccounts) {
+                await cwpProgress(migrationId, { users_total: usersToMigrate.length, users_done: i, current_user: username, current_step: `Email: ${acc.email}` });
+                await cwpLog(migrationId, `  [${username}] Creating email: ${acc.email}`);
+                try {
+                    const emailAddr = acc.email;
+                    const [, emailDomain] = emailAddr.split('@');
+                    // Ensure mail_domains record exists
+                    const mdRes = await client.query(`INSERT INTO mail_domains (domain_name, user_id)
+             VALUES ($1, $2) ON CONFLICT (domain_name) DO UPDATE SET user_id = EXCLUDED.user_id RETURNING id`, [emailDomain, userId]);
+                    const domainId = mdRes.rows[0].id;
+                    // Create mail_users record (no password — admin must set one)
+                    await client.query(`INSERT INTO mail_users (domain_id, email, password_hash, quota)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING`, [domainId, emailAddr, '$MIGRATED$', acc.quota_mb ?? 1024]);
+                    // Provision the Dovecot mailbox directory
+                    await handleProvisionMailbox({ email: emailAddr });
+                    // Rsync Maildir if available on remote
+                    const [localPart] = emailAddr.split('@');
+                    const remoteMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
+                    const localMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
+                    try {
+                        await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred, remoteMaildir, localMaildir);
+                        await cwpLog(migrationId, `  [${username}] Email ${emailAddr} + Maildir synced`);
+                    }
+                    catch {
+                        await cwpLog(migrationId, `  [${username}] Email ${emailAddr} created (no remote Maildir found)`);
+                    }
+                }
+                catch (e) {
+                    await cwpLog(migrationId, `  [${username}] Email error (${acc.email}): ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+            await cwpProgress(migrationId, {
+                users_total: usersToMigrate.length,
+                users_done: i + 1,
+                current_user: username,
+                current_step: 'Done',
+            });
+            await cwpLog(migrationId, `  [${username}] ✓ Migration complete`);
+        }
+        await client.query(`UPDATE cwp_migrations SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1`, [migrationId]);
+        await cwpLog(migrationId, `All ${usersToMigrate.length} user(s) migrated successfully.`);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await client.query(`UPDATE cwp_migrations SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`, [msg, migrationId]);
+        await cwpLog(migrationId, `FATAL ERROR: ${msg}`);
+        throw err;
+    }
+    finally {
+        if (cred.type === 'key')
+            await fs.unlink(cred.keyPath).catch(() => { });
+    }
 }
 start().catch(console.error);
 //# sourceMappingURL=index.js.map

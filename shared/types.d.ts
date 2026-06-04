@@ -4,6 +4,7 @@ export interface User {
     username: string;
     email: string;
     home_dir: string;
+    ssh_enabled: boolean;
     created_at: string;
 }
 export interface Domain {
@@ -86,6 +87,8 @@ export interface MailUser {
     quota: number;
     spam_filter_enabled: boolean;
     spam_digest_enabled: boolean;
+    spam_score_threshold: number;
+    spam_action: 'quarantine' | 'tag' | 'deliver';
     is_catchall: boolean;
     created_at: string;
     domain_name?: string;
@@ -112,6 +115,15 @@ export interface MailQuarantine {
     subject: string;
     spam_score: number;
     file_path: string;
+    created_at: string;
+    released_at: string | null;
+    expires_at: string;
+}
+export interface MailGlobalRule {
+    id: number;
+    sender_pattern: string;
+    access_type: 'allow' | 'block';
+    note: string | null;
     created_at: string;
 }
 export interface MailAccessControl {
@@ -201,5 +213,66 @@ export interface Invoice {
     paid_at: string | null;
     notes: string | null;
     created_at: string;
+}
+export type CwpMigrationStatus = 'pending' | 'discovering' | 'ready' | 'migrating' | 'completed' | 'failed';
+export interface CwpDiscoveredDnsRecord {
+    name: string;
+    type: string;
+    content: string;
+    ttl: number;
+    priority?: number;
+}
+export interface CwpDiscoveredDomain {
+    domain: string;
+    document_root: string;
+    php_version: string;
+    has_ssl: boolean;
+    disk_mb: number;
+    dns_records: CwpDiscoveredDnsRecord[];
+}
+export interface CwpDiscoveredDatabase {
+    db_name: string;
+    db_user: string;
+    size_mb: number;
+}
+export interface CwpDiscoveredEmail {
+    email: string;
+    domain: string;
+    quota_mb: number;
+}
+export interface CwpDiscoveredUser {
+    username: string;
+    email: string;
+    home_dir: string;
+    disk_usage_mb: number;
+    domains: CwpDiscoveredDomain[];
+    databases: CwpDiscoveredDatabase[];
+    email_accounts: CwpDiscoveredEmail[];
+}
+export interface CwpDiscoveryData {
+    users: CwpDiscoveredUser[];
+    discovered_at: string;
+    remote_host: string;
+}
+export interface CwpMigrationProgress {
+    users_total: number;
+    users_done: number;
+    current_user?: string;
+    current_step?: string;
+}
+export interface CwpMigration {
+    id: number;
+    remote_host: string;
+    remote_port: number;
+    remote_user: string;
+    status: CwpMigrationStatus;
+    discovery_data: CwpDiscoveryData | null;
+    selected_users: string[] | null;
+    progress: CwpMigrationProgress;
+    logs: string[];
+    error_message: string | null;
+    created_at: string;
+    updated_at: string;
+    completed_at: string | null;
 }
 //# sourceMappingURL=types.d.ts.map

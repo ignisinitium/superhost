@@ -103,6 +103,24 @@ router.put('/:id', async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+router.put('/:id/ssh', async (req, res) => {
+    const { id } = req.params;
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') {
+        res.status(400).json({ message: 'enabled must be a boolean' });
+        return;
+    }
+    try {
+        const userRes = await query(`UPDATE users SET ssh_enabled=$1 WHERE id=$2 RETURNING id, username`, [enabled, id]);
+        if (userRes.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        const taskRes = await query('INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id', ['TOGGLE_SSH_ACCESS', { username: userRes.rows[0].username, enabled }]);
+        res.json({ message: `SSH access ${enabled ? 'enabled' : 'disabled'}`, taskId: taskRes.rows[0].id });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     try {

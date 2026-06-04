@@ -6,7 +6,7 @@ import type { HostingPackage, UserAddon } from '../../../shared/types';
 import {
   Mail, Shield, Save, ArrowLeft, HardDrive, Zap, Lock,
   Globe, Database, Box, Check, RefreshCw, ChevronRight, Network,
-  Puzzle, Plus, X,
+  Puzzle, Plus, X, Terminal,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -76,6 +76,17 @@ const UserSettingsPage: React.FC = () => {
       refetch();
     },
     onError: (err: any) => toast.error(err.response?.data?.message || 'Update failed'),
+  });
+
+  // ── SSH toggle mutation ──
+  const sshMutation = useMutation({
+    mutationFn: async (enabled: boolean) =>
+      (await api.put(`/users/${id}/ssh`, { enabled })).data,
+    onSuccess: (_data, enabled) => {
+      toast.success(`SSH access ${enabled ? 'enabled' : 'disabled'}`);
+      refetch();
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to update SSH access'),
   });
 
   // ── add-on mutations ──
@@ -377,6 +388,43 @@ const UserSettingsPage: React.FC = () => {
             </div>
           </div>
         )}
+
+        {/* ── SSH Access ── */}
+        <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+          <div className="p-5 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
+            <Terminal className="text-orange-600" size={20} />
+            <div>
+              <h2 className="text-lg font-bold text-slate-800">SSH Access</h2>
+              <p className="text-xs text-slate-400 mt-0.5">Allow this user to log in via SSH with their system shell.</p>
+            </div>
+          </div>
+          <div className="p-6 flex items-center justify-between gap-6">
+            <div className="space-y-1">
+              <p className="text-sm font-semibold text-slate-700">
+                {user?.ssh_enabled ? 'SSH is currently enabled' : 'SSH is currently disabled'}
+              </p>
+              <p className="text-xs text-slate-400">
+                {user?.ssh_enabled
+                  ? `${user.username} can log in via SSH with a full bash shell.`
+                  : `${user?.username}'s shell is set to nologin — SSH login is blocked.`}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={sshMutation.isPending}
+              onClick={() => sshMutation.mutate(!user?.ssh_enabled)}
+              className={`relative inline-flex h-7 w-12 flex-shrink-0 cursor-pointer rounded-full border-2 transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-orange-400/40 disabled:opacity-50 ${
+                user?.ssh_enabled ? 'bg-green-500 border-green-500' : 'bg-slate-200 border-slate-200'
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform duration-200 ease-in-out mt-0.5 ${
+                  user?.ssh_enabled ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
 
         {/* ── Resource Quotas ── */}
         <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
