@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import api from '../api/client';
 import { CreditCard, Download, CheckCircle, Clock, XCircle, Box, Server, Globe } from 'lucide-react';
@@ -10,6 +10,7 @@ interface Product {
   name: string;
   description: string;
   price_cents: number;
+  annual_price_cents: number;
   type: string;
 }
 
@@ -24,6 +25,7 @@ interface Invoice {
 
 const ClientBillingPage: React.FC = () => {
   const location = useLocation();
+  const [cycle, setCycle] = useState<'monthly' | 'annual'>('monthly');
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -53,7 +55,7 @@ const ClientBillingPage: React.FC = () => {
 
   const checkoutMutation = useMutation({
     mutationFn: async (productId: number) => {
-      const res = await api.post('/billing/create-checkout-session', { productId });
+      const res = await api.post('/billing/create-checkout-session', { productId, cycle });
       return res.data;
     },
     onSuccess: (data) => {
@@ -88,9 +90,27 @@ const ClientBillingPage: React.FC = () => {
       </div>
 
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-        <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
-          <Box className="text-blue-600" size={20} />
-          <h2 className="text-lg font-bold text-slate-800">Available Services</h2>
+        <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <Box className="text-blue-600" size={20} />
+            <h2 className="text-lg font-bold text-slate-800">Available Services</h2>
+          </div>
+          {/* Monthly / annual toggle */}
+          <div className="inline-flex bg-slate-100 rounded-lg p-1 text-sm font-bold">
+            <button
+              onClick={() => setCycle('monthly')}
+              className={`px-4 py-1.5 rounded-md transition-colors ${cycle === 'monthly' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Monthly
+            </button>
+            <button
+              onClick={() => setCycle('annual')}
+              className={`px-4 py-1.5 rounded-md transition-colors flex items-center gap-1.5 ${cycle === 'annual' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Annual
+              <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">Save ~17%</span>
+            </button>
+          </div>
         </div>
         
         <div className="p-6 grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -107,11 +127,26 @@ const ClientBillingPage: React.FC = () => {
                   <p className="text-slate-500 text-sm mt-2 line-clamp-2">{product.description}</p>
                 </div>
                 <div className="mt-6 pt-6 border-t border-slate-100">
-                  <div className="flex items-end gap-1 mb-4">
-                    <span className="text-2xl font-bold text-slate-800">${(product.price_cents / 100).toFixed(2)}</span>
-                    <span className="text-slate-500 text-sm mb-1">/mo</span>
-                  </div>
-                  <button 
+                  {(() => {
+                    const hasAnnual = product.annual_price_cents > 0;
+                    const showAnnual = cycle === 'annual' && hasAnnual;
+                    // Monthly-equivalent headline when billed annually.
+                    const headline = showAnnual ? product.annual_price_cents / 12 / 100 : product.price_cents / 100;
+                    return (
+                      <div className="mb-4">
+                        <div className="flex items-end gap-1">
+                          <span className="text-2xl font-bold text-slate-800">${headline.toFixed(2)}</span>
+                          <span className="text-slate-500 text-sm mb-1">/mo</span>
+                        </div>
+                        {showAnnual ? (
+                          <p className="text-xs text-emerald-600 font-medium mt-1">${(product.annual_price_cents / 100).toFixed(2)} billed yearly</p>
+                        ) : cycle === 'annual' && !hasAnnual ? (
+                          <p className="text-xs text-slate-400 mt-1">Monthly billing only</p>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
+                  <button
                     onClick={() => checkoutMutation.mutate(product.id)}
                     disabled={checkoutMutation.isPending}
                     className="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50"

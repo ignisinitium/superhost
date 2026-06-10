@@ -12,6 +12,9 @@ import SettingsPage from './pages/Settings';
 import FirewallPage from './pages/Firewall';
 import ClientLogin from './pages/ClientLogin';
 import SetClientPassword from './pages/SetClientPassword';
+import MarketingHome from './pages/MarketingHome';
+import Order from './pages/Order';
+import OrderSuccess from './pages/OrderSuccess';
 import ClientDashboard from './pages/ClientDashboard';
 import ProcessesPage from './pages/Processes';
 import Dashboard from './pages/Dashboard';
@@ -124,6 +127,17 @@ const ProtectedRoute = ({ children, role }: { children: React.ReactElement; role
     return <Navigate to={role === 'client' ? '/client/login' : '/login'} replace />;
   }
   return children;
+};
+
+// Public storefront at "/": marketing site for visitors; authenticated users
+// are bounced to their dashboard.
+const RootGate = () => {
+  if (!isTokenExpired()) {
+    const role = getTokenRole();
+    if (role === 'admin') return <Navigate to="/dashboard" replace />;
+    if (role === 'client') return <Navigate to="/client" replace />;
+  }
+  return <MarketingHome />;
 };
 
 // Accepts both 'client' and 'mail_user' tokens — used for the standalone /spam route
@@ -244,7 +258,8 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
               <Routes>
                 {role === 'admin' ? (
                   <>
-                    <Route index element={<Dashboard />} />
+                    <Route index element={<Navigate to="/dashboard" replace />} />
+                    <Route path="dashboard" element={<Dashboard />} />
                     <Route path="users" element={<UsersPage />} />
                     <Route path="deleted-users" element={<DeletedUsersPage />} />
                     <Route path="users/:id/settings" element={<UserSettingsPage />} />
@@ -311,6 +326,11 @@ function App() {
     <ErrorBoundary>
       <BrowserRouter>
         <Routes>
+          {/* Public storefront */}
+          <Route path="/" element={<RootGate />} />
+          <Route path="/order" element={<Order />} />
+          <Route path="/order/success" element={<OrderSuccess />} />
+
           <Route path="/login" element={<Login />} />
           <Route path="/client/login" element={<ClientLogin />} />
           <Route path="/client/set-password" element={<SetClientPassword />} />

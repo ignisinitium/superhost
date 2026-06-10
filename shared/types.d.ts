@@ -138,9 +138,12 @@ export interface HostingPackage {
     name: string;
     description: string;
     price_cents: number;
+    annual_price_cents: number;
+    onetime_price_cents: number;
+    is_custom: boolean;
     setup_fee_cents: number;
     billing_cycle: 'monthly' | 'quarterly' | 'annually' | 'onetime';
-    type: 'hosting' | 'addon' | 'domain' | 'vps' | 'reseller';
+    type: 'hosting' | 'addon' | 'domain' | 'vps' | 'reseller' | 'service';
     is_active: boolean;
     sort_order: number;
     disk_quota_mb: number;

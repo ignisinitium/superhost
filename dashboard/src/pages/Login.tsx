@@ -29,7 +29,7 @@ const Login: React.FC = () => {
         localStorage.setItem('token', res.data.token);
         localStorage.setItem('admin', JSON.stringify(res.data.admin));
         localStorage.setItem('role', 'admin');
-        navigate('/');
+        navigate('/dashboard');
       }
     } catch (err: any) {
       setError(err.response?.data?.message || 'Login failed');
@@ -61,7 +61,7 @@ const Login: React.FC = () => {
         localStorage.setItem('token', verifyRes.data.token);
         localStorage.setItem('admin', JSON.stringify(verifyRes.data.admin));
         localStorage.setItem('role', 'admin');
-        navigate('/');
+        navigate('/dashboard');
       }
     } catch (err: any) {
       setError(err.message || 'Security Key authentication failed');
@@ -78,7 +78,7 @@ const Login: React.FC = () => {
       localStorage.setItem('token', res.data.token);
       localStorage.setItem('admin', JSON.stringify(res.data.admin));
       localStorage.setItem('role', 'admin');
-      navigate('/');
+      navigate('/dashboard');
     } catch (err: any) {
       setError(err.response?.data?.message || '2FA verification failed');
     } finally {

@@ -24,7 +24,7 @@ const adminGroups: MenuGroup[] = [
   {
     section: 'Overview',
     items: [
-      { label: 'Dashboard',     icon: LayoutDashboard, path: '/' },
+      { label: 'Dashboard',     icon: LayoutDashboard, path: '/dashboard' },
     ],
   },
   {

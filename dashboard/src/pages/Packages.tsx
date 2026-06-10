@@ -14,10 +14,6 @@ import toast from 'react-hot-toast';
 const fmtDisk = (mb: number) => mb === -1 ? 'Unlimited' : mb >= 1024 ? `${(mb / 1024).toFixed(0)} GB` : `${mb} MB`;
 const fmtNum  = (n: number)  => n === -1 ? '∞' : String(n);
 
-const CYCLE_LABELS: Record<string, string> = {
-  monthly: 'Monthly', quarterly: 'Quarterly', annually: 'Annually', onetime: 'One-time',
-};
-
 const TYPE_COLORS: Record<string, string> = {
   hosting: 'bg-blue-100 text-blue-700',
   addon:   'bg-purple-100 text-purple-700',
@@ -32,6 +28,9 @@ const defaultPlanForm = (): Omit<HostingPackage, 'id' | 'created_at' | 'updated_
   name: '',
   description: '',
   price_cents: 0,
+  annual_price_cents: 0,
+  onetime_price_cents: 0,
+  is_custom: false,
   setup_fee_cents: 0,
   billing_cycle: 'monthly',
   type: 'hosting',
@@ -87,6 +86,9 @@ const defaultAddonForm = (): Omit<HostingPackage, 'id' | 'created_at' | 'updated
   name: '',
   description: '',
   price_cents: 0,
+  annual_price_cents: 0,
+  onetime_price_cents: 0,
+  is_custom: false,
   setup_fee_cents: 0,
   billing_cycle: 'monthly',
   type: 'addon',
@@ -414,8 +416,13 @@ const PackagesPage: React.FC = () => {
                   <div className="text-right flex-shrink-0">
                     <p className="font-bold text-slate-800 text-sm">
                       ${(pkg.price_cents / 100).toFixed(2)}
-                      <span className="text-xs font-normal text-slate-400 ml-1">/{CYCLE_LABELS[pkg.billing_cycle]?.toLowerCase()}</span>
+                      <span className="text-xs font-normal text-slate-400 ml-1">/mo</span>
                     </p>
+                    {pkg.annual_price_cents > 0 && (
+                      <p className="text-[11px] text-emerald-600 font-medium">
+                        ${(pkg.annual_price_cents / 100).toFixed(2)}/yr
+                      </p>
+                    )}
                   </div>
 
                   {/* Status */}
@@ -527,9 +534,12 @@ const PackagesPage: React.FC = () => {
                         <option value="onetime">One-time</option>
                       </select>
                     </Field>
-                    <div className="grid grid-cols-2 gap-3">
-                      <Field label="Price" hint="cents">
+                    <div className="grid grid-cols-3 gap-3">
+                      <Field label="Monthly" hint="cents">
                         <NumInput value={form.price_cents} onChange={(v) => set('price_cents', v)} placeholder="995" />
+                      </Field>
+                      <Field label="Annual" hint="cents/yr">
+                        <NumInput value={form.annual_price_cents} onChange={(v) => set('annual_price_cents', v)} placeholder="9950" />
                       </Field>
                       <Field label="Setup Fee" hint="cents">
                         <NumInput value={form.setup_fee_cents} onChange={(v) => set('setup_fee_cents', v)} placeholder="0" />
@@ -844,7 +854,10 @@ const PackageTable: React.FC<PackageTableProps> = ({
                   </td>
                   <td className="px-5 py-4 font-bold text-slate-800">
                     ${(pkg.price_cents / 100).toFixed(2)}
-                    <span className="text-xs text-slate-400 font-normal ml-1">/{CYCLE_LABELS[pkg.billing_cycle]?.toLowerCase()}</span>
+                    <span className="text-xs text-slate-400 font-normal ml-1">/mo</span>
+                    {pkg.annual_price_cents > 0 && (
+                      <div className="text-[10px] text-emerald-600 font-medium">${(pkg.annual_price_cents / 100).toFixed(2)}/yr</div>
+                    )}
                     {pkg.setup_fee_cents > 0 && (
                       <div className="text-[10px] text-slate-400">+${(pkg.setup_fee_cents / 100).toFixed(2)} setup</div>
                     )}

@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import { query } from '../db.js';
 import { authenticateClient, authenticateAdmin } from '../middleware/auth.js';
 import type { AuthRequest } from '../middleware/auth.js';
+import { provisionSignupByToken, provisionSignupById } from '../provisioning.js';
 
 // Initialize Stripe (using a dummy key if not provided in env)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy_key', {
@@ -32,8 +33,18 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object;
+        const session = event.data.object as any;
         console.log(`Checkout session completed for ${session.customer}`);
+        // Self-service signup: provision the hosting account now that payment
+        // is confirmed. Idempotent, so webhook retries are safe.
+        const token = session.metadata?.signup_token;
+        if (token) {
+          try {
+            await provisionSignupByToken(token);
+          } catch (e) {
+            console.error('Signup provisioning failed:', (e as Error).message);
+          }
+        }
         break;
       }
       case 'invoice.paid': {
@@ -71,7 +82,7 @@ router.get('/products/admin', authenticateAdmin, async (_req, res) => {
 // Create a product (admin)
 router.post('/products', authenticateAdmin, async (req, res) => {
   const {
-    name, description, price_cents, setup_fee_cents, billing_cycle, type, is_active, sort_order,
+    name, description, price_cents, annual_price_cents, onetime_price_cents, is_custom, setup_fee_cents, billing_cycle, type, is_active, sort_order,
     disk_quota_mb, bandwidth_gb, inodes_limit,
     domains_allowed, subdomains_allowed, addon_domains, parked_domains,
     email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
@@ -100,7 +111,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         opcache_enabled, redis_access, memcached_access,
         daily_backups, backup_retention_days,
         reseller_enabled, reseller_accounts,
-        static_ip, stripe_price_id
+        static_ip, stripe_price_id, annual_price_cents, onetime_price_cents, is_custom
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,
         $9,$10,$11,
@@ -113,7 +124,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         $34,$35,$36,
         $37,$38,
         $39,$40,
-        $41,$42
+        $41,$42,$43,$44,$45
       ) RETURNING *`,
       [
         name, description ?? '', price_cents ?? 0, setup_fee_cents ?? 0,
@@ -131,7 +142,8 @@ router.post('/products', authenticateAdmin, async (req, res) => {
         opcache_enabled ?? true, redis_access ?? false, memcached_access ?? false,
         daily_backups ?? false, backup_retention_days ?? 7,
         reseller_enabled ?? false, reseller_accounts ?? 0,
-        static_ip ?? false, stripe_price_id ?? null,
+        static_ip ?? false, stripe_price_id ?? null, annual_price_cents ?? 0,
+        onetime_price_cents ?? 0, is_custom ?? false,
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -144,7 +156,7 @@ router.post('/products', authenticateAdmin, async (req, res) => {
 router.put('/products/:id', authenticateAdmin, async (req, res) => {
   const { id } = req.params;
   const {
-    name, description, price_cents, setup_fee_cents, billing_cycle, type, is_active, sort_order,
+    name, description, price_cents, annual_price_cents, onetime_price_cents, is_custom, setup_fee_cents, billing_cycle, type, is_active, sort_order,
     disk_quota_mb, bandwidth_gb, inodes_limit,
     domains_allowed, subdomains_allowed, addon_domains, parked_domains,
     email_accounts, email_quota_mb, email_forwarders, email_autoresponders, mailing_lists,
@@ -176,8 +188,9 @@ router.put('/products/:id', authenticateAdmin, async (req, res) => {
         opcache_enabled=$34, redis_access=$35, memcached_access=$36,
         daily_backups=$37, backup_retention_days=$38,
         reseller_enabled=$39, reseller_accounts=$40,
-        static_ip=$41, stripe_price_id=$42
-      WHERE id=$43 RETURNING *`,
+        static_ip=$41, stripe_price_id=$42, annual_price_cents=$43,
+        onetime_price_cents=$44, is_custom=$45
+      WHERE id=$46 RETURNING *`,
       [
         name, description, price_cents, setup_fee_cents, billing_cycle,
         type, is_active, sort_order,
@@ -192,7 +205,8 @@ router.put('/products/:id', authenticateAdmin, async (req, res) => {
         opcache_enabled, redis_access, memcached_access,
         daily_backups, backup_retention_days,
         reseller_enabled, reseller_accounts,
-        static_ip ?? false, stripe_price_id ?? null,
+        static_ip ?? false, stripe_price_id ?? null, annual_price_cents ?? 0,
+        onetime_price_cents ?? 0, is_custom ?? false,
         id,
       ]
     );
@@ -209,6 +223,48 @@ router.delete('/products/:id', authenticateAdmin, async (req, res) => {
   try {
     await query('DELETE FROM products WHERE id = $1', [id]);
     res.json({ message: 'Package deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ─── SIGNUPS (admin) ──────────────────────────────────────────────────────────
+
+// List recent self-service signups (storefront orders).
+router.get('/signups', authenticateAdmin, async (_req, res) => {
+  try {
+    const result = await query(
+      `SELECT s.id, s.username, s.email, s.primary_domain, s.billing_cycle, s.amount_cents,
+              s.status, s.created_at, s.provisioned_at, p.name AS plan_name
+       FROM pending_signups s LEFT JOIN products p ON p.id = s.product_id
+       ORDER BY s.created_at DESC LIMIT 200`,
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Manually provision a pending signup (manual orders, or testing before Stripe
+// is live). Provisioning itself is idempotent.
+router.post('/signups/:id/provision', authenticateAdmin, async (req, res) => {
+  try {
+    await provisionSignupById(parseInt(req.params.id as string, 10));
+    res.json({ message: 'Provisioning started' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Service inquiries / quote requests (admin).
+router.get('/inquiries', authenticateAdmin, async (_req, res) => {
+  try {
+    const result = await query(
+      `SELECT i.*, p.name AS service_name FROM service_inquiries i
+       LEFT JOIN products p ON p.id = i.product_id
+       ORDER BY i.created_at DESC LIMIT 200`,
+    );
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
@@ -307,7 +363,7 @@ router.get('/invoices', async (req: AuthRequest, res) => {
 });
 
 router.post('/create-checkout-session', async (req: AuthRequest, res) => {
-  const { productId } = req.body;
+  const { productId, cycle } = req.body as { productId: number; cycle?: 'monthly' | 'annual' };
   const userId = req.userId!;
 
   try {
@@ -316,17 +372,22 @@ router.post('/create-checkout-session', async (req: AuthRequest, res) => {
     let { email, stripe_customer_id } = userRes.rows[0];
 
     const prodRes = await query(
-      'SELECT name, price_cents, stripe_price_id FROM products WHERE id = $1 AND is_active = TRUE',
+      'SELECT name, price_cents, annual_price_cents, stripe_price_id FROM products WHERE id = $1 AND is_active = TRUE',
       [productId]
     );
     if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Package not found' });
     const product = prodRes.rows[0];
 
+    // Charge the annual price when the customer chose the annual cadence.
+    const billedAmount = (cycle === 'annual' && product.annual_price_cents > 0)
+      ? product.annual_price_cents
+      : product.price_cents;
+
     // Demo mode
     if (!process.env.STRIPE_SECRET_KEY) {
       await query(
         'INSERT INTO invoices (user_id, product_id, stripe_invoice_id, amount_cents, status) VALUES ($1, $2, $3, $4, $5)',
-        [userId, productId, `demo_inv_${Date.now()}`, product.price_cents, 'open']
+        [userId, productId, `demo_inv_${Date.now()}`, billedAmount, 'open']
       );
       return res.json({ url: '/client/billing?success=demo' });
     }

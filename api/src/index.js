@@ -46,6 +46,7 @@ import adminDeletedUsersRoutes from './routes/adminDeletedUsers.js';
 import systemRoutes from './routes/system.js';
 import adminMigrationsRoutes from './routes/adminMigrations.js';
 import auditLogRoutes from './routes/auditLog.js';
+import publicRoutes from './routes/public.js';
 dotenv.config();
 // Validate critical environment variables at startup
 if (!process.env.JWT_SECRET) {
@@ -145,6 +146,7 @@ app.use('/api/admin/deleted-users', adminDeletedUsersRoutes);
 app.use('/api/admin/system', systemRoutes);
 app.use('/api/admin/migrations', adminMigrationsRoutes);
 app.use('/api/admin/audit', auditLogRoutes);
+app.use('/api/public', publicRoutes);
 app.use('/api/client/files', filesRoutes);
 app.use('/api/client/git', gitRoutes);
 app.use('/api/client/cron', cronRoutes);
