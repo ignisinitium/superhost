@@ -38,6 +38,7 @@ interface Service {
   price_cents: number;
   onetime_price_cents: number;
   is_custom: boolean;
+  billing_unit?: string;
 }
 
 interface PortfolioItem {
@@ -58,6 +59,7 @@ const SERVICE_ICONS: Record<string, React.ElementType> = {
   'E-Commerce Store': ShoppingCart,
   'Full-Stack Website': Code,
   'AI Services': Sparkles,
+  'Email Spam Filter': ShieldCheck,
 };
 
 const MarketingHome: React.FC = () => {
@@ -151,6 +153,12 @@ const MarketingHome: React.FC = () => {
                     <>
                       <p className="text-lg font-bold text-slate-800 mb-3">Custom pricing</p>
                       <button onClick={() => setQuoteFor(s)} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-xl">Request a quote</button>
+                    </>
+                  ) : s.billing_unit === 'mailbox' ? (
+                    <>
+                      <p className="text-slate-800"><span className="text-2xl font-extrabold">${(s.price_cents / 100).toFixed(2)}</span><span className="text-slate-400 text-sm">/mailbox/mo</span></p>
+                      <p className="text-sm text-slate-500 mt-0.5">Protect email hosted anywhere.</p>
+                      <button onClick={() => navigate(`/order/filter?plan=${s.id}`)} className="mt-3 w-full bg-violet-600 hover:bg-violet-700 text-white font-bold py-2.5 rounded-xl">Get started</button>
                     </>
                   ) : (
                     <>

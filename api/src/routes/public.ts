@@ -13,6 +13,7 @@ const router = express.Router();
 
 const USERNAME_RE = /^[a-z][a-z0-9_-]{2,31}$/;
 const DOMAIN_RE = /^(?!-)[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})+$/i;
+const HOST_RE = /^(?!-)[a-z0-9.-]{1,253}$|^(\d{1,3}\.){3}\d{1,3}$/i;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // System / role names a customer must not be able to claim.
 const RESERVED = new Set([
@@ -81,7 +82,7 @@ router.get('/plans', async (_req, res) => {
 router.get('/services', async (_req, res) => {
   try {
     const result = await query(
-      `SELECT id, name, description, price_cents, onetime_price_cents, is_custom, sort_order,
+      `SELECT id, name, description, price_cents, annual_price_cents, onetime_price_cents, is_custom, billing_unit, sort_order,
               disk_quota_mb, bandwidth_gb, domains_allowed, email_accounts, databases_allowed,
               daily_backups, ssh_access, ssl_included
        FROM products
@@ -240,6 +241,88 @@ router.post('/checkout', checkIpBlock, async (req, res) => {
 
     await query('UPDATE pending_signups SET stripe_session_id = $1 WHERE session_token = $2', [session.id, token]);
     res.json({ url: session.url });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Per-mailbox spam-filter purchase: quantity-based Stripe subscription, and a
+// filter-only account (no hosting) is provisioned on payment.
+router.post('/checkout-filter', checkIpBlock, async (req, res) => {
+  const { username, email, password, domain, destinationHost, destinationPort, addresses, productId, cycle } = req.body ?? {};
+  const uname = String(username ?? '').toLowerCase();
+  const mail = String(email ?? '').toLowerCase().trim();
+  const dom = normalizeDomain(domain);
+  const host = String(destinationHost ?? '').toLowerCase().trim();
+  const port = parseInt(destinationPort ?? 25, 10);
+  const billingCycle = cycle === 'annual' ? 'annual' : 'monthly';
+  const addrList: string[] = Array.isArray(addresses)
+    ? addresses.map((a: any) => String(a).toLowerCase().trim()).filter(Boolean) : [];
+
+  try {
+    if (!USERNAME_RE.test(uname) || RESERVED.has(uname)) return res.status(400).json({ message: 'Invalid username' });
+    if (!EMAIL_RE.test(mail)) return res.status(400).json({ message: 'Invalid email address' });
+    if (!password || String(password).length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters' });
+    if (!DOMAIN_RE.test(dom)) return res.status(400).json({ message: 'Invalid domain name' });
+    if (!HOST_RE.test(host)) return res.status(400).json({ message: 'Invalid destination mail server' });
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ message: 'Invalid port' });
+    if (addrList.length < 1) return res.status(400).json({ message: 'Add at least one mailbox to protect' });
+    if (addrList.some(a => !EMAIL_RE.test(a) || a.split('@')[1] !== dom)) {
+      return res.status(400).json({ message: `Every mailbox must be a valid address at ${dom}` });
+    }
+
+    const prodRes = await query("SELECT * FROM products WHERE id = $1 AND is_active = TRUE AND billing_unit = 'mailbox'", [productId]);
+    if (prodRes.rowCount === 0) return res.status(404).json({ message: 'Plan not found' });
+    const product = prodRes.rows[0];
+
+    if (await usernameTaken(uname)) return res.status(409).json({ message: 'That username is taken' });
+    const emailExists = await query('SELECT 1 FROM users WHERE lower(email) = lower($1)', [mail]);
+    if (emailExists.rowCount) return res.status(409).json({ message: 'An account with that email already exists' });
+    const domTaken = await query(
+      'SELECT 1 FROM mail_relay_domains WHERE lower(domain_name)=lower($1) UNION SELECT 1 FROM domains WHERE lower(domain_name)=lower($1)', [dom]);
+    if (domTaken.rowCount) return res.status(409).json({ message: 'That domain is already configured here' });
+
+    const quantity = addrList.length;
+    const unit = (billingCycle === 'annual' && product.annual_price_cents > 0) ? product.annual_price_cents : product.price_cents;
+    const interval = billingCycle === 'annual' ? 'year' : 'month';
+    const passwordHash = await bcrypt.hash(String(password), 12);
+    const token = crypto.randomBytes(24).toString('hex');
+
+    await query(
+      `INSERT INTO pending_signups
+         (session_token, username, email, password_hash, primary_domain, product_id, billing_cycle, amount_cents,
+          signup_type, destination_host, destination_port, mailbox_addresses, quantity)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'filter',$9,$10,$11,$12)`,
+      [token, uname, mail, passwordHash, dom, product.id, billingCycle, unit * quantity, host, port, addrList.join(','), quantity],
+    );
+
+    const origin = safeOrigin(req);
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: 'subscription',
+        customer_email: mail,
+        line_items: [{
+          quantity,
+          price_data: {
+            currency: 'usd',
+            product_data: { name: `Email Spam Filter — ${dom} (${billingCycle})` },
+            unit_amount: unit,
+            recurring: { interval },
+          },
+        }],
+        metadata: { signup_token: token },
+        subscription_data: { metadata: { signup_token: token } },
+        success_url: `${origin}/order/success?token=${token}`,
+        cancel_url: `${origin}/order/filter?canceled=1`,
+      });
+    } catch (err) {
+      await query('DELETE FROM pending_signups WHERE session_token = $1', [token]).catch(() => {});
+      return res.status(502).json({ message: `Payment processor not configured: ${(err as Error).message}` });
+    }
+
+    await query('UPDATE pending_signups SET stripe_session_id = $1 WHERE session_token = $2', [session.id, token]);
+    res.json({ url: session.url, quantity, monthly: (product.price_cents / 100) * quantity });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

@@ -28,6 +28,10 @@ export async function provisionSignupById(id: number): Promise<void> {
 }
 
 async function provisionSignup(s: any, stripe?: StripeRefs): Promise<void> {
+  if (s.signup_type === 'filter') {
+    await provisionFilterSignup(s, stripe);
+    return;
+  }
   const username: string = s.username;
   const homeDir = `/home/${username}`;
 
@@ -98,4 +102,54 @@ async function provisionSignup(s: any, stripe?: StripeRefs): Promise<void> {
   );
 
   console.log(`Provisioned signup for ${username} (user ${userId}), package ${s.product_id}`);
+}
+
+// Provision a spam-filter (relay) signup: a panel-login account WITHOUT a
+// hosting/Linux account, plus the relay domain + protected addresses. The
+// customer manages everything from the Mail Filtering page.
+async function provisionFilterSignup(s: any, stripe?: StripeRefs): Promise<void> {
+  const username: string = s.username;
+  const userRes = await query(
+    `INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb,
+                        package_id, stripe_customer_id, stripe_subscription_id, subscription_status, status)
+     VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $7, $8, 'active')
+     ON CONFLICT (username) DO UPDATE SET
+       email = EXCLUDED.email, package_id = EXCLUDED.package_id,
+       stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
+       stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+       subscription_status = EXCLUDED.subscription_status, status = 'active'
+     RETURNING id`,
+    [username, s.email, `/home/${username}`, s.password_hash, s.product_id,
+     stripe?.customerId ?? null, stripe?.subscriptionId ?? null, 'active'],
+  );
+  const userId: number = userRes.rows[0].id;
+
+  // Relay domain + protected addresses.
+  if (s.primary_domain && s.destination_host) {
+    const relRes = await query(
+      `INSERT INTO mail_relay_domains (user_id, domain_name, destination_host, destination_port)
+       VALUES ($1, $2, $3, $4) ON CONFLICT (domain_name) DO UPDATE
+         SET user_id = EXCLUDED.user_id, destination_host = EXCLUDED.destination_host, destination_port = EXCLUDED.destination_port
+       RETURNING id`,
+      [userId, s.primary_domain, s.destination_host, s.destination_port ?? 25],
+    );
+    const relayId = relRes.rows[0].id;
+    for (const addr of String(s.mailbox_addresses ?? '').split(',').map((a: string) => a.trim().toLowerCase()).filter(Boolean)) {
+      await query(
+        `INSERT INTO mail_relay_recipients (relay_domain_id, address) VALUES ($1, $2)
+         ON CONFLICT (relay_domain_id, address) DO NOTHING`, [relayId, addr]);
+    }
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CONFIGURE_MAIL_RELAY', {}]);
+  }
+
+  await query(
+    `INSERT INTO invoices (user_id, product_id, stripe_invoice_id, amount_cents, status, paid_at)
+     VALUES ($1, $2, $3, $4, 'paid', NOW())`,
+    [userId, s.product_id, `signup_${String(s.session_token).slice(0, 24)}`, s.amount_cents],
+  );
+  await query(
+    `UPDATE pending_signups SET status = 'provisioned', provisioned_user_id = $1, provisioned_at = NOW() WHERE id = $2`,
+    [userId, s.id],
+  );
+  console.log(`Provisioned FILTER signup for ${username} (user ${userId}), ${s.quantity} mailbox(es)`);
 }

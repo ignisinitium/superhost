@@ -14,6 +14,7 @@ import ClientLogin from './pages/ClientLogin';
 import SetClientPassword from './pages/SetClientPassword';
 import MarketingHome from './pages/MarketingHome';
 import Order from './pages/Order';
+import OrderFilter from './pages/OrderFilter';
 import OrderSuccess from './pages/OrderSuccess';
 import ClientMailFilter from './pages/ClientMailFilter';
 import ClientDashboard from './pages/ClientDashboard';
@@ -331,6 +332,7 @@ function App() {
           {/* Public storefront */}
           <Route path="/" element={<RootGate />} />
           <Route path="/order" element={<Order />} />
+          <Route path="/order/filter" element={<OrderFilter />} />
           <Route path="/order/success" element={<OrderSuccess />} />
 
           <Route path="/login" element={<Login />} />
