@@ -212,6 +212,9 @@ async function handleTask(task: Task) {
       case 'REMOVE_DNS_ZONE':
         await handleRemoveDnsZone(task.payload);
         break;
+      case 'CONFIGURE_MAIL_RELAY':
+        await handleConfigureMailRelay();
+        break;
       case 'CONFIGURE_MAIL_SERVER':
         await handleConfigureMailServer();
         break;
@@ -2263,6 +2266,48 @@ async function applyMailSpamInfraConfig() {
   } else {
     await execPromise('sudo postconf -e mime_header_checks=').catch(() => {});
   }
+}
+
+// Configure Postfix to relay inbound mail for customer "spam filter" domains to
+// their real mail server. DB-driven pgsql maps so adding/removing a relay domain
+// in the panel takes effect without rewriting files. Additive + validated:
+// existing virtual-mailbox delivery is untouched, and relay_recipient_maps means
+// we only accept the customer's real addresses (no backscatter).
+async function handleConfigureMailRelay() {
+  console.log('Configuring mail relay...');
+  const dbUser = process.env.DB_USER!;
+  const dbPassword = process.env.DB_PASSWORD!;
+  const dbHost = process.env.DB_HOST || 'localhost';
+  const dbName = process.env.DB_NAME!;
+  const creds = `user = ${dbUser}\npassword = ${dbPassword}\nhosts = ${dbHost}\ndbname = ${dbName}`;
+
+  const maps: Record<string, string> = {
+    'pgsql-relay-domains.cf':
+      `${creds}\nquery = SELECT domain_name FROM mail_relay_domains WHERE domain_name='%s' AND enabled=true`,
+    'pgsql-relay-transport.cf':
+      `${creds}\nquery = SELECT 'smtp:[' || destination_host || ']:' || destination_port FROM mail_relay_domains WHERE domain_name='%s' AND enabled=true`,
+    'pgsql-relay-recipients.cf':
+      `${creds}\nquery = SELECT 'OK' FROM mail_relay_recipients r JOIN mail_relay_domains d ON r.relay_domain_id = d.id WHERE lower(r.address)=lower('%s') AND d.enabled=true`,
+  };
+  for (const [file, content] of Object.entries(maps)) {
+    const tmp = `/tmp/${file}`;
+    await fs.writeFile(tmp, content + '\n');
+    await execPromise(`sudo mv ${shellEscape(tmp)} /etc/postfix/${file}`);
+    await execPromise(`sudo chown root:postfix /etc/postfix/${file}`);
+    await execPromise(`sudo chmod 640 /etc/postfix/${file}`);
+  }
+
+  await execPromise(`sudo postconf -e ${shellEscape('relay_domains = pgsql:/etc/postfix/pgsql-relay-domains.cf')}`);
+  await execPromise(`sudo postconf -e ${shellEscape('relay_recipient_maps = pgsql:/etc/postfix/pgsql-relay-recipients.cf')}`);
+  // Preserve any existing transport_maps and append ours.
+  const cur = await execPromise('sudo postconf -h transport_maps').then(r => r.stdout.trim()).catch(() => '');
+  const relayT = 'pgsql:/etc/postfix/pgsql-relay-transport.cf';
+  const transport = cur && !cur.includes(relayT) ? `${cur}, ${relayT}` : relayT;
+  await execPromise(`sudo postconf -e ${shellEscape('transport_maps = ' + transport)}`);
+
+  await execPromise('sudo postfix check');
+  await execPromise('sudo systemctl reload postfix');
+  console.log('Mail relay configured.');
 }
 
 async function handleConfigureMailServer() {

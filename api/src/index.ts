@@ -47,6 +47,7 @@ import systemRoutes from './routes/system.js';
 import adminMigrationsRoutes from './routes/adminMigrations.js';
 import auditLogRoutes from './routes/auditLog.js';
 import publicRoutes from './routes/public.js';
+import clientRelayRoutes from './routes/clientRelay.js';
 
 dotenv.config();
 
@@ -160,6 +161,7 @@ app.use('/api/client/git', gitRoutes);
 app.use('/api/client/cron', cronRoutes);
 app.use('/api/client/ftp', ftpRoutes);
 app.use('/api/client/dns', dnsRoutes);
+app.use('/api/client/relay', clientRelayRoutes);
 
 app.use('/api/fido2', fido2Routes);
 
