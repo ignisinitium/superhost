@@ -116,6 +116,7 @@ const clientGroups: MenuGroup[] = [
     items: [
       { label: 'Email Accounts', icon: Mail,        path: '/client/email' },
       { label: 'Spam Filter',    icon: ShieldAlert, path: '/client/spam' },
+      { label: 'Mail Filtering', icon: ShieldCheck, path: '/client/mail-filter' },
     ],
   },
   {

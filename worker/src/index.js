@@ -174,6 +174,15 @@ async function handleTask(task) {
             case 'CONFIGURE_MAIL_RELAY':
                 await handleConfigureMailRelay();
                 break;
+            case 'SCAN_RELAY_QUARANTINE':
+                await handleScanRelayQuarantine();
+                break;
+            case 'RELEASE_RELAY_QUARANTINE':
+                await handleReleaseRelayQuarantine(task.payload);
+                break;
+            case 'DELETE_RELAY_QUARANTINE':
+                await handleDeleteRelayQuarantine(task.payload);
+                break;
             case 'CONFIGURE_MAIL_SERVER':
                 await handleConfigureMailServer();
                 break;
@@ -2010,7 +2019,10 @@ async function handleConfigureMailRelay() {
     const creds = `user = ${dbUser}\npassword = ${dbPassword}\nhosts = ${dbHost}\ndbname = ${dbName}`;
     const maps = {
         'pgsql-relay-domains.cf': `${creds}\nquery = SELECT domain_name FROM mail_relay_domains WHERE domain_name='%s' AND enabled=true`,
-        'pgsql-relay-transport.cf': `${creds}\nquery = SELECT 'smtp:[' || destination_host || ']:' || destination_port FROM mail_relay_domains WHERE domain_name='%s' AND enabled=true`,
+        // Route relay domains through the pipe content-filter (scan → quarantine
+        // spam / forward clean). Scoped to relay domains only; hosted mail is never
+        // routed here.
+        'pgsql-relay-transport.cf': `${creds}\nquery = SELECT 'relayfilter:' FROM mail_relay_domains WHERE domain_name='%s' AND enabled=true`,
         'pgsql-relay-recipients.cf': `${creds}\nquery = SELECT 'OK' FROM mail_relay_recipients r JOIN mail_relay_domains d ON r.relay_domain_id = d.id WHERE lower(r.address)=lower('%s') AND d.enabled=true`,
     };
     for (const [file, content] of Object.entries(maps)) {
@@ -2019,6 +2031,33 @@ async function handleConfigureMailRelay() {
         await execPromise(`sudo mv ${shellEscape(tmp)} /etc/postfix/${file}`);
         await execPromise(`sudo chown root:postfix /etc/postfix/${file}`);
         await execPromise(`sudo chmod 640 /etc/postfix/${file}`);
+    }
+    // 1. Install the pipe content-filter script.
+    const scriptSrc = path.join(process.cwd(), 'scripts/relayfilter.py');
+    await execPromise(`sudo cp ${shellEscape(scriptSrc)} /usr/local/bin/relayfilter.py`);
+    await execPromise('sudo chmod 755 /usr/local/bin/relayfilter.py');
+    // 2. Per-domain destination config the script reads ("host port threshold").
+    await execPromise('sudo mkdir -p /etc/postfix/relay-dest');
+    const domains = await client.query('SELECT domain_name, destination_host, destination_port, spam_threshold FROM mail_relay_domains WHERE enabled = true');
+    await execPromise('sudo rm -f /etc/postfix/relay-dest/*').catch(() => { });
+    for (const d of domains.rows) {
+        const dom = validateDomainName(d.domain_name);
+        const tmp = `/tmp/relaydest_${dom}`;
+        await fs.writeFile(tmp, `${d.destination_host} ${d.destination_port} ${d.spam_threshold}\n`);
+        await execPromise(`sudo mv ${shellEscape(tmp)} /etc/postfix/relay-dest/${shellEscape(dom)}`);
+    }
+    await execPromise('sudo chmod 644 /etc/postfix/relay-dest/* 2>/dev/null').catch(() => { });
+    // 3. Quarantine spool (owned by vmail, the user the pipe runs as).
+    await execPromise('sudo mkdir -p /var/mail/relay-quarantine');
+    await execPromise('sudo chown vmail:vmail /var/mail/relay-quarantine');
+    // 4. Define the relayfilter pipe transport in master.cf (idempotent).
+    const masterHasFilter = await execPromise('grep -q "^relayfilter" /etc/postfix/master.cf && echo yes || echo no')
+        .then(r => r.stdout.trim() === 'yes').catch(() => false);
+    if (!masterHasFilter) {
+        const entry = 'relayfilter unix - n n - 10 pipe\n  flags=Rq user=vmail argv=/usr/local/bin/relayfilter.py ${sender} ${recipient}\n';
+        await fs.writeFile('/tmp/relayfilter.master', entry);
+        await execPromise('cat /tmp/relayfilter.master | sudo tee -a /etc/postfix/master.cf > /dev/null');
+        await execPromise('rm -f /tmp/relayfilter.master');
     }
     await execPromise(`sudo postconf -e ${shellEscape('relay_domains = pgsql:/etc/postfix/pgsql-relay-domains.cf')}`);
     await execPromise(`sudo postconf -e ${shellEscape('relay_recipient_maps = pgsql:/etc/postfix/pgsql-relay-recipients.cf')}`);
@@ -2029,7 +2068,86 @@ async function handleConfigureMailRelay() {
     await execPromise(`sudo postconf -e ${shellEscape('transport_maps = ' + transport)}`);
     await execPromise('sudo postfix check');
     await execPromise('sudo systemctl reload postfix');
-    console.log('Mail relay configured.');
+    console.log(`Mail relay configured (${domains.rowCount} domain(s)).`);
+}
+// Index relay-quarantine .eml files dropped by the pipe filter into the DB.
+async function handleScanRelayQuarantine() {
+    const base = '/var/mail/relay-quarantine';
+    let dirs = [];
+    try {
+        dirs = await fs.readdir(base);
+    }
+    catch {
+        return;
+    }
+    for (const domain of dirs) {
+        const newDir = `${base}/${domain}/new`;
+        let files = [];
+        try {
+            files = await fs.readdir(newDir);
+        }
+        catch {
+            continue;
+        }
+        const relayRes = await client.query('SELECT id FROM mail_relay_domains WHERE domain_name = $1', [domain]);
+        const relayId = relayRes.rows[0]?.id ?? null;
+        for (const f of files) {
+            if (!f.endsWith('.eml'))
+                continue;
+            const filePath = `${newDir}/${f}`;
+            const existing = await client.query('SELECT 1 FROM mail_relay_quarantine WHERE file_path = $1', [filePath]);
+            if (existing.rowCount)
+                continue;
+            let recipient = '', sender = '', score = '0';
+            try {
+                const meta = await fs.readFile(`${newDir}/${f.replace(/\.eml$/, '.meta')}`, 'utf8');
+                recipient = /recipient=(.*)/.exec(meta)?.[1]?.trim() ?? '';
+                sender = /sender=(.*)/.exec(meta)?.[1]?.trim() ?? '';
+                score = /score=(.*)/.exec(meta)?.[1]?.trim() ?? '0';
+            }
+            catch { /* meta optional */ }
+            let subject = '';
+            try {
+                const eml = await fs.readFile(filePath, 'utf8');
+                subject = /^Subject:\s*(.*)$/im.exec(eml.slice(0, 8192))?.[1]?.trim() ?? '';
+            }
+            catch { /* ignore */ }
+            await client.query(`INSERT INTO mail_relay_quarantine (relay_domain_id, recipient, sender, subject, spam_score, file_path)
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (file_path) DO NOTHING`, [relayId, recipient, sender || null, subject || null, parseFloat(score) || 0, filePath]);
+        }
+    }
+}
+// Release a quarantined relay message: deliver it onward to the customer's server.
+async function handleReleaseRelayQuarantine(payload) {
+    const { id } = payload;
+    const r = await client.query(`SELECT q.*, d.destination_host, d.destination_port
+     FROM mail_relay_quarantine q JOIN mail_relay_domains d ON q.relay_domain_id = d.id
+     WHERE q.id = $1 AND q.status = 'held'`, [id]);
+    const item = r.rows[0];
+    if (!item)
+        return;
+    // Re-inject via the local Postfix using sendmail; transport routes it onward.
+    // Use python to SMTP it directly to the destination (loop-safe).
+    const py = `import smtplib,sys
+raw=open(${JSON.stringify(item.file_path)},'rb').read()
+s=smtplib.SMTP(${JSON.stringify(item.destination_host)},${item.destination_port},timeout=30)
+s.sendmail(${JSON.stringify(item.sender || '')},[${JSON.stringify(item.recipient)}],raw); s.quit()`;
+    const tmp = `/tmp/relayrelease_${id}.py`;
+    await fs.writeFile(tmp, py);
+    await execPromise(`python3 ${shellEscape(tmp)}`);
+    await fs.unlink(tmp).catch(() => { });
+    await execPromise(`rm -f ${shellEscape(item.file_path)} ${shellEscape(item.file_path.replace(/\.eml$/, '.meta'))}`).catch(() => { });
+    await client.query("UPDATE mail_relay_quarantine SET status='released', released_at=NOW() WHERE id=$1", [id]);
+    console.log(`Released relay quarantine ${id} → ${item.destination_host}`);
+}
+async function handleDeleteRelayQuarantine(payload) {
+    const { id } = payload;
+    const r = await client.query("SELECT file_path FROM mail_relay_quarantine WHERE id=$1", [id]);
+    const fp = r.rows[0]?.file_path;
+    if (fp) {
+        await execPromise(`rm -f ${shellEscape(fp)} ${shellEscape(String(fp).replace(/\.eml$/, '.meta'))}`).catch(() => { });
+    }
+    await client.query('DELETE FROM mail_relay_quarantine WHERE id=$1', [id]);
 }
 async function handleConfigureMailServer() {
     console.log('Configuring mail server...');
@@ -3161,6 +3279,15 @@ async function start() {
             console.error('Quarantine scan error:', err instanceof Error ? err.message : err);
         }
     }, 5 * 60 * 1000);
+    // Index relay-gateway quarantine (spam held for external-mail customers)
+    setInterval(async () => {
+        try {
+            await handleScanRelayQuarantine();
+        }
+        catch (err) {
+            console.error('Relay quarantine scan error:', err instanceof Error ? err.message : err);
+        }
+    }, 2 * 60 * 1000);
     // Refresh Postfix delivery stats every hour
     setInterval(async () => {
         try {

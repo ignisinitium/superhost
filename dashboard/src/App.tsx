@@ -15,6 +15,7 @@ import SetClientPassword from './pages/SetClientPassword';
 import MarketingHome from './pages/MarketingHome';
 import Order from './pages/Order';
 import OrderSuccess from './pages/OrderSuccess';
+import ClientMailFilter from './pages/ClientMailFilter';
 import ClientDashboard from './pages/ClientDashboard';
 import ProcessesPage from './pages/Processes';
 import Dashboard from './pages/Dashboard';
@@ -298,6 +299,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="databases" element={<ClientDatabasesPage />} />
                     <Route path="email" element={<ClientEmailPage />} />
                     <Route path="spam" element={<SpamDashboard />} />
+                    <Route path="mail-filter" element={<ClientMailFilter />} />
                     <Route path="apps" element={<ClientAppsPage />} />
                     <Route path="cron" element={<ClientCronManager />} />
                     <Route path="ftp" element={<ClientFtpManager />} />

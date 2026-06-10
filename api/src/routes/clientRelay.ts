@@ -107,4 +107,43 @@ router.delete('/:id/recipients/:rid', async (req: AuthRequest, res) => {
   } catch (err) { res.status(500).json({ message: (err as Error).message }); }
 });
 
+// ── Relay quarantine (spam held for the customer's external mail) ────────────
+
+router.get('/quarantine', async (req: AuthRequest, res) => {
+  try {
+    const r = await query(
+      `SELECT q.id, q.recipient, q.sender, q.subject, q.spam_score, q.created_at, d.domain_name
+       FROM mail_relay_quarantine q
+       JOIN mail_relay_domains d ON q.relay_domain_id = d.id
+       WHERE d.user_id = $1 AND q.status = 'held'
+       ORDER BY q.created_at DESC LIMIT 500`, [req.userId]);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ message: (err as Error).message }); }
+});
+
+async function ownsQuarantine(req: AuthRequest, id: unknown): Promise<boolean> {
+  const r = await query(
+    `SELECT 1 FROM mail_relay_quarantine q JOIN mail_relay_domains d ON q.relay_domain_id = d.id
+     WHERE q.id = $1 AND d.user_id = $2`, [id, req.userId]);
+  return (r.rowCount ?? 0) > 0;
+}
+
+router.post('/quarantine/:qid/release', async (req: AuthRequest, res) => {
+  const { qid } = req.params;
+  try {
+    if (!(await ownsQuarantine(req, qid!))) return res.status(404).json({ message: 'Not found' });
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['RELEASE_RELAY_QUARANTINE', { id: Number(qid) }]);
+    res.json({ message: 'Delivery queued' });
+  } catch (err) { res.status(500).json({ message: (err as Error).message }); }
+});
+
+router.delete('/quarantine/:qid', async (req: AuthRequest, res) => {
+  const { qid } = req.params;
+  try {
+    if (!(await ownsQuarantine(req, qid!))) return res.status(404).json({ message: 'Not found' });
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['DELETE_RELAY_QUARANTINE', { id: Number(qid) }]);
+    res.json({ message: 'Deleted' });
+  } catch (err) { res.status(500).json({ message: (err as Error).message }); }
+});
+
 export default router;
