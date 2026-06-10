@@ -1,6 +1,7 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import api from '../../api/client';
+import { BRAND } from '../../brand';
 import {
   LayoutDashboard, Users, Package, Briefcase, Palette,
   Power, Download, Layers, BarChart2,
@@ -130,6 +131,12 @@ const clientGroups: MenuGroup[] = [
 const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const navigate = useNavigate();
   const groups = userRole === 'admin' ? adminGroups : clientGroups;
+  // Customers see the "Quality Creations" brand (violet); admins see the
+  // "Superhost" engine brand (orange).
+  const isClient = userRole === 'client';
+  const activeCls = isClient
+    ? 'bg-violet-500/15 text-violet-300 border border-violet-500/20'
+    : 'bg-orange-500/15 text-orange-400 border border-orange-500/20';
 
   const handleLogout = async () => {
     // Revoke the token server-side (best-effort) before clearing local state.
@@ -153,14 +160,25 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
     `}>
       {/* Logo */}
       <div className="h-14 flex items-center px-5 border-b border-slate-800 bg-slate-950 flex-shrink-0">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center shadow-lg shadow-orange-500/20 flex-shrink-0">
-            <Server className="w-4 h-4 text-white" />
+        {isClient ? (
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center shadow-lg shadow-violet-500/20 flex-shrink-0 text-white text-[11px] font-extrabold tracking-tight">
+              {BRAND.short}
+            </div>
+            <span className="text-lg font-bold text-violet-300 tracking-tight">
+              {BRAND.name}
+            </span>
           </div>
-          <span className="text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-amber-400 tracking-tight">
-            Superhost
-          </span>
-        </div>
+        ) : (
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center shadow-lg shadow-orange-500/20 flex-shrink-0">
+              <Server className="w-4 h-4 text-white" />
+            </div>
+            <span className="text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-amber-400 tracking-tight">
+              Superhost
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Navigation */}
@@ -184,7 +202,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
                     className={({ isActive }) =>
                       `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150 ${
                         isActive
-                          ? 'bg-orange-500/15 text-orange-400 border border-orange-500/20'
+                          ? activeCls
                           : 'text-slate-400 hover:bg-slate-800 hover:text-slate-100 border border-transparent'
                       }`
                     }
