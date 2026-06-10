@@ -148,6 +148,36 @@ router.post('/:id/setup-link', async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+// Suspend an account — marks it suspended and takes the user's websites offline.
+router.post('/:id/suspend', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const u = await query("UPDATE users SET status = 'suspended' WHERE id = $1 RETURNING id, username", [id]);
+        if (u.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SUSPEND_ACCOUNT', { userId: u.rows[0].id, username: u.rows[0].username }]);
+        await logAudit(req, 'user.suspend', { targetType: 'user', targetId: String(id), metadata: { username: u.rows[0].username } });
+        res.json({ message: 'Account suspended', status: 'suspended' });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+// Reactivate an account — restores the websites and clears suspension.
+router.post('/:id/reactivate', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const u = await query("UPDATE users SET status = 'active' WHERE id = $1 RETURNING id, username", [id]);
+        if (u.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['UNSUSPEND_ACCOUNT', { userId: u.rows[0].id, username: u.rows[0].username }]);
+        await logAudit(req, 'user.reactivate', { targetType: 'user', targetId: String(id), metadata: { username: u.rows[0].username } });
+        res.json({ message: 'Account reactivated', status: 'active' });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     try {

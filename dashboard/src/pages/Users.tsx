@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box, Network, KeyRound, Copy, Check } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box, Network, KeyRound, Copy, Check, Ban, Power } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -16,6 +16,16 @@ const UsersPage: React.FC = () => {
   const [setupLink, setSetupLink] = useState<{ username: string; url: string } | null>(null);
   const [generatingLink, setGeneratingLink] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
+
+  const suspendMutation = useMutation({
+    mutationFn: async ({ id, suspend }: { id: number; suspend: boolean }) =>
+      (await api.post(`/users/${id}/${suspend ? 'suspend' : 'reactivate'}`)).data,
+    onSuccess: (_d, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+      toast.success(vars.suspend ? 'Account suspended — sites going offline' : 'Account reactivated — sites coming back online');
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Action failed'),
+  });
 
   const handleGenerateSetupLink = async (user: User) => {
     setGeneratingLink(user.id);
@@ -118,7 +128,12 @@ const UsersPage: React.FC = () => {
                   {new Date(user.created_at).toLocaleDateString()}
                 </span>
               </div>
-              <h3 className="text-xl font-bold text-slate-800">{user.username}</h3>
+              <div className="flex items-center gap-2">
+                <h3 className="text-xl font-bold text-slate-800">{user.username}</h3>
+                {(user as any).status === 'suspended' && (
+                  <span className="text-[10px] font-bold text-red-700 bg-red-100 border border-red-200 px-2 py-0.5 rounded-full uppercase tracking-wide">Suspended</span>
+                )}
+              </div>
               <p className="text-slate-500 text-sm flex items-center gap-2 mt-2">
                 <Mail size={14} className="text-slate-400" />
                 {user.email}
@@ -194,6 +209,23 @@ const UsersPage: React.FC = () => {
                   <KeyRound size={13} />
                   {generatingLink === user.id ? 'Generating…' : 'Set-password link'}
                 </button>
+                {(user as any).status === 'suspended' ? (
+                  <button
+                    onClick={() => suspendMutation.mutate({ id: user.id, suspend: false })}
+                    disabled={suspendMutation.isPending}
+                    className="col-span-2 bg-green-50 hover:bg-green-100 text-green-700 hover:text-green-800 font-semibold text-xs py-2.5 rounded-lg border border-green-200 hover:border-green-300 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60"
+                  >
+                    <Power size={13} /> Reactivate account
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { if (confirm(`Suspend ${user.username}? Their website(s) will go offline immediately.`)) suspendMutation.mutate({ id: user.id, suspend: true }); }}
+                    disabled={suspendMutation.isPending}
+                    className="col-span-2 bg-red-50 hover:bg-red-100 text-red-700 hover:text-red-800 font-semibold text-xs py-2.5 rounded-lg border border-red-200 hover:border-red-300 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60"
+                  >
+                    <Ban size={13} /> Suspend account
+                  </button>
+                )}
               </div>
             </div>
           )) : (
