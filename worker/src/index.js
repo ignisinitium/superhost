@@ -318,6 +318,9 @@ async function handleTask(task) {
             case 'MIGRATE_CWP':
                 await handleMigrateCwp(task.payload);
                 break;
+            case 'MIGRATE_SITE':
+                await handleMigrateSite(task.payload);
+                break;
             default:
                 throw new Error(`Unknown command: ${task.command}`);
         }
@@ -3612,6 +3615,118 @@ async function cwpLog(migrationId, msg) {
 }
 async function cwpProgress(migrationId, progress) {
     await client.query("UPDATE cwp_migrations SET progress = $1, updated_at = NOW() WHERE id = $2", [JSON.stringify(progress), migrationId]);
+}
+// ── Generic site migration over SSH (Node.js / static / PHP) ────────────────
+async function siteLog(id, msg) {
+    const ts = new Date().toISOString().slice(11, 19);
+    await client.query('UPDATE site_migrations SET log = log || $1 WHERE id = $2', [`[${ts}] ${msg}\n`, id]);
+    console.log(`[SiteMigration ${id}] ${msg}`);
+}
+async function handleMigrateSite(payload) {
+    const { migrationId, sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey, remotePath, userId, username: rawUser, domainName: rawDomain, domainId, stack, appPort, installCommand, buildCommand, startCommand, phpVersion } = payload;
+    const username = validateUsername(rawUser);
+    const domain = validateDomainName(rawDomain);
+    const docRoot = `/home/${username}/public_html/${domain}`;
+    const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+    await client.query("UPDATE site_migrations SET status='running' WHERE id=$1", [migrationId]);
+    try {
+        await siteLog(migrationId, `Connecting to ${sshUser}@${sourceHost}:${sourcePort} …`);
+        await sshRun(sourceHost, Number(sourcePort), sshUser, cred, 'echo ok');
+        await siteLog(migrationId, 'SSH connection OK. Syncing files…');
+        // 1. Pull the site files (skip deps/VCS; we reinstall locally).
+        await execPromise(`sudo mkdir -p ${shellEscape(docRoot)}`);
+        const src = String(remotePath).replace(/\/?$/, '/'); // ensure trailing slash → copy contents
+        await rsyncFromRemote(sourceHost, Number(sourcePort), sshUser, cred, src, docRoot + '/', ['--exclude=node_modules', '--exclude=.git', '--exclude=.env']);
+        await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(docRoot)}`);
+        await execPromise(`sudo setfacl -R -m user:jonathan:rwx ${shellEscape(docRoot)}`).catch(() => { });
+        await siteLog(migrationId, 'Files synced.');
+        if (stack === 'node' || stack === 'python') {
+            if (installCommand) {
+                await siteLog(migrationId, `Installing dependencies: ${installCommand}`);
+                await execPromise(`sudo -u ${shellEscape(username)} bash -lc ${shellEscape(`cd ${docRoot} && ${installCommand}`)}`, { timeout: 15 * 60 * 1000 });
+            }
+            if (buildCommand) {
+                await siteLog(migrationId, `Building: ${buildCommand}`);
+                await execPromise(`sudo -u ${shellEscape(username)} bash -lc ${shellEscape(`cd ${docRoot} && ${buildCommand}`)}`, { timeout: 15 * 60 * 1000 });
+            }
+            // Allocate a port (use the requested one, else the first free port in range).
+            let port = parseInt(appPort, 10);
+            if (!Number.isInteger(port) || port < 1024) {
+                const p = await client.query('SELECT gs FROM generate_series(30000,40000) gs WHERE gs NOT IN (SELECT port FROM user_apps) ORDER BY gs LIMIT 1');
+                port = p.rows[0]?.gs ?? 30000;
+            }
+            // Reverse-proxy vhost → the app port.
+            const vhost = `server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    access_log /var/log/nginx/${domain}.access.log;
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+`;
+            await fs.writeFile(`/tmp/${domain}.vhost`, vhost);
+            await execPromise(`sudo mv ${shellEscape(`/tmp/${domain}.vhost`)} /etc/nginx/sites-available/${shellEscape(domain)}`);
+            await execPromise(`sudo ln -sf /etc/nginx/sites-available/${shellEscape(domain)} /etc/nginx/sites-enabled/${shellEscape(domain)}`);
+            await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+            // Record the app + start it under PM2 via a launcher (handles any start command).
+            const appRes = await client.query(`INSERT INTO user_apps (user_id, domain_id, name, type, port, startup_script, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'running') RETURNING id`, [userId, domainId ?? null, domain, stack, port, startCommand ?? null]);
+            const appName = `app_${appRes.rows[0].id}`;
+            const cmd = startCommand || (stack === 'python' ? 'python3 app.py' : 'npm start');
+            const launcher = `${docRoot}/.superhost-start.sh`;
+            await fs.writeFile('/tmp/.superhost-start.sh', `#!/bin/bash\ncd ${docRoot}\nexport PORT=${port}\nexec ${cmd}\n`);
+            await execPromise(`sudo mv /tmp/.superhost-start.sh ${shellEscape(launcher)}`);
+            await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(launcher)} && sudo chmod 755 ${shellEscape(launcher)}`);
+            await siteLog(migrationId, `Starting app on port ${port} (${cmd})`);
+            await execPromise(`sudo -u ${shellEscape(username)} pm2 start ${shellEscape(launcher)} --name ${shellEscape(appName)} --interpreter bash --cwd ${shellEscape(docRoot)}`);
+            await execPromise(`pm2 startup systemd -u ${shellEscape(username)} --hp /home/${shellEscape(username)} --silent`).catch(() => { });
+            await execPromise(`sudo -u ${shellEscape(username)} pm2 save --force`).catch(() => { });
+        }
+        else {
+            // static / php: serve the docroot directly.
+            const ver = validatePhpVersion(phpVersion || '8.3');
+            const phpBlock = stack === 'php'
+                ? `\n    location ~ \\.php$ {\n        include snippets/fastcgi-php.conf;\n        fastcgi_pass unix:/run/php/php${ver}-fpm.sock;\n    }`
+                : '';
+            const idx = stack === 'php' ? 'index.php index.html' : 'index.html';
+            const tryf = stack === 'php' ? 'try_files $uri $uri/ /index.php?$query_string;' : 'try_files $uri $uri/ /index.html;';
+            const vhost = `server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    root ${docRoot};
+    index ${idx};
+    access_log /var/log/nginx/${domain}.access.log;
+    location / { ${tryf} }${phpBlock}
+    location ~ /\\.ht { deny all; }
+}
+`;
+            await fs.writeFile(`/tmp/${domain}.vhost`, vhost);
+            await execPromise(`sudo mv ${shellEscape(`/tmp/${domain}.vhost`)} /etc/nginx/sites-available/${shellEscape(domain)}`);
+            await execPromise(`sudo ln -sf /etc/nginx/sites-available/${shellEscape(domain)} /etc/nginx/sites-enabled/${shellEscape(domain)}`);
+            await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+        }
+        await client.query("UPDATE site_migrations SET status='completed', completed_at=NOW() WHERE id=$1", [migrationId]);
+        await siteLog(migrationId, '✓ Migration complete. Point DNS to this server and run SSL when ready.');
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await client.query("UPDATE site_migrations SET status='failed', error_message=$1 WHERE id=$2", [msg, migrationId]);
+        await siteLog(migrationId, `ERROR: ${msg}`);
+        throw err;
+    }
+    finally {
+        if (cred.type === 'key')
+            await fs.unlink(cred.keyPath).catch(() => { });
+    }
 }
 async function handleTestSshConnection(taskId, payload) {
     const { remoteHost, remotePort, remoteUser, authType, sshPassword, sshKey } = payload;

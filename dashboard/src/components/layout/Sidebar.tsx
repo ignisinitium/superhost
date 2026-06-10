@@ -9,7 +9,7 @@ import {
   ShieldCheck, ShieldAlert, Mail,
   Network, Terminal, Cpu, Paintbrush, Settings,
   Zap, GitBranch, CreditCard,
-  Server, LogOut, RadioTower, UserX, ArrowDownToLine, ScrollText,
+  Server, LogOut, RadioTower, UserX, ArrowDownToLine, ScrollText, ServerCog,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -75,6 +75,7 @@ const adminGroups: MenuGroup[] = [
       { label: 'Processes',      icon: Cpu,         path: '/processes' },
       { label: 'Theme Engine',   icon: Paintbrush,       path: '/themes' },
       { label: 'CWP Migration',  icon: ArrowDownToLine,  path: '/migration' },
+      { label: 'Site Migration', icon: ServerCog,        path: '/site-migration' },
       { label: 'Settings',       icon: Settings,         path: '/settings' },
     ],
   },

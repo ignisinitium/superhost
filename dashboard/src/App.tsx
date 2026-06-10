@@ -56,6 +56,7 @@ import ResellerBranding from './pages/ResellerBranding';
 import TerminalPage from './pages/Terminal';
 import AdminSpam from './pages/AdminSpam';
 import MigrationPage from './pages/Migration';
+import AdminSiteMigration from './pages/AdminSiteMigration';
 import AuditLogPage from './pages/AuditLog';
 
 // ---------------------------------------------------------------------------
@@ -292,6 +293,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="terminal" element={<TerminalPage />} />
                     <Route path="settings" element={<SettingsPage />} />
                     <Route path="migration" element={<MigrationPage />} />
+                    <Route path="site-migration" element={<AdminSiteMigration />} />
                   </>
                 ) : (
                   <>

@@ -47,6 +47,7 @@ import systemRoutes from './routes/system.js';
 import adminMigrationsRoutes from './routes/adminMigrations.js';
 import auditLogRoutes from './routes/auditLog.js';
 import publicRoutes from './routes/public.js';
+import adminSiteMigrationsRoutes from './routes/adminSiteMigrations.js';
 import clientRelayRoutes from './routes/clientRelay.js';
 
 dotenv.config();
@@ -153,6 +154,7 @@ app.use('/api/admin/apps', adminAppsRoutes);
 app.use('/api/admin/deleted-users', adminDeletedUsersRoutes);
 app.use('/api/admin/system', systemRoutes);
 app.use('/api/admin/migrations', adminMigrationsRoutes);
+app.use('/api/admin/site-migrations', adminSiteMigrationsRoutes);
 app.use('/api/admin/audit', auditLogRoutes);
 app.use('/api/public', publicRoutes);
 
