@@ -49,10 +49,15 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
             case 'invoice.paid': {
                 const invoice = event.data.object;
                 await query('UPDATE invoices SET status = $1, paid_at = NOW() WHERE stripe_invoice_id = $2', ['paid', invoice.id]);
-                // A successful renewal reactivates the account if it was past_due.
+                // A successful payment reactivates the account if it was suspended —
+                // bring the websites back online.
                 if (invoice.customer) {
-                    await query(`UPDATE users SET status = 'active', subscription_status = 'active'
-             WHERE stripe_customer_id = $1 AND status = 'suspended'`, [invoice.customer]);
+                    const reactivated = await query(`UPDATE users SET status = 'active', subscription_status = 'active'
+             WHERE stripe_customer_id = $1 AND status = 'suspended'
+             RETURNING id, username`, [invoice.customer]);
+                    for (const u of reactivated.rows) {
+                        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['UNSUSPEND_ACCOUNT', { userId: u.id, username: u.username }]);
+                    }
                 }
                 break;
             }
@@ -83,10 +88,15 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
             }
             case 'customer.subscription.deleted': {
                 const sub = event.data.object;
-                // Subscription canceled/ended → suspend the hosting account.
-                await query(`UPDATE users SET status = 'suspended', subscription_status = 'canceled'
-           WHERE stripe_subscription_id = $1 OR stripe_customer_id = $2`, [sub.id, sub.customer]);
-                console.log(`Subscription ${sub.id} canceled → account suspended`);
+                // Subscription canceled/ended → suspend the account and take the
+                // customer's websites offline.
+                const suspended = await query(`UPDATE users SET status = 'suspended', subscription_status = 'canceled'
+           WHERE stripe_subscription_id = $1 OR stripe_customer_id = $2
+           RETURNING id, username`, [sub.id, sub.customer]);
+                for (const u of suspended.rows) {
+                    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SUSPEND_ACCOUNT', { userId: u.id, username: u.username }]);
+                }
+                console.log(`Subscription ${sub.id} canceled → suspending ${suspended.rowCount} account(s)`);
                 break;
             }
             default:

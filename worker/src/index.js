@@ -87,6 +87,12 @@ async function handleTask(task) {
             case 'DELETE_DOMAIN':
                 await handleDeleteDomain(task.payload);
                 break;
+            case 'SUSPEND_ACCOUNT':
+                await handleSuspendAccount(task.payload);
+                break;
+            case 'UNSUSPEND_ACCOUNT':
+                await handleUnsuspendAccount(task.payload);
+                break;
             case 'SETUP_CUSTOM_API':
                 await handleSetupCustomApi(task.payload);
                 break;
@@ -920,6 +926,123 @@ async function handleDeleteDomain(payload) {
     await execPromise(`sudo rm -f /etc/bind/zones/db.${shellEscape(domainName)}`).catch(() => { });
     await execPromise('sudo nginx -t && sudo systemctl reload nginx').catch(() => { });
     console.log(`Domain ${domainName} deleted.`);
+}
+// ── Account suspension (subscription canceled/unpaid) ───────────────────────
+const SUSPENDED_ROOT = '/var/www/suspended';
+const SUSPEND_BACKUP_DIR = '/etc/nginx/suspended-backups';
+async function fileExists(p) {
+    try {
+        await fs.access(p);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+// Write the shared "temporarily unavailable" landing page once.
+async function ensureSuspendedPage() {
+    await execPromise(`sudo mkdir -p ${SUSPENDED_ROOT}`);
+    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Site temporarily unavailable</title>
+<style>body{margin:0;font-family:system-ui,Arial,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}
+.box{max-width:520px;padding:40px}h1{font-size:1.6rem;margin:0 0 12px}p{color:#94a3b8;line-height:1.6}</style></head>
+<body><div class="box"><h1>This site is temporarily unavailable</h1>
+<p>The website you're trying to reach is currently offline. If you are the site owner, please sign in to your account to restore service.</p></div></body></html>`;
+    const tmp = '/tmp/suspended.html';
+    await fs.writeFile(tmp, html);
+    await execPromise(`sudo mv ${shellEscape(tmp)} ${SUSPENDED_ROOT}/suspended.html`);
+}
+function buildSuspendedVhost(domain, hasSsl) {
+    const block = (listen, ssl) => `server {
+    ${listen}
+    server_name ${domain} www.${domain};
+    ${ssl}
+    root ${SUSPENDED_ROOT};
+    location / { return 503; }
+    error_page 503 /suspended.html;
+    location = /suspended.html { internal; }
+}`;
+    let out = block('listen 80;\n    listen [::]:80;', '');
+    if (hasSsl) {
+        out += '\n' + block('listen 443 ssl;\n    listen [::]:443 ssl;', `ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;`);
+    }
+    return out + '\n';
+}
+// Take all of a user's websites offline behind a 503 page. Reversible — the
+// real vhost is backed up so UNSUSPEND_ACCOUNT can restore it exactly.
+async function handleSuspendAccount(payload) {
+    const username = validateUsername(payload?.username);
+    const userId = payload?.userId;
+    if (!userId)
+        throw new Error('userId required');
+    const res = await client.query('SELECT domain_name FROM domains WHERE user_id = $1', [userId]);
+    if (res.rowCount === 0) {
+        console.log(`Suspend: no domains for ${username}`);
+        return;
+    }
+    await ensureSuspendedPage();
+    await execPromise(`sudo mkdir -p ${SUSPEND_BACKUP_DIR}`);
+    for (const row of res.rows) {
+        let domain;
+        try {
+            domain = validateDomainName(row.domain_name);
+        }
+        catch {
+            continue;
+        }
+        const avail = `/etc/nginx/sites-available/${domain}`;
+        const backup = `${SUSPEND_BACKUP_DIR}/${domain}`;
+        if (!(await fileExists(avail)))
+            continue;
+        // Back up the real vhost once (don't clobber an existing backup).
+        if (!(await fileExists(backup))) {
+            await execPromise(`sudo cp ${shellEscape(avail)} ${shellEscape(backup)}`).catch(() => { });
+        }
+        const hasSsl = await fileExists(`/etc/letsencrypt/live/${domain}/fullchain.pem`);
+        const tmp = `/tmp/suspended_${domain}.conf`;
+        await fs.writeFile(tmp, buildSuspendedVhost(domain, hasSsl));
+        await execPromise(`sudo mv ${shellEscape(tmp)} ${shellEscape(avail)}`);
+        await execPromise(`sudo ln -sf ${shellEscape(avail)} /etc/nginx/sites-enabled/${shellEscape(domain)}`).catch(() => { });
+    }
+    try {
+        await execPromise('sudo nginx -t');
+        await execPromise('sudo systemctl reload nginx');
+        console.log(`Suspended ${res.rowCount} site(s) for ${username}`);
+    }
+    catch (e) {
+        console.error('nginx invalid after suspend — restoring backups:', e.message);
+        await handleUnsuspendAccount({ username, userId });
+        throw e;
+    }
+}
+// Restore a user's websites from backup (subscription reactivated).
+async function handleUnsuspendAccount(payload) {
+    const username = validateUsername(payload?.username);
+    const userId = payload?.userId;
+    if (!userId)
+        throw new Error('userId required');
+    const res = await client.query('SELECT domain_name FROM domains WHERE user_id = $1', [userId]);
+    let restored = 0;
+    for (const row of res.rows) {
+        let domain;
+        try {
+            domain = validateDomainName(row.domain_name);
+        }
+        catch {
+            continue;
+        }
+        const avail = `/etc/nginx/sites-available/${domain}`;
+        const backup = `${SUSPEND_BACKUP_DIR}/${domain}`;
+        if (await fileExists(backup)) {
+            await execPromise(`sudo mv ${shellEscape(backup)} ${shellEscape(avail)}`).catch(() => { });
+            await execPromise(`sudo ln -sf ${shellEscape(avail)} /etc/nginx/sites-enabled/${shellEscape(domain)}`).catch(() => { });
+            restored++;
+        }
+    }
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx').catch((e) => console.error('nginx reload failed during unsuspend:', e.message));
+    console.log(`Unsuspended ${restored} site(s) for ${username}`);
 }
 async function handleUpdateDomainConfig(payload) {
     const { domainName, username, phpVersion, reverseProxyBlock } = payload;
