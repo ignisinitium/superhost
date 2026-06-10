@@ -10,6 +10,7 @@ const Login: React.FC = () => {
   const [twoFACode, setTwoFACode] = useState('');
   const [require2FA, setRequire2FA] = useState(false);
   const [adminId, setAdminId] = useState<number | null>(null);
+  const [pendingToken, setPendingToken] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
@@ -23,6 +24,7 @@ const Login: React.FC = () => {
       if (res.data.require2FA) {
         setRequire2FA(true);
         setAdminId(res.data.adminId);
+        setPendingToken(res.data.pendingToken);
       } else {
         localStorage.setItem('token', res.data.token);
         localStorage.setItem('admin', JSON.stringify(res.data.admin));
@@ -72,7 +74,7 @@ const Login: React.FC = () => {
     e.preventDefault();
     setIsLoading(true);
     try {
-      const res = await api.post('/auth/verify-2fa', { adminId, token: twoFACode });
+      const res = await api.post('/auth/verify-2fa', { adminId, token: twoFACode, pendingToken });
       localStorage.setItem('token', res.data.token);
       localStorage.setItem('admin', JSON.stringify(res.data.admin));
       localStorage.setItem('role', 'admin');

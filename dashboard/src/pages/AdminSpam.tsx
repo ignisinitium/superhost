@@ -123,13 +123,14 @@ function EmptyState({ icon: Icon, text }: { icon: React.ElementType; text: strin
 
 // ── Main Page ──────────────────────────────────────────────────────────────────
 
-type Tab = 'overview' | 'quarantine' | 'mailboxes' | 'rules';
+type Tab = 'overview' | 'quarantine' | 'mailboxes' | 'rules' | 'infra';
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: 'overview',   label: 'Overview',   icon: TrendingDown },
   { id: 'quarantine', label: 'Quarantine', icon: ShieldAlert },
   { id: 'mailboxes',  label: 'Mailboxes',  icon: Mail },
   { id: 'rules',      label: 'Rules',      icon: Filter },
+  { id: 'infra',      label: 'Infrastructure', icon: ShieldCheck },
 ];
 
 const AdminSpam: React.FC = () => {
@@ -175,6 +176,82 @@ const AdminSpam: React.FC = () => {
       {activeTab === 'quarantine' && <QuarantineTab queryClient={queryClient} />}
       {activeTab === 'mailboxes'  && <MailboxesTab  queryClient={queryClient} />}
       {activeTab === 'rules'      && <RulesTab       queryClient={queryClient} />}
+      {activeTab === 'infra'      && <InfraTab       queryClient={queryClient} />}
+    </div>
+  );
+};
+
+// ── Infrastructure Tab: greylisting / RBL / attachment blocking ─────────────────
+
+const InfraTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = ({ queryClient }) => {
+  const { data, isLoading } = useQuery<Record<string, string>>({
+    queryKey: ['adminSpamSettings'],
+    queryFn: async () => (await adminApi.get('/spam/settings')).data,
+  });
+
+  const [form, setForm] = useState<Record<string, string>>({});
+  const s = { ...data, ...form };
+  const set = (k: string, v: string) => setForm(f => ({ ...f, [k]: v }));
+
+  const saveMutation = useMutation({
+    mutationFn: async () => (await adminApi.put('/spam/settings', s)).data,
+    onSuccess: () => {
+      toast.success('Settings saved — mail server reconfiguring');
+      queryClient.invalidateQueries({ queryKey: ['adminSpamSettings'] });
+      setForm({});
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to save'),
+  });
+
+  if (isLoading) return <div className="text-slate-400 p-8 text-center">Loading...</div>;
+
+  const Toggle = ({ k, label, desc }: { k: string; label: string; desc: string }) => (
+    <div className="flex items-start justify-between gap-4 py-4 border-b border-slate-100 last:border-0">
+      <div>
+        <div className="font-bold text-slate-800 text-sm">{label}</div>
+        <div className="text-slate-500 text-xs mt-0.5">{desc}</div>
+      </div>
+      <button
+        onClick={() => set(k, s[k] === 'true' ? 'false' : 'true')}
+        className={`shrink-0 w-12 h-6 rounded-full transition-colors ${s[k] === 'true' ? 'bg-green-500' : 'bg-slate-300'}`}
+      >
+        <span className={`block w-5 h-5 bg-white rounded-full shadow transform transition-transform mt-0.5 ${s[k] === 'true' ? 'translate-x-6' : 'translate-x-0.5'}`} />
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 max-w-3xl space-y-2">
+      <Toggle k="greylisting_enabled" label="Greylisting" desc="Temporarily defer mail from unknown senders; legitimate servers retry, most spambots don't. (Installs postgrey.)" />
+      <Toggle k="rbl_enabled" label="DNS blocklists (RBL)" desc="Reject connections from IPs listed on the blocklists below at SMTP time." />
+      <div className="py-3 border-b border-slate-100">
+        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">RBL zones (comma-separated)</label>
+        <input
+          className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          value={s['mail_rbls'] ?? ''}
+          onChange={(e) => set('mail_rbls', e.target.value)}
+          placeholder="zen.spamhaus.org,bl.spamcop.net"
+        />
+      </div>
+      <Toggle k="attachment_blocking_enabled" label="Dangerous attachment blocking" desc="Reject messages whose attachments use risky extensions before they are delivered." />
+      <div className="py-3">
+        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Blocked extensions (comma-separated)</label>
+        <input
+          className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          value={s['blocked_attachment_extensions'] ?? ''}
+          onChange={(e) => set('blocked_attachment_extensions', e.target.value)}
+          placeholder="exe,scr,vbs,js,jar"
+        />
+      </div>
+      <div className="pt-4">
+        <button
+          onClick={() => saveMutation.mutate()}
+          disabled={saveMutation.isPending}
+          className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-xl font-bold text-sm disabled:opacity-50"
+        >
+          {saveMutation.isPending ? 'Saving...' : 'Save & Apply'}
+        </button>
+      </div>
     </div>
   );
 };

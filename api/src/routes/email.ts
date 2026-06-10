@@ -1,15 +1,41 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import { query } from '../db.js';
-import { authenticateClient } from '../middleware/auth.js';
+import { authenticateClientOrMail } from '../middleware/auth.js';
 import type { AuthRequest } from '../middleware/auth.js';
 
 const router = express.Router();
 
-router.use(authenticateClient);
+router.use(authenticateClientOrMail);
 
 // Email local part validation: RFC 5321 safe subset
 const EMAIL_LOCAL_RE = /^[a-zA-Z0-9._%+\-]{1,64}$/;
+
+/**
+ * Block single-mailbox (mail_user) tokens from account-management endpoints.
+ * Mail users may only manage spam/quarantine for their own mailbox; creating
+ * mailboxes, deleting them, changing arbitrary passwords, and managing
+ * forwarders require a full client token.
+ */
+function denyMailUser(req: AuthRequest, res: express.Response): boolean {
+  if (req.mailUserId != null) {
+    res.status(403).json({ message: 'Not permitted for mailbox logins' });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * For a mail_user token, the requested mailbox must be their own.
+ * Returns true (and sends 403) on violation. No-op for full clients.
+ */
+function mailScopeDenied(req: AuthRequest, targetMailUserId: unknown, res: express.Response): boolean {
+  if (req.mailUserId != null && Number(targetMailUserId) !== req.mailUserId) {
+    res.status(403).json({ message: 'Access denied' });
+    return true;
+  }
+  return false;
+}
 
 /**
  * Generate a Dovecot-compatible password hash.
@@ -29,15 +55,16 @@ async function generateDovecotPassword(plainPassword: string): Promise<string> {
 
 router.get('/', async (req: AuthRequest, res) => {
   try {
-    // Get all email accounts for domains owned by this user
+    // Full clients see all their mailboxes; a mail_user sees only their own.
     const result = await query(`
       SELECT mu.id, mu.domain_id, mu.email, md.domain_name, mu.quota,
-             mu.spam_filter_enabled, mu.is_catchall
+             mu.spam_filter_enabled, mu.spam_digest_enabled,
+             mu.spam_score_threshold, mu.spam_action, mu.is_catchall
       FROM mail_users mu
       JOIN mail_domains md ON mu.domain_id = md.id
-      WHERE md.user_id = $1
+      WHERE md.user_id = $1 AND ($2::int IS NULL OR mu.id = $2)
       ORDER BY mu.email ASC
-    `, [req.userId]);
+    `, [req.userId, req.mailUserId ?? null]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
@@ -45,6 +72,7 @@ router.get('/', async (req: AuthRequest, res) => {
 });
 
 router.post('/', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   const { localPart, domainId, password, quota = 1024, isCatchall = false } = req.body;
   const userId = req.userId!;
 
@@ -128,6 +156,7 @@ router.post('/', async (req: AuthRequest, res) => {
 });
 
 router.delete('/:id', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   const { id } = req.params;
   const userId = req.userId!;
 
@@ -153,6 +182,7 @@ router.delete('/:id', async (req: AuthRequest, res) => {
 
 // Change email password
 router.patch('/:id/password', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   const { id } = req.params;
   const { password } = req.body;
   const userId = req.userId!;
@@ -184,11 +214,22 @@ router.patch('/:id/password', async (req: AuthRequest, res) => {
 // Update Email Account (Quota, Spam Filter)
 router.patch('/:id', async (req: AuthRequest, res) => {
   const { id } = req.params;
-  const { quota, spamFilterEnabled, spamDigestEnabled, spamScoreThreshold, spamAction } = req.body;
+  if (mailScopeDenied(req, id!, res)) return;
+  let { quota } = req.body;
+  const { spamFilterEnabled, spamDigestEnabled, spamScoreThreshold, spamAction } = req.body;
   const userId = req.userId!;
+
+  // A mail_user may tune their own spam settings but not raise their quota.
+  if (req.mailUserId != null) quota = undefined;
 
   if (spamAction !== undefined && !['quarantine', 'tag', 'deliver'].includes(spamAction)) {
     return res.status(400).json({ message: 'spamAction must be quarantine, tag, or deliver' });
+  }
+  if (spamScoreThreshold !== undefined) {
+    const t = Number(spamScoreThreshold);
+    if (!Number.isFinite(t) || t < 0.1 || t > 100) {
+      return res.status(400).json({ message: 'spamScoreThreshold must be between 0.1 and 100' });
+    }
   }
 
   try {
@@ -232,6 +273,7 @@ router.patch('/:id', async (req: AuthRequest, res) => {
 // --- Forwarders ---
 
 router.get('/forwarders', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   try {
     const result = await query(`
       SELECT mf.*, md.domain_name 
@@ -247,6 +289,7 @@ router.get('/forwarders', async (req: AuthRequest, res) => {
 });
 
 router.post('/forwarders', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   const { source, destination, domainId } = req.body;
   const userId = req.userId!;
 
@@ -272,6 +315,7 @@ router.post('/forwarders', async (req: AuthRequest, res) => {
 });
 
 router.delete('/forwarders/:id', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
   const { id } = req.params;
   try {
     const verifyRes = await query(`
@@ -297,6 +341,7 @@ router.delete('/forwarders/:id', async (req: AuthRequest, res) => {
 
 router.get('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   try {
     const result = await query(`
       SELECT ma.* FROM mail_autoresponders ma
@@ -313,6 +358,7 @@ router.get('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
 
 router.post('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   const { message, enabled } = req.body;
   try {
     const verifyRes = await query(`
@@ -349,6 +395,7 @@ router.post('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
 // Get quarantined emails for a user (supports ?search=)
 router.get('/:mailUserId/quarantine', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   const { search } = req.query;
   try {
     const verifyRes = await query(`
@@ -390,15 +437,15 @@ router.post('/quarantine/bulk', async (req: AuthRequest, res) => {
       JOIN mail_users mu ON q.mail_user_id = mu.id
       JOIN mail_domains md ON mu.domain_id = md.id
       WHERE q.id = ANY($1) AND md.user_id = $2 AND q.released_at IS NULL
-    `, [safeIds, userId]);
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [safeIds, userId, req.mailUserId ?? null]);
 
     if (action === 'delete') {
-      await query('DELETE FROM mail_quarantine WHERE id = ANY($1)', [qRes.rows.map((r: any) => r.id)]);
+      // Worker removes the mail file then deletes the row (prevents the
+      // quarantine scanner from re-inserting it). Don't pre-delete here.
       for (const row of qRes.rows) {
-        if (row.file_path) {
-          await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
-            ['DELETE_FILE', { filePath: row.file_path }]);
-        }
+        await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+          ['DELETE_QUARANTINE_FILE', { quarantineId: row.id, filePath: row.file_path }]);
       }
     } else {
       for (const row of qRes.rows) {
@@ -423,7 +470,8 @@ router.post('/quarantine/:id/release', async (req: AuthRequest, res) => {
       JOIN mail_users mu ON q.mail_user_id = mu.id
       JOIN mail_domains md ON mu.domain_id = md.id
       WHERE q.id = $1 AND md.user_id = $2 AND q.released_at IS NULL
-    `, [id, req.userId]);
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [id, req.userId, req.mailUserId ?? null]);
 
     if (qRes.rowCount === 0) return res.status(404).json({ message: 'Quarantined email not found' });
 
@@ -457,19 +505,20 @@ router.delete('/quarantine/:id', async (req: AuthRequest, res) => {
       JOIN mail_users mu ON q.mail_user_id = mu.id
       JOIN mail_domains md ON mu.domain_id = md.id
       WHERE q.id = $1 AND md.user_id = $2 AND q.released_at IS NULL
-    `, [id, req.userId]);
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [id, req.userId, req.mailUserId ?? null]);
 
     if (verifyRes.rowCount === 0) return res.status(403).json({ message: 'Access denied' });
 
-    await query('DELETE FROM mail_quarantine WHERE id = $1', [id]);
-    
-    // Delete file via worker
+    // Remove the mail file first (dedicated task that validates the quarantine
+    // path), then drop the DB row inside the worker so the 5-minute scanner
+    // can't resurrect a deleted item. See DELETE_QUARANTINE_FILE handler.
     await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', [
-      'DELETE_FILE', 
-      { filePath: verifyRes.rows[0].file_path }
+      'DELETE_QUARANTINE_FILE',
+      { quarantineId: verifyRes.rows[0].id, filePath: verifyRes.rows[0].file_path }
     ]);
 
-    res.json({ message: 'Quarantined email deleted' });
+    res.json({ message: 'Quarantined email deletion queued' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
@@ -479,6 +528,7 @@ router.delete('/quarantine/:id', async (req: AuthRequest, res) => {
 
 router.get('/:mailUserId/access-control', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   try {
     const verifyRes = await query(`
       SELECT mu.id FROM mail_users mu
@@ -497,7 +547,14 @@ router.get('/:mailUserId/access-control', async (req: AuthRequest, res) => {
 
 router.post('/:mailUserId/access-control', async (req: AuthRequest, res) => {
   const { mailUserId } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   const { senderPattern, accessType } = req.body;
+  if (!senderPattern || typeof senderPattern !== 'string' || !/^[a-zA-Z0-9@._%+\-*]{1,255}$/.test(senderPattern)) {
+    return res.status(400).json({ message: 'Invalid sender pattern' });
+  }
+  if (!['allow', 'block'].includes(accessType)) {
+    return res.status(400).json({ message: 'accessType must be allow or block' });
+  }
   try {
     const verifyRes = await query(`
       SELECT mu.id FROM mail_users mu
@@ -525,6 +582,7 @@ router.post('/:mailUserId/access-control', async (req: AuthRequest, res) => {
 
 router.delete('/:mailUserId/access-control/:id', async (req: AuthRequest, res) => {
   const { mailUserId, id } = req.params;
+  if (mailScopeDenied(req, mailUserId!, res)) return;
   try {
     const verifyRes = await query(`
       SELECT mu.id FROM mail_users mu
@@ -538,6 +596,97 @@ router.delete('/:mailUserId/access-control/:id', async (req: AuthRequest, res) =
     await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
       ['SYNC_SPAM_RULES', { mailUserId: parseInt(mailUserId as string, 10) }]);
     res.json({ message: 'Access rule deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ── Per-domain allow/block rules (apply to every mailbox in the domain) ──────
+
+// Verify the mail domain belongs to the authenticated client. Mail-user tokens
+// are blocked (domain-wide changes are an account-owner action).
+async function ownedMailDomain(req: AuthRequest, domainId: unknown): Promise<boolean> {
+  const r = await query('SELECT id FROM mail_domains WHERE id = $1 AND user_id = $2', [domainId, req.userId]);
+  return (r.rowCount ?? 0) > 0;
+}
+
+router.get('/domain-rules/:domainId', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
+  const { domainId } = req.params;
+  try {
+    if (!(await ownedMailDomain(req, domainId!))) return res.status(403).json({ message: 'Access denied' });
+    const result = await query(
+      'SELECT * FROM mail_domain_rules WHERE domain_id = $1 ORDER BY access_type DESC, sender_pattern',
+      [domainId],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.post('/domain-rules/:domainId', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
+  const { domainId } = req.params;
+  const { senderPattern, accessType } = req.body;
+  if (!senderPattern || typeof senderPattern !== 'string' || !/^[a-zA-Z0-9@._%+\-*]{1,255}$/.test(senderPattern)) {
+    return res.status(400).json({ message: 'Invalid sender pattern' });
+  }
+  if (!['allow', 'block'].includes(accessType)) {
+    return res.status(400).json({ message: 'accessType must be allow or block' });
+  }
+  try {
+    if (!(await ownedMailDomain(req, domainId!))) return res.status(403).json({ message: 'Access denied' });
+    const result = await query(
+      `INSERT INTO mail_domain_rules (domain_id, sender_pattern, access_type)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (domain_id, sender_pattern) DO UPDATE SET access_type = EXCLUDED.access_type
+       RETURNING *`,
+      [domainId, senderPattern, accessType],
+    );
+    await resyncDomainMailboxes(domainId!);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.delete('/domain-rules/:domainId/:id', async (req: AuthRequest, res) => {
+  if (denyMailUser(req, res)) return;
+  const { domainId, id } = req.params;
+  try {
+    if (!(await ownedMailDomain(req, domainId!))) return res.status(403).json({ message: 'Access denied' });
+    await query('DELETE FROM mail_domain_rules WHERE id = $1 AND domain_id = $2', [id, domainId]);
+    await resyncDomainMailboxes(domainId!);
+    res.json({ message: 'Domain rule deleted' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Re-sync sieve for every mailbox in a domain after a domain-rule change.
+async function resyncDomainMailboxes(domainId: unknown): Promise<void> {
+  const mailboxes = await query('SELECT id FROM mail_users WHERE domain_id = $1', [domainId]);
+  for (const m of mailboxes.rows as { id: number }[]) {
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_SPAM_RULES', { mailUserId: m.id }]);
+  }
+}
+
+// Report a quarantined message as spam (retrain Bayes) without deleting it.
+router.post('/quarantine/:id/report-spam', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  try {
+    const qRes = await query(`
+      SELECT q.id, q.file_path FROM mail_quarantine q
+      JOIN mail_users mu ON q.mail_user_id = mu.id
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE q.id = $1 AND md.user_id = $2
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [id, req.userId, req.mailUserId ?? null]);
+    if (qRes.rowCount === 0) return res.status(404).json({ message: 'Not found' });
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['LEARN_SPAM', { filePath: qRes.rows[0].file_path }]);
+    res.json({ message: 'Reported as spam' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

@@ -1,6 +1,6 @@
 import { Client } from 'pg';
 import dotenv from 'dotenv';
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
 import fs from 'fs/promises';
@@ -38,6 +38,10 @@ import {
 } from './sanitize.js';
 
 const execPromise = promisify(exec);
+// execFile runs a binary directly with an argument array (no shell), so values
+// can never be interpreted as shell metacharacters. Prefer this over execPromise
+// whenever any argument is user-controlled.
+const execFilePromise = promisify(execFile);
 dotenv.config();
 
 // Fail loudly if required env vars are missing — never fall back to hardcoded credentials
@@ -86,6 +90,16 @@ async function handleTask(task: Task) {
       return;
     }
 
+    // Scrub secrets (SSH creds, passwords, tokens) from the persisted payload
+    // now that we hold the in-memory copy. Tasks live in the DB indefinitely and
+    // are readable by any admin via GET /api/tasks/:id, so secrets must not
+    // remain at rest. Handlers still use the in-memory task.payload below.
+    if (task.payload && typeof task.payload === 'object') {
+      const scrubbed = redactPayload(task.payload);
+      await client.query('UPDATE tasks SET payload = $1 WHERE id = $2', [scrubbed, task.id])
+        .catch(() => { /* non-fatal: never block execution on scrubbing */ });
+    }
+
     switch (task.command) {
       case 'CREATE_USER':
         await handleCreateUser(task.payload);
@@ -101,6 +115,9 @@ async function handleTask(task: Task) {
         break;
       case 'TOGGLE_SSH_ACCESS':
         await handleToggleSshAccess(task.payload);
+        break;
+      case 'SET_LINUX_PASSWORD':
+        await handleSetLinuxPassword(task.payload);
         break;
       case 'CREATE_DOMAIN':
         await handleCreateDomain(task.payload);
@@ -290,6 +307,12 @@ async function handleTask(task: Task) {
         break;
       case 'DELETE_FILE':
         await handleDeleteFile(task.payload);
+        break;
+      case 'DELETE_QUARANTINE_FILE':
+        await handleDeleteQuarantineFile(task.payload);
+        break;
+      case 'LEARN_SPAM':
+        await handleLearnSpam(task.payload);
         break;
       case 'ZIP_FILES':
         await handleZipFiles(task.payload);
@@ -558,6 +581,20 @@ Your app will survive reboots — PM2 saves its state after every start/stop.
     console.error(`Failed to create user ${username}:`, err);
     throw err;
   }
+}
+
+async function handleSetLinuxPassword(payload: any) {
+  const username = validateUsername(payload?.username);
+  const password: string = payload?.password;
+  if (!password) throw new Error('password is required');
+  // chpasswd reads "username:password" from stdin — no shell interpolation of the password
+  const { exec } = await import('child_process');
+  await new Promise<void>((resolve, reject) => {
+    const proc = exec(`sudo chpasswd`, (err) => err ? reject(err) : resolve());
+    proc.stdin!.write(`${username}:${password}\n`);
+    proc.stdin!.end();
+  });
+  console.log(`Linux password updated for ${username}`);
 }
 
 async function handleToggleSshAccess(payload: any) {
@@ -1196,9 +1233,16 @@ async function handleRestartService(payload: any) {
 }
 
 async function handleSyncMigrationData(payload: any) {
-  const { sourcePath, targetPath, username } = payload;
-  if (!sourcePath || !targetPath || !username) {
+  if (!payload?.sourcePath || !payload?.targetPath || !payload?.username) {
     throw new Error('sourcePath, targetPath, and username are required for sync');
+  }
+  // Backup contents originate from a foreign host, so paths/username are
+  // untrusted. Validate the username and escape every value before shell use.
+  const username = validateUsername(payload.username);
+  const sourcePath = String(payload.sourcePath);
+  const targetPath = String(payload.targetPath);
+  if (/[\r\n\x00]/.test(sourcePath) || /[\r\n\x00]/.test(targetPath)) {
+    throw new Error('Illegal character in migration path');
   }
 
   // Ensure target directory exists
@@ -1206,12 +1250,10 @@ async function handleSyncMigrationData(payload: any) {
 
   // Use rsync to move files and preserve permissions/structure
   console.log(`Syncing files from ${sourcePath} to ${targetPath}...`);
-  // Note: sourcePath usually ends with /public_html or similar. 
-  // We append / to sourcePath to copy contents, not the folder itself if that's intended.
-  await execPromise(`rsync -av ${sourcePath}/ ${targetPath}/`);
+  await execPromise(`rsync -av ${shellEscape(sourcePath + '/')} ${shellEscape(targetPath + '/')}`);
 
   // Fix permissions for the new user
-  await execPromise(`chown -R ${username}:${username} ${targetPath}`);
+  await execPromise(`chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(targetPath)}`);
   
   // Cleanup source path if it's in /tmp
   if (sourcePath.includes('/tmp/migrate_')) {
@@ -1282,8 +1324,14 @@ async function handleUpdateResourceUsage(payload: any) {
 }
 
 async function handleCreateDatabase(payload: any) {
-  const { dbName, dbUser, dbPassword } = payload;
-  if (!dbName || !dbUser || !dbPassword) throw new Error('dbName, dbUser, and dbPassword are required');
+  const { dbPassword } = payload;
+  if (!payload?.dbName || !payload?.dbUser || !dbPassword) throw new Error('dbName, dbUser, and dbPassword are required');
+  // Identifiers can't be bound parameters in MySQL — validate to a safe charset
+  // here in the worker (never trust the API to have done it). The password IS
+  // bound as a parameter so it can never break out of the SQL literal.
+  const dbName = validateMysqlIdentifier(payload.dbName, 'dbName');
+  const dbUser = validateMysqlIdentifier(payload.dbUser, 'dbUser');
+  if (typeof dbPassword !== 'string') throw new Error('dbPassword must be a string');
 
   const connection = await mysql.createConnection({
     host: 'localhost',
@@ -1293,7 +1341,7 @@ async function handleCreateDatabase(payload: any) {
 
   try {
     await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\``);
-    await connection.query(`CREATE USER IF NOT EXISTS '${dbUser}'@'localhost' IDENTIFIED BY '${dbPassword}'`);
+    await connection.query(`CREATE USER IF NOT EXISTS '${dbUser}'@'localhost' IDENTIFIED BY ?`, [dbPassword]);
     await connection.query(`GRANT ALL PRIVILEGES ON \`${dbName}\`.* TO '${dbUser}'@'localhost'`);
     await connection.query('FLUSH PRIVILEGES');
     console.log(`Database ${dbName} and user ${dbUser} created successfully.`);
@@ -1325,8 +1373,9 @@ async function handleChangeDbPassword(payload: any) {
 }
 
 async function handleDeleteDatabase(payload: any) {
-  const { dbName, dbUser } = payload;
-  if (!dbName || !dbUser) throw new Error('dbName and dbUser are required');
+  if (!payload?.dbName || !payload?.dbUser) throw new Error('dbName and dbUser are required');
+  const dbName = validateMysqlIdentifier(payload.dbName, 'dbName');
+  const dbUser = validateMysqlIdentifier(payload.dbUser, 'dbUser');
 
   const connection = await mysql.createConnection({
     host: 'localhost',
@@ -1633,12 +1682,25 @@ server {
 }
 
 async function handleInstallWordPress(payload: any) {
-  const { domainName, username, dbName, dbUser, dbPassword, siteTitle, adminUser, adminPassword, adminEmail } = payload;
-  
-  if (!domainName || !username || !dbName) throw new Error('Missing required fields for WordPress installation');
+  const { dbName: rawDbName, dbUser: rawDbUser, dbPassword, siteTitle, adminUser, adminPassword, adminEmail } = payload;
+
+  // Validate identifiers that flow into shell/SQL. execFile arrays neutralise
+  // the remaining free-text values (title/password/email), so they can't break
+  // out into a shell.
+  const username = validateUsername(payload?.username);
+  const domainName = validateDomainName(payload?.domainName);
+  const dbName = validateMysqlIdentifier(rawDbName, 'dbName');
+  const dbUser = validateMysqlIdentifier(rawDbUser, 'dbUser');
+  if (typeof dbPassword !== 'string' || !dbPassword) throw new Error('dbPassword required');
+  if (typeof adminUser !== 'string' || !/^[a-zA-Z0-9._@\-]{1,60}$/.test(adminUser)) throw new Error('Invalid admin user');
+  if (typeof adminPassword !== 'string' || adminPassword.length < 8) throw new Error('Admin password too short');
+  if (typeof adminEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) throw new Error('Invalid admin email');
+  const title = typeof siteTitle === 'string' && siteTitle.trim() ? siteTitle.slice(0, 200) : domainName;
 
   const docRoot = `/home/${username}/public_html/${domainName}`;
-  const wpCli = `sudo -u ${username} wp --path=${docRoot}`;
+  // Run wp-cli as the hosting user via execFile (argument array, no shell).
+  const wp = (...args: string[]) =>
+    execFilePromise('sudo', ['-u', username, 'wp', `--path=${docRoot}`, ...args]);
 
   try {
     // 1. Ensure DB exists (reuse create DB logic)
@@ -1646,11 +1708,12 @@ async function handleInstallWordPress(payload: any) {
 
     // 2. Download and config WP
     console.log(`Starting WordPress installation in ${docRoot}...`);
-    await execPromise(`${wpCli} core download`);
-    await execPromise(`${wpCli} config create --dbname=${dbName} --dbuser=${dbUser} --dbpass=${dbPassword} --dbhost=localhost`);
-    
+    await wp('core', 'download');
+    await wp('config', 'create', `--dbname=${dbName}`, `--dbuser=${dbUser}`, `--dbpass=${dbPassword}`, '--dbhost=localhost');
+
     // 3. Install core
-    await execPromise(`${wpCli} core install --url=http://${domainName} --title="${siteTitle}" --admin_user="${adminUser}" --admin_password="${adminPassword}" --admin_email="${adminEmail}"`);
+    await wp('core', 'install', `--url=http://${domainName}`, `--title=${title}`,
+      `--admin_user=${adminUser}`, `--admin_password=${adminPassword}`, `--admin_email=${adminEmail}`);
 
     // 4. Update Nginx configuration for WordPress routing
     let template = await fs.readFile(path.join(process.cwd(), 'src/templates/nginx.conf.tplt'), 'utf8');
@@ -1881,9 +1944,19 @@ async function handleSyncFtp(payload: any) {
   }
 }
 
+// Reject anything that could inject extra lines/directives into a BIND zone
+// file. Newlines and control chars are the zone-file injection vector.
+function sanitizeZoneField(value: unknown, label: string): string {
+  const s = String(value ?? '');
+  if (/[\r\n\x00-\x1f\x7f]/.test(s)) throw new Error(`Illegal control character in DNS ${label}`);
+  return s;
+}
+
 async function handleSyncDnsZone(payload: any) {
-  const { zoneId, domainName } = payload;
-  if (!zoneId || !domainName) throw new Error('zoneId and domainName are required');
+  const { zoneId } = payload;
+  if (!zoneId || !payload?.domainName) throw new Error('zoneId and domainName are required');
+  // Validate before any shell/file use — guarantees no metacharacters/newlines.
+  const domainName = validateDomainName(payload.domainName);
 
   try {
     // 1. Fetch Zone and Records
@@ -1916,15 +1989,17 @@ async function handleSyncDnsZone(payload: any) {
 
     // 4. Generate Record Lines
     const recordLines = records.map((r: any) => {
-      const name = r.name === '@' ? '' : r.name;
-      const priority = r.priority ? `\t${r.priority}` : '';
-      const ttl = r.ttl ? `\t${r.ttl}` : '';
+      const type = validateDnsType(r.type);
+      const rawName = sanitizeZoneField(r.name, 'record name');
+      const name = rawName === '@' ? '' : rawName;
+      const priority = r.priority ? `\t${parseInt(r.priority, 10)}` : '';
+      const ttl = r.ttl ? `\t${parseInt(r.ttl, 10)}` : '';
 
-      // TXT records must be quoted and split into ≤255-byte chunks for BIND
-      let content = r.content as string;
-      if (r.type === 'TXT') {
-        // Strip any existing outer quotes before re-quoting
-        const raw = content.replace(/^"+|"+$/g, '');
+      let content = sanitizeZoneField(r.content, 'record content');
+      if (type === 'TXT') {
+        // Strip outer quotes, escape embedded backslashes/quotes, then re-quote
+        // and split into ≤255-byte chunks for BIND.
+        const raw = content.replace(/^"+|"+$/g, '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
         const chunkSize = 255;
         if (raw.length <= chunkSize) {
           content = `"${raw}"`;
@@ -1935,27 +2010,51 @@ async function handleSyncDnsZone(payload: any) {
         }
       }
 
-      return `${name}${ttl}\tIN\t${r.type}${priority}\t${content}`;
+      return `${name}${ttl}\tIN\t${type}${priority}\t${content}`;
     }).join('\n');
 
     template = template.replace(/{{RECORDS}}/g, recordLines);
 
-    // 5. Write Zone File
+    // 5. Write Zone File (domainName is validated, so interpolation is safe;
+    // still use the escaped form consistently as defence in depth).
     const safeDomain = shellEscape(domainName);
     const zoneFilePath = `/etc/bind/zones/db.${domainName}`;
+    const tmpZone = `/tmp/db.${domainName}`;
     await execPromise('sudo mkdir -p /etc/bind/zones');
-    await fs.writeFile(`/tmp/db.${domainName}`, template);
-    await execPromise(`sudo mv /tmp/db.${domainName} ${zoneFilePath}`);
+    await fs.writeFile(tmpZone, template);
 
-    // 6. Ensure zone entry exists in named.conf.zones
+    // Validate the generated zone before installing it — a malformed zone
+    // would otherwise break named's reload for every domain.
+    await execPromise(`named-checkzone ${safeDomain} ${shellEscape(tmpZone)}`);
+    await execPromise(`sudo mv ${shellEscape(tmpZone)} ${shellEscape(zoneFilePath)}`);
+
+    // 6. Ensure zone entry exists in named.conf.zones — but ONLY if the zone
+    //    isn't already declared anywhere named includes. A duplicate zone (e.g.
+    //    qc.fyi also declared in named.conf.local) makes named refuse to start,
+    //    taking down DNS for every hosted domain. So check both files first.
     const zonesConfPath = '/etc/bind/named.conf.zones';
-    const zoneEntry = `zone "${domainName}" { type master; file "/etc/bind/zones/db.${domainName}"; };\n`;
+    const zoneDecl = `zone "${domainName}"`;
     let zonesConf = '';
     try { zonesConf = await fs.readFile(zonesConfPath, 'utf8'); } catch { /* file may not exist yet */ }
-    if (!zonesConf.includes(`zone "${domainName}"`)) {
-      await fs.appendFile(`/tmp/named.conf.zones.tmp`, zoneEntry);
-      await execPromise(`cat ${zonesConfPath} /tmp/named.conf.zones.tmp | sudo tee ${zonesConfPath} > /dev/null`);
-      await execPromise(`rm -f /tmp/named.conf.zones.tmp`);
+    let localConf = '';
+    try { localConf = await fs.readFile('/etc/bind/named.conf.local', 'utf8'); } catch { /* optional */ }
+
+    if (!zonesConf.includes(zoneDecl) && !localConf.includes(zoneDecl)) {
+      const zoneEntry = `zone "${domainName}" { type master; file "/etc/bind/zones/db.${domainName}"; };\n`;
+      // Back up so we can roll back if the result fails validation.
+      await execPromise(`sudo cp -p ${zonesConfPath} ${zonesConfPath}.bak`).catch(() => {});
+      const tmpZonesConf = '/tmp/named.conf.zones.new';
+      await fs.writeFile(tmpZonesConf, zonesConf + (zonesConf.endsWith('\n') || !zonesConf ? '' : '\n') + zoneEntry);
+      await execPromise(`sudo mv ${shellEscape(tmpZonesConf)} ${zonesConfPath}`);
+
+      // Validate the whole BIND config; if it's now broken, roll back rather
+      // than leave named unable to start.
+      try {
+        await execPromise('sudo named-checkconf');
+      } catch (cfgErr) {
+        await execPromise(`sudo mv ${zonesConfPath}.bak ${zonesConfPath}`).catch(() => {});
+        throw new Error(`named-checkconf failed after adding zone ${domainName}; rolled back: ${(cfgErr as Error).message}`);
+      }
     }
 
     // 7. Reload Bind
@@ -1999,6 +2098,57 @@ async function handleRemoveDnsZone(payload: any) {
   } catch (err) {
     console.error(`Failed to remove DNS zone ${domainName}:`, err);
     throw err;
+  }
+}
+
+// Apply greylisting, DNSBL/RBL rejection, and attachment-extension blocking
+// based on server_settings toggles. Safe to call repeatedly (idempotent).
+async function applyMailSpamInfraConfig() {
+  const settingsRes = await client.query(
+    `SELECT key, value FROM server_settings WHERE key IN
+     ('greylisting_enabled','rbl_enabled','mail_rbls','attachment_blocking_enabled','blocked_attachment_extensions')`
+  ).catch(() => ({ rows: [] as { key: string; value: string }[] }));
+  const s: Record<string, string> = {};
+  for (const row of settingsRes.rows) s[row.key] = row.value;
+
+  // ── Greylisting via postgrey ──────────────────────────────────────────────
+  const greylist = s['greylisting_enabled'] === 'true';
+  if (greylist) {
+    await execPromise('sudo apt-get install -y postgrey').catch(() => {});
+    await execPromise('sudo systemctl enable --now postgrey').catch(() => {});
+  }
+
+  // ── RBL / DNSBL rejection ─────────────────────────────────────────────────
+  const rblEnabled = s['rbl_enabled'] === 'true';
+  const rblZones = (s['mail_rbls'] ?? '')
+    .split(',').map(z => z.trim())
+    .filter(z => /^[a-zA-Z0-9.\-]+$/.test(z)); // reject anything non-hostname
+
+  // Build smtpd_recipient_restrictions in a fixed, safe order.
+  const restrictions = ['permit_mynetworks', 'permit_sasl_authenticated'];
+  if (greylist) restrictions.push('check_policy_service inet:127.0.0.1:10023');
+  if (rblEnabled) for (const z of rblZones) restrictions.push(`reject_rbl_client ${z}`);
+  restrictions.push('permit');
+  await execPromise(`sudo postconf -e ${shellEscape('smtpd_recipient_restrictions = ' + restrictions.join(', '))}`);
+
+  // ── Attachment / dangerous-extension blocking ─────────────────────────────
+  const attachEnabled = s['attachment_blocking_enabled'] === 'true';
+  if (attachEnabled) {
+    const exts = (s['blocked_attachment_extensions'] ?? '')
+      .split(',').map(e => e.trim().toLowerCase())
+      .filter(e => /^[a-z0-9]{1,10}$/.test(e));
+    if (exts.length) {
+      const body = [
+        '# Superhost-managed — block dangerous attachment extensions',
+        `/^[^>]*name\\s*=\\s*"?[^"]*\\.(${exts.join('|')})"?\\s*$/  REJECT Attachment type .$1 not allowed for security reasons`,
+      ].join('\n');
+      const tmp = '/tmp/superhost_mime_header_checks';
+      await fs.writeFile(tmp, body + '\n');
+      await execPromise(`sudo mv ${shellEscape(tmp)} /etc/postfix/mime_header_checks`);
+      await execPromise('sudo postconf -e mime_header_checks=pcre:/etc/postfix/mime_header_checks');
+    }
+  } else {
+    await execPromise('sudo postconf -e mime_header_checks=').catch(() => {});
   }
 }
 
@@ -2072,6 +2222,10 @@ async function handleConfigureMailServer() {
       await execPromise(`sudo postconf -e ${shellEscape(setting)}`);
     }
 
+    // 2b. Admin-configurable anti-spam infrastructure (greylisting, RBLs,
+    //     attachment blocking) driven by server_settings keys (migration 021).
+    await applyMailSpamInfraConfig();
+
     // 3. Deploy Dovecot 2.4 SQL auth config (auth-sql.conf.ext)
     //    Correct Dovecot 2.4 format: sql_driver at top level, named pgsql block,
     //    BLF-CRYPT scheme (Dovecot's name for bcrypt / Blowfish-Crypt).
@@ -2134,6 +2288,10 @@ sieve_script personal {
   driver = file
   path = ~/.dovecot.sieve
 }
+
+# editheader lets per-user "tag" rules prepend [SPAM] to the Subject.
+# variables is enabled by default but we list it for clarity.
+sieve_extensions = +editheader +variables
 `;
     const tempQuota = '/tmp/91-superhost-plugins.conf';
     await fs.writeFile(tempQuota, dovecotPlugins);
@@ -2170,9 +2328,27 @@ protocol lmtp {
     await execPromise('sudo chown -R vmail:vmail /var/mail');
     await execPromise('sudo chmod -R 770 /var/mail');
 
-    // 6. SpamAssassin
+    // 6. SpamAssassin — managed local.cf. Crucially, add X-Spam-Level to ALL
+    // mail (not just mail above the global score) so per-mailbox sieve
+    // thresholds below the global required_score still work. report_safe 0
+    // keeps the original message intact (no MIME wrapping) for quarantine.
+    const saLocalCf = `# Superhost-managed — do not edit by hand
+required_score 5.0
+report_safe 0
+add_header all Level _STARS(*)_
+add_header all Status _YESNO_, score=_SCORE_ required=_REQD_ tests=_TESTS_
+rewrite_header Subject [SPAM]
+use_bayes 1
+bayes_auto_learn 1
+`;
+    const tempSa = '/tmp/superhost-spamassassin.cf';
+    await fs.writeFile(tempSa, saLocalCf);
+    await execPromise(`sudo mv ${tempSa} /etc/spamassassin/local.cf`).catch((e) =>
+      console.warn('Could not write SpamAssassin local.cf:', (e as Error).message));
     await execPromise('sudo systemctl enable spamassassin').catch(() => {});
-    await execPromise('sudo systemctl start spamassassin').catch(() => {});
+    await execPromise('sudo systemctl restart spamassassin').catch(() =>
+      execPromise('sudo systemctl start spamassassin').catch(() => {}));
+    await execPromise('sudo systemctl restart spamass-milter').catch(() => {});
 
     // 7. Restart services
     await execPromise('sudo postfix check');
@@ -2240,26 +2416,32 @@ function buildSieveScript(opts: {
   email: string;
   spamFilterEnabled: boolean;
   spamAction: string;
+  spamScoreThreshold: number;
   globalAllows: string[];
   globalBlocks: string[];
+  domainAllows: string[];
+  domainBlocks: string[];
   mbAllows: string[];
   mbBlocks: string[];
   arEnabled: boolean;
   arMessage: string;
 }): string {
-  const { email, spamFilterEnabled, spamAction, globalAllows, globalBlocks,
-          mbAllows, mbBlocks, arEnabled, arMessage } = opts;
+  const { email, spamFilterEnabled, spamAction, spamScoreThreshold, globalAllows, globalBlocks,
+          domainAllows, domainBlocks, mbAllows, mbBlocks, arEnabled, arMessage } = opts;
 
-  const allAllows = [...globalAllows, ...mbAllows];
-  const allBlocks = [...globalBlocks, ...mbBlocks];
+  // Precedence (most specific wins): mailbox → domain → global.
+  const allAllows = [...mbAllows, ...domainAllows, ...globalAllows];
+  const allBlocks = [...mbBlocks, ...domainBlocks, ...globalBlocks];
   const needFileinto = spamFilterEnabled && (allBlocks.length > 0 || spamAction === 'quarantine');
   const needEnvelope = spamFilterEnabled && (allAllows.length > 0 || allBlocks.length > 0);
   const needVacation  = arEnabled && !!arMessage?.trim();
+  const needEditheader = spamFilterEnabled && spamAction === 'tag';
 
   const exts: string[] = [];
   if (needFileinto) exts.push('fileinto');
   if (needEnvelope) exts.push('envelope');
   if (needVacation)  exts.push('vacation');
+  if (needEditheader) exts.push('editheader', 'variables');
   if (exts.length === 0) return '';
 
   const lines: string[] = [`require [${exts.map(e => `"${e}"`).join(', ')}];`, ''];
@@ -2277,13 +2459,20 @@ function buildSieveScript(opts: {
     }
     if (allBlocks.length > 0) lines.push('');
 
-    // SpamAssassin flag
+    // Per-mailbox score threshold. SpamAssassin adds an X-Spam-Level header
+    // with one '*' per integer score point; a message scoring >= N therefore
+    // contains a run of N literal stars. :contains matches that substring, so
+    // this honours the user's chosen threshold rather than SA's global score.
     if (spamAction !== 'deliver') {
-      lines.push('if header :contains "X-Spam-Flag" "YES" {');
+      const stars = Math.max(1, Math.min(40, Math.round(spamScoreThreshold || 5)));
+      lines.push(`if header :contains "X-Spam-Level" ${sieveStr('*'.repeat(stars))} {`);
       if (spamAction === 'quarantine') {
         lines.push('  fileinto "Quarantine";', '  stop;');
       } else {
-        // tag — SA already rewrote subject, just keep
+        // tag — prepend [SPAM] to the Subject so it is visible in the inbox
+        lines.push('  if header :matches "Subject" "*" { set "subj" "${1}"; }');
+        lines.push('  deleteheader "Subject";');
+        lines.push('  addheader :last "Subject" "[SPAM] ${subj}";');
         lines.push('  keep;', '  stop;');
       }
       lines.push('}', '');
@@ -2339,10 +2528,10 @@ async function handleSyncSpamRules(payload: any) {
   const { mailUserId } = payload as { mailUserId?: number };
 
   const mailboxRes = await client.query<{
-    id: number; email: string; spam_filter_enabled: boolean;
+    id: number; email: string; domain_id: number; spam_filter_enabled: boolean;
     spam_score_threshold: number; spam_action: string;
   }>(`
-    SELECT id, email, spam_filter_enabled, spam_score_threshold, spam_action
+    SELECT id, email, domain_id, spam_filter_enabled, spam_score_threshold, spam_action
     FROM mail_users
     WHERE ($1::int IS NULL OR id = $1)
   `, [mailUserId ?? null]);
@@ -2353,6 +2542,22 @@ async function handleSyncSpamRules(payload: any) {
   const globalAllows = globalRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
   const globalBlocks = globalRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
 
+  // Cache per-domain rules so repeated mailboxes in the same domain hit it once.
+  const domainRuleCache = new Map<number, { allows: string[]; blocks: string[] }>();
+  const getDomainRules = async (domainId: number) => {
+    if (domainRuleCache.has(domainId)) return domainRuleCache.get(domainId)!;
+    const dr = await client.query<{ sender_pattern: string; access_type: string }>(
+      'SELECT sender_pattern, access_type FROM mail_domain_rules WHERE domain_id = $1',
+      [domainId],
+    ).catch(() => ({ rows: [] as { sender_pattern: string; access_type: string }[] }));
+    const rules = {
+      allows: dr.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern),
+      blocks: dr.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern),
+    };
+    domainRuleCache.set(domainId, rules);
+    return rules;
+  };
+
   for (const mailbox of mailboxRes.rows) {
     try {
       const mbRes = await client.query<{ sender_pattern: string; access_type: string }>(
@@ -2361,6 +2566,7 @@ async function handleSyncSpamRules(payload: any) {
       );
       const mbAllows = mbRes.rows.filter(r => r.access_type === 'allow').map(r => r.sender_pattern);
       const mbBlocks = mbRes.rows.filter(r => r.access_type === 'block').map(r => r.sender_pattern);
+      const domainRules = await getDomainRules(mailbox.domain_id);
 
       const arRes = await client.query<{ message: string; enabled: boolean }>(
         'SELECT message, enabled FROM mail_autoresponders WHERE mail_user_id = $1',
@@ -2372,7 +2578,10 @@ async function handleSyncSpamRules(payload: any) {
         email: mailbox.email,
         spamFilterEnabled: mailbox.spam_filter_enabled,
         spamAction: mailbox.spam_action ?? 'quarantine',
-        globalAllows, globalBlocks, mbAllows, mbBlocks,
+        spamScoreThreshold: Number(mailbox.spam_score_threshold) || 5,
+        globalAllows, globalBlocks,
+        domainAllows: domainRules.allows, domainBlocks: domainRules.blocks,
+        mbAllows, mbBlocks,
         arEnabled:  ar?.enabled  ?? false,
         arMessage:  ar?.message  ?? '',
       });
@@ -2503,11 +2712,46 @@ async function handleReleaseQuarantine(payload: any) {
     // Mark as released (keep for FP stats; purge job cleans up after 7 days)
     await client.query('UPDATE mail_quarantine SET released_at = NOW() WHERE id = $1', [id]);
 
+    // A released message is a confirmed false-positive → teach Bayes it's ham.
+    await learnMessage(destDir + '/' + fileName, 'ham');
+
     console.log(`Released quarantined email ${id} to ${recipient}.`);
   } catch (err) {
     console.error(`Failed to release quarantine for ${id}:`, err);
     throw err;
   }
+}
+
+/**
+ * Feed a message to SpamAssassin's Bayes classifier. Idempotent: each file path
+ * is learned at most once (tracked in mail_learn_log) so repeated actions don't
+ * skew the corpus. Non-fatal — a learn failure never breaks the caller.
+ */
+async function learnMessage(filePath: string, type: 'ham' | 'spam') {
+  const p = String(filePath ?? '');
+  if (!p || !p.startsWith('/var/mail/vhosts/') || p.includes('..') || /[\r\n\x00]/.test(p)) {
+    console.warn(`learnMessage: refusing suspicious path ${p}`);
+    return;
+  }
+  try {
+    const ins = await client.query(
+      `INSERT INTO mail_learn_log (learn_type, file_path) VALUES ($1, $2)
+       ON CONFLICT (file_path) DO NOTHING RETURNING id`,
+      [type, p],
+    );
+    if (ins.rowCount === 0) return; // already learned
+    await execPromise(`sudo sa-learn --${type} ${shellEscape(p)}`);
+    console.log(`sa-learn --${type} ${p}`);
+  } catch (err) {
+    console.warn(`sa-learn --${type} failed for ${p}: ${(err as Error).message}`);
+  }
+}
+
+// Mark an inbox/quarantine message as spam and retrain Bayes (user "Report spam").
+async function handleLearnSpam(payload: any) {
+  const { filePath } = payload as { filePath?: string };
+  if (!filePath) throw new Error('filePath required');
+  await learnMessage(filePath, 'spam');
 }
 
 function htmlEscape(s: string | null | undefined): string {
@@ -3030,6 +3274,36 @@ async function handleDeleteFile(payload: any) {
   await fs.rm(absolutePath, { recursive: true, force: true });
 }
 
+// Delete a quarantined mail file, then remove its DB row. Quarantine files
+// live under /var/mail/vhosts/<domain>/<user>/.Quarantine and are owned by
+// vmail, so they're outside the file-manager's home-dir sandbox — this handler
+// validates the path is genuinely a quarantine file before rm. Deleting the
+// file BEFORE the row prevents the 5-minute scanner from resurrecting it.
+async function handleDeleteQuarantineFile(payload: any) {
+  const { quarantineId, filePath } = payload as { quarantineId?: number; filePath?: string };
+  const p = String(filePath ?? '');
+
+  // Defence in depth: must be a real quarantine path with no traversal/metachars.
+  const ok = p.startsWith('/var/mail/vhosts/')
+    && p.includes('/.Quarantine/')
+    && !p.includes('..')
+    && !/[\r\n\x00]/.test(p);
+
+  if (p && ok) {
+    // Deleting a quarantined item confirms it as spam → reinforce Bayes before
+    // the file is gone.
+    await learnMessage(p, 'spam');
+    await execPromise(`sudo rm -f ${shellEscape(p)}`).catch((e) =>
+      console.warn(`Quarantine file rm failed for ${p}: ${(e as Error).message}`));
+  } else if (p) {
+    console.warn(`Refusing to delete non-quarantine path: ${p}`);
+  }
+
+  if (quarantineId != null && Number.isInteger(Number(quarantineId))) {
+    await client.query('DELETE FROM mail_quarantine WHERE id = $1', [quarantineId]);
+  }
+}
+
 async function handleZipFiles(payload: any) {
   const username = validateUsername(payload?.username);
   const baseDir = `/home/${username}/public_html`;
@@ -3210,6 +3484,43 @@ async function start() {
     catch (err) { console.error('Refresh mail stats error:', err instanceof Error ? err.message : err); }
   }, 60 * 60 * 1000);
   handleRefreshMailStats().catch(err => console.error('Initial mail stats error:', err));
+
+  // Enforce quarantine retention (30-day expiry, 7-day post-release) daily,
+  // plus once shortly after startup. Without this, quarantine grows forever.
+  setInterval(async () => {
+    try { await handlePurgeExpiredQuarantine(); }
+    catch (err) { console.error('Quarantine purge error:', err instanceof Error ? err.message : err); }
+  }, 24 * 60 * 60 * 1000);
+  handlePurgeExpiredQuarantine().catch(err => console.error('Initial quarantine purge error:', err));
+
+  // Purge expired token-blocklist + FIDO2 challenge rows daily so they don't
+  // accumulate (the blocklist only needs entries until the token's own expiry).
+  setInterval(async () => {
+    try {
+      await client.query('DELETE FROM token_blocklist WHERE expires_at < NOW()');
+      await client.query('DELETE FROM fido2_challenges WHERE expires_at < NOW()').catch(() => {});
+    } catch (err) { console.error('Token blocklist cleanup error:', err instanceof Error ? err.message : err); }
+  }, 24 * 60 * 60 * 1000);
+
+  // Daily spam digest. Checked hourly but guarded by a stored date so it fires
+  // at most once per UTC day regardless of how often the worker restarts.
+  const maybeSendDailyDigest = async () => {
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+    const res = await client.query(
+      "SELECT value FROM server_settings WHERE key = 'last_spam_digest_date'"
+    ).catch(() => ({ rows: [] as { value: string }[] }));
+    if (res.rows[0]?.value === today) return;
+    await client.query(
+      `INSERT INTO server_settings (key, value) VALUES ('last_spam_digest_date', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [today]
+    );
+    await handleSendSpamDigest({});
+  };
+  setInterval(() => {
+    maybeSendDailyDigest().catch(err =>
+      console.error('Spam digest error:', err instanceof Error ? err.message : err));
+  }, 60 * 60 * 1000);
 
   collectMetrics().catch(err => console.error('Initial collectMetrics error:', err));
   collectTrafficStats().catch(err => console.error('Initial collectTrafficStats error:', err));
@@ -3783,6 +4094,31 @@ try:
 except Exception as e:
     print(json.dumps({'error': str(e), 'users': [], 'debug': debug})); raise SystemExit(1)
 
+# Linux password hashes from /etc/shadow (requires root on source; skipped gracefully).
+# These are one-way crypt hashes ($6$/$2y$/etc) — re-applied verbatim on the new host.
+shadow = {}
+try:
+    with open('/etc/shadow') as f:
+        for line in f:
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[1] and parts[1] not in ('*','!','!!',''):
+                shadow[parts[0]] = parts[1]
+except Exception as e:
+    sh_errors.append(('shadow', str(e)[:120]))
+
+# Email mailbox password hashes from CWP's mail DB. Maps full email -> hash.
+mail_pw = {}
+for mdb in ['postfix','vmail','mail','roundcube']:
+    raw_mpw = sh(['mysql', mdb, '-N', '-e', 'SELECT username, password FROM mailbox'])
+    if raw_mpw:
+        for ln in raw_mpw.split('\\n'):
+            cols = ln.split('\\t')
+            if len(cols) >= 2 and '@' in cols[0] and cols[1].strip():
+                mail_pw[cols[0].strip()] = cols[1].strip()
+        if mail_pw: break
+debug['shadow_count'] = len(shadow)
+debug['mail_pw_count'] = len(mail_pw)
+
 result = []
 for uname, home in raw_users:
     # Read CWP user.conf for email and primary domain
@@ -4087,7 +4423,7 @@ for uname, home in raw_users:
                     addr = mbox+'@'+dom_dir
                     if addr not in seen_e:
                         seen_e.add(addr)
-                        email_accs.append({'email':addr,'domain':dom_dir,'quota_mb':1024})
+                        email_accs.append({'email':addr,'domain':dom_dir,'quota_mb':1024,'password_hash':mail_pw.get(addr,'')})
         except: pass
 
     # Fallback: file-based virtual mailbox lists (/etc/virtual, /etc/dovecot/virtual)
@@ -4109,11 +4445,11 @@ for uname, home in raw_users:
                                     seen_e.add(addr)
                                     em_dom = addr.split('@')[1]
                                     if em_dom not in dom_set: continue  # can't attribute to this user
-                                    email_accs.append({'email':addr,'domain':em_dom,'quota_mb':1024})
+                                    email_accs.append({'email':addr,'domain':em_dom,'quota_mb':1024,'password_hash':mail_pw.get(addr,'')})
                         except: pass
             except: pass
 
-    result.append({'username':uname,'email':email,'home_dir':home,'disk_usage_mb':disk_mb,'domains':domains,'databases':dbs,'email_accounts':email_accs})
+    result.append({'username':uname,'email':email,'home_dir':home,'disk_usage_mb':disk_mb,'domains':domains,'databases':dbs,'email_accounts':email_accs,'password_hash':shadow.get(uname,'')})
 
 print(json.dumps({'users':result,'debug':debug,'discovered_at':datetime.utcnow().isoformat()+'Z','remote_host':socket.gethostname()}))
 CWPEOF
@@ -4244,6 +4580,38 @@ async function patchCmsDbConfig(configPath: string, dbUser: string, dbPass: stri
   }
 }
 
+// Convert a migrated mailbox password hash into a form Dovecot accepts via the
+// SQL passdb. Dovecot needs an explicit {SCHEME} prefix when the hash isn't in
+// the configured default scheme (BLF-CRYPT). Returns null for unknown formats
+// so the caller can fall back to a placeholder rather than store garbage.
+function normalizeMailHash(h?: string): string | null {
+  if (!h || typeof h !== 'string') return null;
+  const v = h.trim();
+  if (!v) return null;
+  if (v.startsWith('{')) return v;                 // already has a Dovecot scheme prefix
+  if (v.startsWith('$6$')) return `{SHA512-CRYPT}${v}`;
+  if (v.startsWith('$5$')) return `{SHA256-CRYPT}${v}`;
+  if (v.startsWith('$2a$') || v.startsWith('$2b$') || v.startsWith('$2y$')) return `{BLF-CRYPT}${v}`;
+  if (v.startsWith('$1$')) return `{MD5-CRYPT}${v}`;
+  return null;
+}
+
+// Mint a single-use, 7-day password-setup token for a user and return the full
+// dashboard URL the user visits to set their panel password. Stores only the
+// token's sha256 hash. Used to onboard migrated users (who have no panel password).
+async function generateSetupLink(userId: number): Promise<string> {
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await client.query(
+    'INSERT INTO password_setup_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+    [userId, tokenHash, expiresAt],
+  );
+  const base = process.env.DASHBOARD_DOMAIN || process.env.MASTER_DOMAIN || 'localhost';
+  const origin = base.startsWith('http') ? base : `https://${base}`;
+  return `${origin}/client/set-password?token=${token}`;
+}
+
 async function handleMigrateCwp(payload: any): Promise<void> {
   const { migrationId, remoteHost, remotePort, remoteUser, selectedUsers, authType, sshPassword, sshKey } = payload;
   const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
@@ -4258,6 +4626,9 @@ async function handleMigrateCwp(payload: any): Promise<void> {
     const usersToMigrate = allUsers.filter((u: any) => (selectedUsers as string[]).includes(u.username));
 
     await cwpLog(migrationId, `Starting migration of ${usersToMigrate.length} user(s)…`);
+
+    // Collected so we can print all set-password links together at the end.
+    const setupLinks: string[] = [];
 
     for (let i = 0; i < usersToMigrate.length; i++) {
       const cwpUser = usersToMigrate[i] as any;
@@ -4291,6 +4662,26 @@ async function handleMigrateCwp(payload: any): Promise<void> {
 
         // System setup (creates Linux user, default DB, staging domain)
         await handleCreateUser({ username, email });
+
+        // Preserve the original Linux password hash (crypt format) so the
+        // user's system password keeps working once SSH/FTP is enabled.
+        const linuxHash = (cwpUser.password_hash as string | undefined)?.trim();
+        if (linuxHash && linuxHash.startsWith('$')) {
+          await execPromise(`echo ${shellEscape(`${username}:${linuxHash}`)} | sudo chpasswd -e`)
+            .then(() => cwpLog(migrationId, `  [${username}] Linux password hash migrated`))
+            .catch((e) => cwpLog(migrationId, `  [${username}] Could not set Linux password: ${(e as Error).message}`));
+        }
+
+        // Migrated users have no dashboard password — generate a one-time
+        // set-password link they can use to set one.
+        try {
+          const link = await generateSetupLink(userId);
+          setupLinks.push(`${username}: ${link}`);
+          await cwpLog(migrationId, `  [${username}] Set-password link (7-day, single-use): ${link}`);
+        } catch (e) {
+          await cwpLog(migrationId, `  [${username}] Could not generate set-password link: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
         await cwpLog(migrationId, `  [${username}] Superhost account created`);
       }
 
@@ -4443,12 +4834,17 @@ async function handleMigrateCwp(payload: any): Promise<void> {
           );
           const domainId = mdRes.rows[0].id as number;
 
-          // Create mail_users record (no password — admin must set one)
+          // Migrate the mailbox password hash so IMAP/SMTP/webmail keep working;
+          // fall back to a placeholder the admin must replace if none was found.
+          const mailHash = normalizeMailHash(acc.password_hash as string | undefined) ?? '$MIGRATED$';
           await client.query(
             `INSERT INTO mail_users (domain_id, email, password_hash, quota)
              VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING`,
-            [domainId, emailAddr, '$MIGRATED$', acc.quota_mb ?? 1024]
+            [domainId, emailAddr, mailHash, acc.quota_mb ?? 1024]
           );
+          if (mailHash !== '$MIGRATED$') {
+            await cwpLog(migrationId, `  [${username}] Mailbox password migrated for ${emailAddr}`);
+          }
 
           // Provision the Dovecot mailbox directory
           await handleProvisionMailbox({ email: emailAddr });
@@ -4482,6 +4878,11 @@ async function handleMigrateCwp(payload: any): Promise<void> {
       [migrationId]
     );
     await cwpLog(migrationId, `All ${usersToMigrate.length} user(s) migrated successfully.`);
+
+    if (setupLinks.length) {
+      await cwpLog(migrationId, '━━━ Set-password links (send one to each user; 7-day, single-use) ━━━');
+      for (const l of setupLinks) await cwpLog(migrationId, `  ${l}`);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await client.query(

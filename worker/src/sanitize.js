@@ -385,9 +385,10 @@ export function validateDnsType(type) {
 // ---------------------------------------------------------------------------
 // Redact sensitive fields from log output
 // ---------------------------------------------------------------------------
-const SENSITIVE_KEYS = new Set([
+export const SENSITIVE_KEYS = new Set([
     'password', 'dbPassword', 'adminPassword', 'dbPass', 'token',
     'secret', 'apiKey', 'api_key', 'webhook_secret', 'private_key',
+    'sshPassword', 'sshKey', 'passwordHash',
 ]);
 export function redactPayload(payload) {
     if (typeof payload !== 'object' || payload === null)

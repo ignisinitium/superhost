@@ -1,28 +1,54 @@
 import React, { useState } from 'react';
 import api from '../api/client';
 import { useNavigate } from 'react-router-dom';
-import { User, Lock, ArrowRight } from 'lucide-react';
+import { User, Lock, ArrowRight, ShieldCheck } from 'lucide-react';
 
 const ClientLogin: React.FC = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [require2FA, setRequire2FA] = useState(false);
+  const [pendingToken, setPendingToken] = useState<string | null>(null);
+  const [twoFACode, setTwoFACode] = useState('');
   const navigate = useNavigate();
+
+  const finishLogin = (data: any) => {
+    localStorage.setItem('token', data.token);
+    localStorage.setItem('user', JSON.stringify(data.user));
+    localStorage.setItem('role', 'client');
+    navigate('/client');
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError('');
-    
+
     try {
       const res = await api.post('/client/auth/login', { username, password });
-      localStorage.setItem('token', res.data.token);
-      localStorage.setItem('user', JSON.stringify(res.data.user));
-      localStorage.setItem('role', 'client');
-      navigate('/client');
+      if (res.data.require2FA) {
+        setRequire2FA(true);
+        setPendingToken(res.data.pendingToken);
+      } else {
+        finishLogin(res.data);
+      }
     } catch (err: any) {
       setError(err.response?.data?.message || 'Login failed. Please check your credentials.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleVerify2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsLoading(true);
+    setError('');
+    try {
+      const res = await api.post('/client/auth/verify-2fa', { token: twoFACode, pendingToken });
+      finishLogin(res.data);
+    } catch (err: any) {
+      setError(err.response?.data?.message || 'Invalid verification code.');
     } finally {
       setIsLoading(false);
     }
@@ -51,6 +77,34 @@ const ClientLogin: React.FC = () => {
           </div>
         )}
 
+        {require2FA ? (
+          <form onSubmit={handleVerify2FA} className="space-y-6">
+            <div className="space-y-2">
+              <label className="block text-slate-300 mb-2 text-sm font-medium">Authentication code</label>
+              <div className="relative">
+                <ShieldCheck className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoFocus
+                  className="w-full bg-slate-900/50 border border-slate-700 rounded-xl py-3 pl-10 pr-4 text-white tracking-[0.3em] placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 transition-all"
+                  value={twoFACode}
+                  onChange={(e) => setTwoFACode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="123456"
+                  required
+                />
+              </div>
+              <p className="text-slate-500 text-xs">Enter the 6-digit code from your authenticator app.</p>
+            </div>
+            <button
+              type="submit"
+              disabled={isLoading || twoFACode.length !== 6}
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl transition-all duration-300 flex items-center justify-center gap-2 shadow-lg shadow-blue-600/20 disabled:opacity-50"
+            >
+              {isLoading ? 'Verifying...' : 'Verify'}
+            </button>
+          </form>
+        ) : (
         <form onSubmit={handleLogin} className="space-y-6">
           <div className="space-y-2">
             <label className="block text-slate-300 mb-2 text-sm font-medium">Username</label>
@@ -91,6 +145,7 @@ const ClientLogin: React.FC = () => {
             {!isLoading && <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />}
           </button>
         </form>
+        )}
 
         <div className="mt-8 pt-6 border-t border-slate-700/50 text-center">
           <button 

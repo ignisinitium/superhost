@@ -1,5 +1,8 @@
 .env
 .env.local
+# Local secret backups — never commit (contain credentials)
+.env.backup-*
+*.env.backup-*
 node_modules/
 .DS_Store
 # Compiled TS output — not the dashboard Vite build

@@ -4,9 +4,10 @@ import jwt from 'jsonwebtoken';
 import speakeasy from 'speakeasy';
 import QRCode from 'qrcode';
 import { query } from '../db.js';
-import { authenticateAdmin } from '../middleware/auth.js';
+import { authenticateAdmin, signSessionToken } from '../middleware/auth.js';
 import type { AuthRequest } from '../middleware/auth.js';
 import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
+import { revokeCurrentToken, logAudit } from '../audit.js';
 
 function getJwtSecret(): string {
   const secret = process.env.JWT_SECRET;
@@ -39,34 +40,72 @@ router.post('/login', checkIpBlock, async (req, res) => {
     await logLoginAttempt(ip, username, true);
 
     if (admin.two_factor_enabled) {
-      return res.json({ require2FA: true, adminId: admin.id });
+      // Bind the second factor to a verified first factor: issue a short-lived
+      // token that ONLY authorizes /verify-2fa, so the TOTP step can't be hit
+      // standalone by guessing an adminId.
+      const pending = jwt.sign({ id: admin.id, role: 'pending_2fa' }, getJwtSecret(), { expiresIn: '5m' });
+      return res.json({ require2FA: true, adminId: admin.id, pendingToken: pending });
     }
 
-    const token = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
+    const token = signSessionToken({ id: admin.id, role: 'admin' }, '8h');
     res.json({ token, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }
 });
 
-router.post('/verify-2fa', async (req, res) => {
-  const { adminId, token } = req.body;
+router.post('/verify-2fa', checkIpBlock, async (req, res) => {
+  const { token, pendingToken } = req.body;
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
 
   try {
+    // The admin identity comes from the signed pending token from /login,
+    // not from a client-supplied adminId — this both binds to the password
+    // step and prevents skipping the first factor.
+    let adminId: number;
+    try {
+      const decoded = jwt.verify(pendingToken, getJwtSecret()) as { id: number; role: string };
+      if (decoded.role !== 'pending_2fa' || !Number.isInteger(decoded.id)) {
+        return res.status(401).json({ message: 'Invalid or expired 2FA session' });
+      }
+      adminId = decoded.id;
+    } catch {
+      return res.status(401).json({ message: 'Invalid or expired 2FA session' });
+    }
+
     const result = await query('SELECT * FROM admins WHERE id = $1', [adminId]);
     if (result.rows.length === 0) return res.status(401).json({ message: 'Invalid admin' });
 
     const admin = result.rows[0];
+    if (!admin.two_factor_enabled || !admin.two_factor_secret) {
+      return res.status(400).json({ message: '2FA is not enabled for this account' });
+    }
+
     const verified = speakeasy.totp.verify({
       secret: admin.two_factor_secret,
       encoding: 'base32',
-      token
+      token,
+      window: 1,
     });
 
-    if (!verified) return res.status(401).json({ message: 'Invalid 2FA token' });
+    if (!verified) {
+      await logLoginAttempt(ip, admin.username, false);
+      return res.status(401).json({ message: 'Invalid 2FA token' });
+    }
 
-    const jwtToken = jwt.sign({ id: admin.id, role: 'admin' }, getJwtSecret(), { expiresIn: '8h' });
+    await logLoginAttempt(ip, admin.username, true);
+    const jwtToken = signSessionToken({ id: admin.id, role: 'admin' }, '8h');
     res.json({ token: jwtToken, admin: { id: admin.id, username: admin.username } });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.post('/logout', authenticateAdmin, async (req: AuthRequest, res) => {
+  try {
+    await revokeCurrentToken(req);
+    await logAudit(req, 'admin.logout');
+    res.json({ message: 'Logged out' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

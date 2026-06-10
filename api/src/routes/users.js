@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
+import { logAudit } from '../audit.js';
 const router = express.Router();
 router.use(authenticateAdmin);
 router.get('/', async (_req, res) => {
@@ -51,6 +52,7 @@ router.post('/', async (req, res) => {
             package_id ?? null]);
         const user = result.rows[0];
         await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CREATE_USER', { username: finalUsername }]);
+        await logAudit(req, 'user.create', { targetType: 'user', targetId: user.id, metadata: { username: finalUsername } });
         res.status(201).json(user);
     }
     catch (err) {
@@ -97,6 +99,10 @@ router.put('/:id', async (req, res) => {
         }
         if (result.rows.length === 0)
             return res.status(404).json({ message: 'User not found' });
+        if (password) {
+            const username = result.rows[0].username;
+            await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SET_LINUX_PASSWORD', { username, password }]);
+        }
         res.json(result.rows[0]);
     }
     catch (err) {
@@ -121,6 +127,27 @@ router.put('/:id/ssh', async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+// Generate a one-time set-password link for a user (e.g. after migration, when
+// they have no dashboard password yet). Returns the raw token ONCE — store the
+// hash only — for the admin to hand to the user. Valid for 7 days, single-use.
+router.post('/:id/setup-link', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const u = await query('SELECT id, username FROM users WHERE id = $1', [id]);
+        if (u.rows.length === 0)
+            return res.status(404).json({ message: 'User not found' });
+        const token = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        await query('INSERT INTO password_setup_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)', [id, tokenHash, expiresAt]);
+        await logAudit(req, 'user.setup_link', { targetType: 'user', targetId: String(id), metadata: { username: u.rows[0].username } });
+        // Return the relative path; the dashboard prepends its own origin.
+        res.json({ token, path: `/client/set-password?token=${token}`, expiresAt });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     try {
@@ -128,6 +155,7 @@ router.delete('/:id', async (req, res) => {
         if (userRes.rows.length === 0)
             return res.status(404).json({ message: 'User not found' });
         const taskRes = await query('INSERT INTO tasks (command, payload) VALUES ($1, $2) RETURNING id', ['ARCHIVE_AND_DELETE_USER', { userId: parseInt(id) }]);
+        await logAudit(req, 'user.delete', { targetType: 'user', targetId: id, metadata: { username: userRes.rows[0].username } });
         res.json({ message: 'User archival and deletion queued', taskId: taskRes.rows[0].id });
     }
     catch (err) {

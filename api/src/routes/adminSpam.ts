@@ -442,4 +442,54 @@ router.post('/digest/:mailUserId', async (req, res) => {
   }
 });
 
+// ── Anti-spam infrastructure settings (greylisting / RBL / attachment) ───────
+
+const INFRA_KEYS = [
+  'greylisting_enabled', 'rbl_enabled', 'mail_rbls',
+  'attachment_blocking_enabled', 'blocked_attachment_extensions',
+] as const;
+
+router.get('/settings', async (_req, res) => {
+  try {
+    const result = await query(
+      `SELECT key, value FROM server_settings WHERE key = ANY($1)`,
+      [INFRA_KEYS as unknown as string[]],
+    );
+    const settings: Record<string, string> = {};
+    for (const row of result.rows as { key: string; value: string }[]) settings[row.key] = row.value;
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.put('/settings', async (req, res) => {
+  const body = req.body as Record<string, unknown>;
+  try {
+    for (const key of INFRA_KEYS) {
+      if (body[key] === undefined) continue;
+      let value = String(body[key]);
+      // Validate the free-text lists so they can't inject hostnames/extensions
+      // that later land in Postfix config.
+      if (key === 'mail_rbls') {
+        value = value.split(',').map(z => z.trim()).filter(z => /^[a-zA-Z0-9.\-]+$/.test(z)).join(',');
+      } else if (key === 'blocked_attachment_extensions') {
+        value = value.split(',').map(e => e.trim().toLowerCase()).filter(e => /^[a-z0-9]{1,10}$/.test(e)).join(',');
+      } else {
+        value = value === 'true' ? 'true' : 'false';
+      }
+      await query(
+        `INSERT INTO server_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [key, value],
+      );
+    }
+    // Re-apply mail config so changes take effect.
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CONFIGURE_MAIL_SERVER', {}]);
+    res.json({ message: 'Spam infrastructure settings updated' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 export default router;

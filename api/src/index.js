@@ -6,6 +6,7 @@ import { query } from './db.js';
 import { globalErrorHandler } from './middleware/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import clientAuthRoutes from './routes/clientAuth.js';
+import mailAuthRoutes from './routes/mailAuth.js';
 import clientDomainsRoutes from './routes/clientDomains.js';
 import userRoutes from './routes/users.js';
 import domainRoutes from './routes/domains.js';
@@ -43,6 +44,8 @@ import adminSpamRoutes from './routes/adminSpam.js';
 import adminAppsRoutes from './routes/adminApps.js';
 import adminDeletedUsersRoutes from './routes/adminDeletedUsers.js';
 import systemRoutes from './routes/system.js';
+import adminMigrationsRoutes from './routes/adminMigrations.js';
+import auditLogRoutes from './routes/auditLog.js';
 dotenv.config();
 // Validate critical environment variables at startup
 if (!process.env.JWT_SECRET) {
@@ -75,12 +78,23 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
     : ['http://localhost:5173', 'http://localhost:4173'];
 app.use(cors({
-    origin: (origin, callback) => {
-        // Allow requests with no origin (server-to-server, curl, mobile apps)
+    origin: async (origin, callback) => {
         if (!origin)
             return callback(null, true);
         if (allowedOrigins.includes(origin))
             return callback(null, true);
+        // Dynamically allow https://spam.<domain> for any registered mail domain
+        const spamMatch = origin.match(/^https:\/\/spam\.(.+)$/);
+        if (spamMatch) {
+            try {
+                const res = await query('SELECT 1 FROM mail_domains WHERE domain_name = $1', [spamMatch[1]]);
+                if (res.rowCount && res.rowCount > 0)
+                    return callback(null, true);
+            }
+            catch {
+                // fall through to deny
+            }
+        }
         return callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
     credentials: true,
@@ -95,6 +109,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/client/auth', clientAuthRoutes);
+app.use('/api/mail-auth', mailAuthRoutes);
 app.use('/api/client/domains', clientDomainsRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/domains', domainRoutes);
@@ -124,9 +139,12 @@ app.use('/api/admin/nameservers', adminNameserversRoutes);
 app.use('/api/admin/reseller', resellerRoutes);
 app.use('/api/admin/email', adminEmailRoutes);
 app.use('/api/admin/spam', adminSpamRoutes);
+app.use('/api/spam', adminSpamRoutes);
 app.use('/api/admin/apps', adminAppsRoutes);
 app.use('/api/admin/deleted-users', adminDeletedUsersRoutes);
 app.use('/api/admin/system', systemRoutes);
+app.use('/api/admin/migrations', adminMigrationsRoutes);
+app.use('/api/admin/audit', auditLogRoutes);
 app.use('/api/client/files', filesRoutes);
 app.use('/api/client/git', gitRoutes);
 app.use('/api/client/cron', cronRoutes);

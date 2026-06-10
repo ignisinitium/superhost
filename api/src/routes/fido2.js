@@ -2,6 +2,7 @@ import express from 'express';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse, } from '@simplewebauthn/server';
 import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
+import { checkIpBlock } from '../middleware/rateLimiter.js';
 import jwt from 'jsonwebtoken';
 const router = express.Router();
 // RP_ID is the domain used for WebAuthn. Defaults to the hostname if not set.
@@ -88,12 +89,14 @@ router.post('/register-verify', authenticateAdmin, async (req, res) => {
         res.status(400).json({ message: err.message });
     }
 });
-router.post('/login-options', async (req, res) => {
+router.post('/login-options', checkIpBlock, async (req, res) => {
     const { username } = req.body;
     try {
         const adminRes = await query('SELECT id FROM admins WHERE username = $1', [username]);
+        // Use a uniform 404 message identical to a malformed request so this can't
+        // be used as a username-enumeration oracle.
         if (adminRes.rows.length === 0)
-            return res.status(404).json({ message: 'Admin not found' });
+            return res.status(404).json({ message: 'No passkey available' });
         const adminId = adminRes.rows[0].id;
         const credsRes = await query('SELECT credential_id FROM admin_fido_credentials WHERE admin_id = $1', [adminId]);
         const allowCredentials = credsRes.rows.map(row => ({
@@ -113,7 +116,7 @@ router.post('/login-options', async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
-router.post('/login-verify', async (req, res) => {
+router.post('/login-verify', checkIpBlock, async (req, res) => {
     const { body, adminId } = req.body;
     const expectedChallenge = await getChallenge(adminId);
     if (!expectedChallenge)

@@ -405,9 +405,14 @@ const UserSettingsPage: React.FC = () => {
               </p>
               <p className="text-xs text-slate-400">
                 {user?.ssh_enabled
-                  ? `${user.username} can log in via SSH with a full bash shell.`
+                  ? `${user.username} can log in via SSH. Ensure a password is set below.`
                   : `${user?.username}'s shell is set to nologin — SSH login is blocked.`}
               </p>
+              {user?.ssh_enabled && (
+                <p className="text-xs text-amber-600 font-medium mt-1">
+                  SSH uses the account password — set one in Profile &amp; Security above if not already done.
+                </p>
+              )}
             </div>
             <button
               type="button"

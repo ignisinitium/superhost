@@ -49,5 +49,6 @@ export declare function validateCronCommand(command: unknown): string;
 export declare function validateLineCount(lines: unknown, max?: number): number;
 export declare function validatePhpVersion(version: unknown): string;
 export declare function validateDnsType(type: unknown): string;
+export declare const SENSITIVE_KEYS: Set<string>;
 export declare function redactPayload(payload: unknown): unknown;
 //# sourceMappingURL=sanitize.d.ts.map

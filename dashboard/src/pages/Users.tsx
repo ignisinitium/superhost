@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box, Network } from 'lucide-react';
+import { UserPlus, Mail, User as UserIcon, Calendar, Globe, Settings as SettingsIcon, AlertCircle, Database, LogIn, Box, Network, KeyRound, Copy, Check } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { User } from '../../../shared/types';
 import toast from 'react-hot-toast';
@@ -13,6 +13,23 @@ const UsersPage: React.FC = () => {
   const [newUsername, setNewUsername] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [impersonating, setImpersonating] = useState<number | null>(null);
+  const [setupLink, setSetupLink] = useState<{ username: string; url: string } | null>(null);
+  const [generatingLink, setGeneratingLink] = useState<number | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const handleGenerateSetupLink = async (user: User) => {
+    setGeneratingLink(user.id);
+    try {
+      const res = await api.post(`/users/${user.id}/setup-link`);
+      const url = `${window.location.origin}${res.data.path}`;
+      setSetupLink({ username: user.username, url });
+      setCopied(false);
+    } catch (err: any) {
+      toast.error(err.response?.data?.message || 'Failed to generate link');
+    } finally {
+      setGeneratingLink(null);
+    }
+  };
 
   const { data: users, isLoading, error: queryError } = useQuery<User[]>({
     queryKey: ['users'],
@@ -169,6 +186,14 @@ const UsersPage: React.FC = () => {
                   <LogIn size={13} />
                   {impersonating === user.id ? 'Logging in…' : 'Impersonate'}
                 </button>
+                <button
+                  onClick={() => handleGenerateSetupLink(user)}
+                  disabled={generatingLink === user.id}
+                  className="col-span-2 bg-blue-50 hover:bg-blue-100 text-blue-700 hover:text-blue-800 font-semibold text-xs py-2.5 rounded-lg border border-blue-200 hover:border-blue-300 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60"
+                >
+                  <KeyRound size={13} />
+                  {generatingLink === user.id ? 'Generating…' : 'Set-password link'}
+                </button>
               </div>
             </div>
           )) : (
@@ -178,6 +203,40 @@ const UsersPage: React.FC = () => {
               <p className="text-slate-500">Get started by adding your first hosting client.</p>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Set-password link modal */}
+      {setupLink && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
+            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+              <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><KeyRound size={18} className="text-blue-600" /> Set-password link</h2>
+              <button onClick={() => setSetupLink(null)} className="text-slate-400 hover:text-slate-600">✕</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-slate-600">
+                Send this one-time link to <span className="font-bold text-slate-800">{setupLink.username}</span> so they can set their dashboard password. It expires in 7 days and works once.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={setupLink.url}
+                  onFocus={(e) => e.target.select()}
+                  className="flex-1 bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-xs font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+                />
+                <button
+                  onClick={() => { navigator.clipboard.writeText(setupLink.url).then(() => { setCopied(true); toast.success('Copied'); }); }}
+                  className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-xl text-sm font-bold flex items-center gap-1.5"
+                >
+                  {copied ? <Check size={15} /> : <Copy size={15} />} {copied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs rounded-xl px-3 py-2">
+                This link is shown only once — copy it now. Generating a new link invalidates this one.
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

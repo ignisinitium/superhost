@@ -47,6 +47,8 @@ const FirewallPage: React.FC = () => {
   const [blockReason, setBlockReason] = useState('');
 
   const [rawOutput, setRawOutput] = useState('');
+  const [blockedPage, setBlockedPage] = useState(0);
+  const BLOCKED_PAGE_SIZE = 15;
 
   // ── UFW status (task-based) ───────────────────────────────────────────────
   const { data: statusData, isLoading: isStatusLoading, refetch } = useQuery({
@@ -87,6 +89,15 @@ const FirewallPage: React.FC = () => {
     },
     refetchInterval: 30_000,
   });
+
+  // Reset page if it goes out of range after data refresh / unblock
+  useEffect(() => {
+    const activeCount = blockedIps.filter(
+      (e) => e.expires_at === null || new Date(e.expires_at) > new Date(),
+    ).length;
+    const count = Math.max(1, Math.ceil(activeCount / BLOCKED_PAGE_SIZE));
+    if (blockedPage >= count) setBlockedPage(Math.max(0, count - 1));
+  }, [blockedIps, blockedPage]);
 
   // ── Mutations ─────────────────────────────────────────────────────────────
   const allowPortMutation = useMutation({
@@ -168,6 +179,16 @@ const FirewallPage: React.FC = () => {
   const isActive = rawOutput.toLowerCase().includes('active');
   const isLoading = isStatusLoading || isBlocklistLoading;
 
+  const now = new Date();
+  const activeBlockedIps = blockedIps.filter(
+    (entry) => entry.expires_at === null || new Date(entry.expires_at) > now,
+  );
+  const blockedPageCount = Math.max(1, Math.ceil(activeBlockedIps.length / BLOCKED_PAGE_SIZE));
+  const pagedBlockedIps = activeBlockedIps.slice(
+    blockedPage * BLOCKED_PAGE_SIZE,
+    (blockedPage + 1) * BLOCKED_PAGE_SIZE,
+  );
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   const handleAllowPort = (e: React.FormEvent) => {
     e.preventDefault();
@@ -224,7 +245,7 @@ const FirewallPage: React.FC = () => {
             </span>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            {portRules.length} port rule{portRules.length !== 1 ? 's' : ''} &nbsp;·&nbsp; {blockedIps.length} blocked IP{blockedIps.length !== 1 ? 's' : ''}
+            {portRules.length} port rule{portRules.length !== 1 ? 's' : ''} &nbsp;·&nbsp; {activeBlockedIps.length} blocked IP{activeBlockedIps.length !== 1 ? 's' : ''}
           </p>
         </div>
       </div>
@@ -352,48 +373,93 @@ const FirewallPage: React.FC = () => {
                 <tr>
                   <td colSpan={5} className="px-6 py-10 text-center text-slate-400 italic text-sm">Loading…</td>
                 </tr>
-              ) : blockedIps.length === 0 ? (
+              ) : activeBlockedIps.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-6 py-10 text-center text-slate-400 italic text-sm">
                     No IPs are currently blocked.
                   </td>
                 </tr>
               ) : (
-                blockedIps.map((entry) => {
-                  const isExpired = entry.expires_at ? new Date(entry.expires_at) < new Date() : false;
-                  return (
-                    <tr key={entry.id} className="hover:bg-slate-50/50 transition-colors">
-                      <td className="px-6 py-4 font-mono font-bold text-slate-800 text-sm">{entry.ip_address}</td>
-                      <td className="px-6 py-4 text-slate-500 text-xs max-w-xs truncate">{entry.reason}</td>
-                      <td className="px-6 py-4 text-xs">
-                        {entry.expires_at ? (
-                          <span className={isExpired ? 'text-slate-400 line-through' : 'text-amber-600 font-medium'}>
-                            {new Date(entry.expires_at).toLocaleDateString()}
-                          </span>
-                        ) : (
-                          <span className="text-red-600 font-bold">Permanent</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 text-slate-400 text-xs">
-                        {new Date(entry.created_at).toLocaleString()}
-                      </td>
-                      <td className="px-6 py-4 text-right">
-                        <button
-                          onClick={() => confirmUnblock(entry.ip_address)}
-                          disabled={unblockIpMutation.isPending}
-                          className="text-emerald-500 hover:text-emerald-700 p-2 rounded-lg hover:bg-emerald-50 transition-colors disabled:opacity-40"
-                          title="Unblock this IP"
-                        >
-                          <Unlock size={15} />
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })
+                pagedBlockedIps.map((entry) => (
+                  <tr key={entry.id} className="hover:bg-slate-50/50 transition-colors">
+                    <td className="px-6 py-4 font-mono font-bold text-slate-800 text-sm">{entry.ip_address}</td>
+                    <td className="px-6 py-4 text-slate-500 text-xs max-w-xs truncate">{entry.reason}</td>
+                    <td className="px-6 py-4 text-xs">
+                      {entry.expires_at ? (
+                        <span className="text-amber-600 font-medium">
+                          {new Date(entry.expires_at).toLocaleDateString()}
+                        </span>
+                      ) : (
+                        <span className="text-red-600 font-bold">Permanent</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 text-slate-400 text-xs">
+                      {new Date(entry.created_at).toLocaleString()}
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      <button
+                        onClick={() => confirmUnblock(entry.ip_address)}
+                        disabled={unblockIpMutation.isPending}
+                        className="text-emerald-500 hover:text-emerald-700 p-2 rounded-lg hover:bg-emerald-50 transition-colors disabled:opacity-40"
+                        title="Unblock this IP"
+                      >
+                        <Unlock size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                ))
               )}
             </tbody>
           </table>
         </div>
+
+        {/* Pagination */}
+        {blockedPageCount > 1 && (
+          <div className="border-t border-slate-100 px-6 py-3 flex items-center justify-between bg-slate-50/50">
+            <span className="text-xs text-slate-400">
+              Page {blockedPage + 1} of {blockedPageCount} &nbsp;·&nbsp; {activeBlockedIps.length} total
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setBlockedPage(0)}
+                disabled={blockedPage === 0}
+                className="px-2 py-1 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-200 disabled:opacity-30 transition-colors"
+              >
+                «
+              </button>
+              <button
+                onClick={() => setBlockedPage((p) => Math.max(0, p - 1))}
+                disabled={blockedPage === 0}
+                className="px-2 py-1 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-200 disabled:opacity-30 transition-colors"
+              >
+                ‹
+              </button>
+              {Array.from({ length: blockedPageCount }, (_, i) => (
+                <button
+                  key={i}
+                  onClick={() => setBlockedPage(i)}
+                  className={`w-7 h-7 rounded-lg text-xs font-bold transition-colors ${i === blockedPage ? 'bg-red-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}
+                >
+                  {i + 1}
+                </button>
+              ))}
+              <button
+                onClick={() => setBlockedPage((p) => Math.min(blockedPageCount - 1, p + 1))}
+                disabled={blockedPage === blockedPageCount - 1}
+                className="px-2 py-1 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-200 disabled:opacity-30 transition-colors"
+              >
+                ›
+              </button>
+              <button
+                onClick={() => setBlockedPage(blockedPageCount - 1)}
+                disabled={blockedPage === blockedPageCount - 1}
+                className="px-2 py-1 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-200 disabled:opacity-30 transition-colors"
+              >
+                »
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* UFW IP deny rules that exist in UFW but not in DB (auto-blocked etc.) */}
         {ufwIpDenyRules.length > 0 && (

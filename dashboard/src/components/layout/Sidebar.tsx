@@ -1,5 +1,6 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
+import api from '../../api/client';
 import {
   LayoutDashboard, Users, Package, Briefcase, Palette,
   Power, Download, Layers, BarChart2,
@@ -7,7 +8,7 @@ import {
   ShieldCheck, ShieldAlert, Mail,
   Network, Terminal, Cpu, Paintbrush, Settings,
   Zap, GitBranch, CreditCard,
-  Server, LogOut, RadioTower, UserX,
+  Server, LogOut, RadioTower, UserX, ArrowDownToLine, ScrollText,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -62,6 +63,7 @@ const adminGroups: MenuGroup[] = [
       { label: 'Firewall',       icon: ShieldCheck,  path: '/firewall' },
       { label: 'Malware Scan',   icon: ShieldAlert,  path: '/security' },
       { label: 'Spam Manager',   icon: Mail,         path: '/spam' },
+      { label: 'Audit Log',      icon: ScrollText,   path: '/audit' },
     ],
   },
   {
@@ -70,8 +72,9 @@ const adminGroups: MenuGroup[] = [
       { label: 'Networking',     icon: Globe,       path: '/network' },
       { label: 'Logs',           icon: Terminal,    path: '/logs' },
       { label: 'Processes',      icon: Cpu,         path: '/processes' },
-      { label: 'Theme Engine',   icon: Paintbrush,  path: '/themes' },
-      { label: 'Settings',       icon: Settings,    path: '/settings' },
+      { label: 'Theme Engine',   icon: Paintbrush,       path: '/themes' },
+      { label: 'CWP Migration',  icon: ArrowDownToLine,  path: '/migration' },
+      { label: 'Settings',       icon: Settings,         path: '/settings' },
     ],
   },
 ];
@@ -128,7 +131,11 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const navigate = useNavigate();
   const groups = userRole === 'admin' ? adminGroups : clientGroups;
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    // Revoke the token server-side (best-effort) before clearing local state.
+    try {
+      await api.post(userRole === 'admin' ? '/auth/logout' : '/client/auth/logout');
+    } catch { /* ignore — still clear the local session */ }
     localStorage.removeItem('token');
     localStorage.removeItem('role');
     localStorage.removeItem('user');

@@ -11,6 +11,7 @@ import DomainsPage from './pages/Domains';
 import SettingsPage from './pages/Settings';
 import FirewallPage from './pages/Firewall';
 import ClientLogin from './pages/ClientLogin';
+import SetClientPassword from './pages/SetClientPassword';
 import ClientDashboard from './pages/ClientDashboard';
 import ProcessesPage from './pages/Processes';
 import Dashboard from './pages/Dashboard';
@@ -49,6 +50,8 @@ import ResellerManager from './pages/ResellerManager';
 import ResellerBranding from './pages/ResellerBranding';
 import TerminalPage from './pages/Terminal';
 import AdminSpam from './pages/AdminSpam';
+import MigrationPage from './pages/Migration';
+import AuditLogPage from './pages/AuditLog';
 
 // ---------------------------------------------------------------------------
 // JWT helpers — decode payload WITHOUT verification (verification is server-side)
@@ -262,6 +265,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="updates" element={<UpdatesPage />} />
                     <Route path="monitoring" element={<AdminMonitoring />} />
                     <Route path="spam" element={<AdminSpam />} />
+                    <Route path="audit" element={<AuditLogPage />} />
                     <Route path="resellers" element={<ResellerManager />} />
                     <Route path="branding" element={<ResellerBranding />} />
                     <Route path="cron" element={<AdminCronManager />} />
@@ -270,6 +274,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="nameservers" element={<AdminNameserversPage />} />
                     <Route path="terminal" element={<TerminalPage />} />
                     <Route path="settings" element={<SettingsPage />} />
+                    <Route path="migration" element={<MigrationPage />} />
                   </>
                 ) : (
                   <>
@@ -308,6 +313,7 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/client/login" element={<ClientLogin />} />
+          <Route path="/client/set-password" element={<SetClientPassword />} />
           <Route path="/spam-login" element={<MailSpamLogin />} />
           <Route
             path="/my-spam"

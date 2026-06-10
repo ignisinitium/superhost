@@ -2,6 +2,7 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { query } from '../db.js';
+import { checkIpBlock, logLoginAttempt } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
@@ -11,7 +12,8 @@ function getJwtSecret(): string {
   return secret;
 }
 
-router.post('/login', async (req, res) => {
+router.post('/login', checkIpBlock, async (req, res) => {
+  const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
   const { email, password } = req.body as { email?: string; password?: string };
   if (!email || !password) {
     return res.status(400).json({ message: 'Email and password are required' });
@@ -26,6 +28,7 @@ router.post('/login', async (req, res) => {
     `, [email.toLowerCase().trim()]);
 
     if (muRes.rowCount === 0) {
+      await logLoginAttempt(ip, email, false);
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
@@ -34,13 +37,16 @@ router.post('/login', async (req, res) => {
     const rawHash: string = (mu.password_hash as string).replace(/^\{[^}]+\}/, '');
     const match = await bcrypt.compare(password, rawHash);
     if (!match) {
+      await logLoginAttempt(ip, email, false);
       return res.status(401).json({ message: 'Invalid email or password' });
     }
+
+    await logLoginAttempt(ip, email, true);
 
     const token = jwt.sign(
       { id: mu.user_id, role: 'mail_user', mailUserId: mu.id },
       getJwtSecret(),
-      { expiresIn: '7d' }
+      { expiresIn: '24h' }
     );
 
     res.json({ token, email });
