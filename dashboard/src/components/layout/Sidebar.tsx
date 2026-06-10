@@ -131,7 +131,18 @@ const clientGroups: MenuGroup[] = [
 // ── Sidebar component ─────────────────────────────────────────────────────────
 const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
   const navigate = useNavigate();
-  const groups = userRole === 'admin' ? adminGroups : clientGroups;
+  let groups = userRole === 'admin' ? adminGroups : clientGroups;
+  // Spam-filter-only customers don't have hosting — show just the items they use.
+  if (userRole === 'client') {
+    let accountType = 'hosting';
+    try { accountType = JSON.parse(localStorage.getItem('user') || '{}').account_type || 'hosting'; } catch { /* default */ }
+    if (accountType === 'filter') {
+      const allow = new Set(['/client', '/client/mail-filter', '/client/billing', '/client/settings']);
+      groups = clientGroups
+        .map(g => ({ ...g, items: g.items.filter(i => allow.has(i.path)) }))
+        .filter(g => g.items.length > 0);
+    }
+  }
   // Customers see the "Quality Creations" brand (violet); admins see the
   // "Superhost" engine brand (orange).
   const isClient = userRole === 'client';

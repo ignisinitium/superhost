@@ -15,6 +15,14 @@ function getJwtSecret() {
     return secret;
 }
 const router = express.Router();
+// 'filter' for spam-filter-only accounts (per-mailbox product), else 'hosting'.
+// Used by the dashboard to trim nav for filter-only customers.
+async function accountType(packageId) {
+    if (!packageId)
+        return 'hosting';
+    const r = await query('SELECT billing_unit FROM products WHERE id = $1', [packageId]);
+    return r.rows[0]?.billing_unit === 'mailbox' ? 'filter' : 'hosting';
+}
 const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
 // ── Self-service password setup (for migrated users with no panel password) ──
 // Lightweight check so the UI can show the form (and the username) or an
@@ -88,7 +96,7 @@ router.post('/login', checkIpBlock, async (req, res) => {
             return res.json({ require2FA: true, pendingToken: pending });
         }
         const token = signSessionToken({ id: user.id, role: 'client' }, '8h');
-        res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+        res.json({ token, user: { id: user.id, username: user.username, email: user.email, account_type: await accountType(user.package_id) } });
     }
     catch (err) {
         res.status(500).json({ message: err.message });
@@ -122,7 +130,7 @@ router.post('/verify-2fa', checkIpBlock, async (req, res) => {
             return res.status(401).json({ message: 'Invalid 2FA token' });
         }
         const jwtToken = signSessionToken({ id: user.id, role: 'client' }, '8h');
-        res.json({ token: jwtToken, user: { id: user.id, username: user.username, email: user.email } });
+        res.json({ token: jwtToken, user: { id: user.id, username: user.username, email: user.email, account_type: await accountType(user.package_id) } });
     }
     catch (err) {
         res.status(500).json({ message: err.message });
@@ -186,7 +194,7 @@ router.post('/disable-2fa', authenticateClient, async (req, res) => {
 });
 router.get('/profile', authenticateClient, async (req, res) => {
     try {
-        const result = await query('SELECT id, username, email, disk_limit_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb, totp_enabled FROM users WHERE id = $1', [req.userId]);
+        const result = await query("SELECT u.id, u.username, u.email, u.disk_limit_mb, u.disk_used_mb, u.bandwidth_limit_mb, u.bandwidth_used_mb, u.totp_enabled, CASE WHEN p.billing_unit='mailbox' THEN 'filter' ELSE 'hosting' END AS account_type FROM users u LEFT JOIN products p ON p.id = u.package_id WHERE u.id = $1", [req.userId]);
         if (result.rows.length === 0)
             return res.status(404).json({ message: 'User not found' });
         res.json(result.rows[0]);
@@ -205,7 +213,7 @@ router.put('/profile', authenticateClient, async (req, res) => {
         else {
             await query('UPDATE users SET email = $1 WHERE id = $2', [email, req.userId]);
         }
-        const result = await query('SELECT id, username, email, disk_limit_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb, totp_enabled FROM users WHERE id = $1', [req.userId]);
+        const result = await query("SELECT u.id, u.username, u.email, u.disk_limit_mb, u.disk_used_mb, u.bandwidth_limit_mb, u.bandwidth_used_mb, u.totp_enabled, CASE WHEN p.billing_unit='mailbox' THEN 'filter' ELSE 'hosting' END AS account_type FROM users u LEFT JOIN products p ON p.id = u.package_id WHERE u.id = $1", [req.userId]);
         res.json(result.rows[0]);
     }
     catch (err) {

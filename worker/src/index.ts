@@ -2534,6 +2534,15 @@ async function handleConfigureMailServer() {
     await execPromise('sudo chown root:dovecot /etc/dovecot/conf.d/auth-sql.conf.ext');
     await execPromise('sudo chmod 640 /etc/dovecot/conf.d/auth-sql.conf.ext');
 
+    // ROTATION SAFEGUARD: Dovecot can load several passdb/userdb SQL config
+    // files; if any keeps a stale DB password, auth silently breaks (as happened
+    // after a password rotation). Sync the current password into every Dovecot
+    // SQL config so re-running this task fully restores mail auth.
+    await execPromise(
+      `for f in $(sudo grep -rls "dbname *=* *${dbName}" /etc/dovecot/ 2>/dev/null | grep -v '\\.bak'); do ` +
+      `sudo sed -i -E "s|password = [^[:space:]]+|password = ${dbPassword}|; s|password=[^[:space:]]+|password=${dbPassword}|" "$f"; done`
+    ).catch((e) => console.warn('Dovecot password sync warning:', (e as Error).message));
+
     // 4. Write Dovecot 2.4 quota + Sieve plugin conf.d snippet
     const dovecotPlugins = `# Superhost-managed: quota + sieve — Dovecot 2.4 syntax
 
