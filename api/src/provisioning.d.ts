@@ -6,6 +6,10 @@
  * The API never runs shell commands; system work is delegated to the worker via
  * the tasks queue (CREATE_USER, CREATE_DOMAIN, GENERATE_EMAIL_DNS, ...).
  */
-export declare function provisionSignupByToken(token: string): Promise<void>;
+export interface StripeRefs {
+    customerId?: string | null;
+    subscriptionId?: string | null;
+}
+export declare function provisionSignupByToken(token: string, stripe?: StripeRefs): Promise<void>;
 export declare function provisionSignupById(id: number): Promise<void>;
 //# sourceMappingURL=provisioning.d.ts.map

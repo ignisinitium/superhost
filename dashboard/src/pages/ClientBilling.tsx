@@ -53,6 +53,19 @@ const ClientBillingPage: React.FC = () => {
     }
   });
 
+  const { data: subscription } = useQuery<{
+    status?: string; subscription_status?: string; current_period_end?: string | null; has_billing?: boolean;
+  }>({
+    queryKey: ['subscription'],
+    queryFn: async () => (await api.get('/billing/subscription')).data,
+  });
+
+  const portalMutation = useMutation({
+    mutationFn: async () => (await api.post('/billing/portal')).data,
+    onSuccess: (data) => { window.location.href = data.url; },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Could not open billing portal'),
+  });
+
   const checkoutMutation = useMutation({
     mutationFn: async (productId: number) => {
       const res = await api.post('/billing/create-checkout-session', { productId, cycle });
@@ -88,6 +101,37 @@ const ClientBillingPage: React.FC = () => {
           <p className="text-slate-500 mt-1">Order new services, view invoices, and manage subscriptions.</p>
         </div>
       </div>
+
+      {/* Subscription management */}
+      {subscription?.has_billing && (
+        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <CreditCard className="text-violet-600" size={22} />
+            <div>
+              <h2 className="text-lg font-bold text-slate-800">Your subscription</h2>
+              <p className="text-sm text-slate-500 mt-0.5 flex items-center gap-2">
+                <span className={`inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full ${
+                  subscription.status === 'active' ? 'bg-green-50 text-green-700 border border-green-200'
+                  : subscription.status === 'suspended' ? 'bg-red-50 text-red-700 border border-red-200'
+                  : 'bg-amber-50 text-amber-700 border border-amber-200'
+                }`}>
+                  {(subscription.subscription_status || subscription.status || 'active').replace('_', ' ')}
+                </span>
+                {subscription.current_period_end && (
+                  <span>Renews {new Date(subscription.current_period_end).toLocaleDateString()}</span>
+                )}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => portalMutation.mutate()}
+            disabled={portalMutation.isPending}
+            className="bg-slate-800 hover:bg-slate-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm disabled:opacity-50"
+          >
+            {portalMutation.isPending ? 'Opening…' : 'Manage subscription'}
+          </button>
+        </div>
+      )}
 
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
         <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">

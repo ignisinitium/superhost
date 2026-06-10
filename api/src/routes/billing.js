@@ -30,11 +30,15 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
                 const session = event.data.object;
                 console.log(`Checkout session completed for ${session.customer}`);
                 // Self-service signup: provision the hosting account now that payment
-                // is confirmed. Idempotent, so webhook retries are safe.
+                // is confirmed. Idempotent, so webhook retries are safe. Capture the
+                // Stripe customer + subscription so we can manage it later.
                 const token = session.metadata?.signup_token;
                 if (token) {
                     try {
-                        await provisionSignupByToken(token);
+                        await provisionSignupByToken(token, {
+                            customerId: session.customer ?? null,
+                            subscriptionId: session.subscription ?? null,
+                        });
                     }
                     catch (e) {
                         console.error('Signup provisioning failed:', e.message);
@@ -45,11 +49,44 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
             case 'invoice.paid': {
                 const invoice = event.data.object;
                 await query('UPDATE invoices SET status = $1, paid_at = NOW() WHERE stripe_invoice_id = $2', ['paid', invoice.id]);
+                // A successful renewal reactivates the account if it was past_due.
+                if (invoice.customer) {
+                    await query(`UPDATE users SET status = 'active', subscription_status = 'active'
+             WHERE stripe_customer_id = $1 AND status = 'suspended'`, [invoice.customer]);
+                }
                 break;
             }
             case 'invoice.payment_failed': {
                 const failedInvoice = event.data.object;
                 await query('UPDATE invoices SET status = $1 WHERE stripe_invoice_id = $2', ['failed', failedInvoice.id]);
+                if (failedInvoice.customer) {
+                    await query(`UPDATE users SET subscription_status = 'past_due' WHERE stripe_customer_id = $1`, [failedInvoice.customer]);
+                }
+                break;
+            }
+            case 'customer.subscription.created':
+            case 'customer.subscription.updated': {
+                const sub = event.data.object;
+                // Sync status + renewal date. Stripe statuses: active, past_due,
+                // unpaid, canceled, incomplete, trialing. Idempotent and a no-op if the
+                // account doesn't exist yet (Checkout signups provision via
+                // checkout.session.completed); covers subscriptions created elsewhere.
+                const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+                await query(`UPDATE users
+             SET subscription_status = $1,
+                 current_period_end = $2,
+                 status = CASE WHEN $1 IN ('active','trialing') THEN 'active'
+                               WHEN $1 IN ('canceled','unpaid') THEN 'suspended'
+                               ELSE status END
+           WHERE stripe_subscription_id = $3 OR stripe_customer_id = $4`, [sub.status, periodEnd, sub.id, sub.customer]);
+                break;
+            }
+            case 'customer.subscription.deleted': {
+                const sub = event.data.object;
+                // Subscription canceled/ended → suspend the hosting account.
+                await query(`UPDATE users SET status = 'suspended', subscription_status = 'canceled'
+           WHERE stripe_subscription_id = $1 OR stripe_customer_id = $2`, [sub.id, sub.customer]);
+                console.log(`Subscription ${sub.id} canceled → account suspended`);
                 break;
             }
             default:
@@ -283,6 +320,36 @@ router.get('/products', async (_req, res) => {
     try {
         const result = await query('SELECT * FROM products WHERE is_active = TRUE ORDER BY sort_order ASC, price_cents ASC');
         res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+// Current subscription state for the logged-in client.
+router.get('/subscription', async (req, res) => {
+    try {
+        const r = await query(`SELECT status, subscription_status, current_period_end, stripe_customer_id IS NOT NULL AS has_billing
+       FROM users WHERE id = $1`, [req.userId]);
+        res.json(r.rows[0] ?? {});
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+// Open the Stripe Billing Portal so the customer can update their card, view
+// invoices, and cancel/change their plan themselves.
+router.post('/portal', async (req, res) => {
+    try {
+        const r = await query('SELECT stripe_customer_id FROM users WHERE id = $1', [req.userId]);
+        const customer = r.rows[0]?.stripe_customer_id;
+        if (!customer)
+            return res.status(400).json({ message: 'No billing account found for this user yet.' });
+        const host = req.headers['x-forwarded-host'] || req.headers.host || 'qc.fyi';
+        const session = await stripe.billingPortal.sessions.create({
+            customer,
+            return_url: `https://${host}/client/billing`,
+        });
+        res.json({ url: session.url });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

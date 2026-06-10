@@ -8,11 +8,16 @@ import { query } from './db.js';
  * The API never runs shell commands; system work is delegated to the worker via
  * the tasks queue (CREATE_USER, CREATE_DOMAIN, GENERATE_EMAIL_DNS, ...).
  */
-export async function provisionSignupByToken(token: string): Promise<void> {
+export interface StripeRefs {
+  customerId?: string | null;
+  subscriptionId?: string | null;
+}
+
+export async function provisionSignupByToken(token: string, stripe?: StripeRefs): Promise<void> {
   const res = await query('SELECT * FROM pending_signups WHERE session_token = $1', [token]);
   const signup = res.rows[0];
   if (!signup || signup.status === 'provisioned') return; // unknown or already done
-  await provisionSignup(signup);
+  await provisionSignup(signup, stripe);
 }
 
 export async function provisionSignupById(id: number): Promise<void> {
@@ -22,7 +27,7 @@ export async function provisionSignupById(id: number): Promise<void> {
   await provisionSignup(signup);
 }
 
-async function provisionSignup(s: any): Promise<void> {
+async function provisionSignup(s: any, stripe?: StripeRefs): Promise<void> {
   const username: string = s.username;
   const homeDir = `/home/${username}`;
 
@@ -30,13 +35,21 @@ async function provisionSignup(s: any): Promise<void> {
   const diskLimit = prod?.disk_quota_mb ?? 5120;
   const bwLimit = prod ? (prod.bandwidth_gb === -1 ? -1 : prod.bandwidth_gb * 1024) : 5120;
 
-  // 1. Create the panel user (idempotent) and assign the purchased package.
+  // 1. Create the panel user (idempotent) and assign the purchased package +
+  //    Stripe references so we can manage the subscription later.
   const userRes = await query(
-    `INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email, package_id = EXCLUDED.package_id
+    `INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb,
+                        package_id, stripe_customer_id, stripe_subscription_id, subscription_status, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active')
+     ON CONFLICT (username) DO UPDATE SET
+       email = EXCLUDED.email, package_id = EXCLUDED.package_id,
+       stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
+       stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+       subscription_status = EXCLUDED.subscription_status, status = 'active'
      RETURNING id`,
-    [username, s.email, homeDir, s.password_hash, diskLimit, bwLimit, s.product_id],
+    [username, s.email, homeDir, s.password_hash, diskLimit, bwLimit, s.product_id,
+     stripe?.customerId ?? null, stripe?.subscriptionId ?? null,
+     stripe?.subscriptionId ? 'active' : null],
   );
   const userId: number = userRes.rows[0].id;
 
