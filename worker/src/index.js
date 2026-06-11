@@ -3629,148 +3629,178 @@ async function siteLog(id, msg) {
     await client.query('UPDATE site_migrations SET log = log || $1 WHERE id = $2', [`[${ts}] ${msg}\n`, id]);
     console.log(`[SiteMigration ${id}] ${msg}`);
 }
-// Discover the websites hosted on a remote server (nginx + apache vhosts),
-// detect each site's stack, and store the list for the admin to choose from.
+// Remote discovery: resolves each site's frontend doc-root, the backend(s)
+// behind any nginx proxy_pass (port → process cwd/cmd/runtime/manager), and the
+// database each backend uses (engine + name only — never creds). Also parses
+// Apache vhosts and cPanel/Plesk/DirectAdmin layouts. Emits one JSON blob.
+const SERVER_DISCOVERY = `python3 << 'PYEOF'
+import json, os, re, subprocess
+def sh(cmd, t=60):
+    try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t).stdout
+    except Exception: return ''
+def read(p):
+    for c in (['cat', p], ['sudo','cat',p]):
+        try:
+            r = subprocess.run(c, capture_output=True, text=True, timeout=15)
+            if r.returncode == 0: return r.stdout
+        except Exception: pass
+    return ''
+def www(d): return re.sub(r'^www\\.', '', d.strip().lower())
+def valid(d): return d and '.' in d and d != '_' and not d.startswith(('~','*'))
+
+ngconf = sh('sudo nginx -T 2>/dev/null') or sh('nginx -T 2>/dev/null')
+def server_blocks(text):
+    out=[]; i=0; n=len(text)
+    while True:
+        m=re.search(r'\\bserver\\b\\s*\\{', text[i:])
+        if not m: break
+        s=i+m.start(); j=i+m.end()-1; depth=0
+        while j<n:
+            if text[j]=='{': depth+=1
+            elif text[j]=='}':
+                depth-=1
+                if depth==0: j+=1; break
+            j+=1
+        out.append(text[s:j]); i=j
+    return out
+
+port_proc={}
+for line in sh('sudo ss -ltnp 2>/dev/null').splitlines():
+    mm=re.search(r':(\\d+)\\s', line); pm=re.search(r'pid=(\\d+)', line)
+    if mm and pm:
+        port=int(mm.group(1)); pid=pm.group(1)
+        if port in port_proc: continue
+        port_proc[port]={'cwd':sh(f'sudo readlink /proc/{pid}/cwd 2>/dev/null').strip(),
+                         'cmd':sh(f'sudo tr "\\0" " " < /proc/{pid}/cmdline 2>/dev/null').strip()}
+pm2={}
+for u in set(sh("ps -eo user:32,comm 2>/dev/null | grep -i pm2 | awk '{print $1}' | sort -u").split()):
+    try:
+        for a in json.loads(sh(f'sudo -u {u} pm2 jlist 2>/dev/null') or '[]'):
+            e=a.get('pm2_env',{}); pm2[a.get('name')]={'cwd':e.get('pm_cwd'),'user':u}
+    except Exception: pass
+def runtime(cwd,cmd):
+    c=(cmd or '').lower()
+    if 'python' in c or 'gunicorn' in c or 'uvicorn' in c: return 'python'
+    if cwd and os.path.exists(os.path.join(cwd,'requirements.txt')): return 'python'
+    return 'node'
+def db_of(cwd):
+    if not cwd: return None
+    env=read(os.path.join(cwd,'.env'))
+    m=re.search(r'^DATABASE_URL=["\\']?([^"\\'\\n\\r]+)', env, re.M)
+    if m:
+        mm=re.match(r'(\\w+)://[^:]+:[^@]*@([^:/]+)(?::\\d+)?/([^?\\s]+)', m.group(1))
+        if mm:
+            eng=mm.group(1).lower(); engine='postgres' if eng.startswith('postg') else ('mysql' if 'mysql' in eng or 'maria' in eng else eng)
+            return {'engine':engine,'host':mm.group(2),'name':mm.group(3),'style':'url'}
+    def g(k):
+        mm=re.search(r'^'+k+r'=["\\']?([^"\\'\\n\\r]*)', env, re.M); return mm.group(1).strip() if mm else None
+    name=g('DB_DATABASE') or g('DB_NAME') or g('PGDATABASE')
+    if name:
+        conn=(g('DB_CONNECTION') or '').lower()
+        engine='postgres' if ('pg' in conn or 'postg' in conn or g('PGDATABASE')) else 'mysql'
+        return {'engine':engine,'host':g('DB_HOST') or g('PGHOST') or 'localhost','name':name,'style':'discrete'}
+    return None
+
+sites={}
+for blk in server_blocks(ngconf):
+    names=set()
+    for s in re.findall(r'server_name\\s+([^;]+);', blk):
+        for t in s.split():
+            if valid(www(t)): names.add(www(t))
+    if not names: continue
+    rm=re.search(r'(?:^|\\n)\\s*root\\s+([^;]+);', blk); root=rm.group(1).strip() if rm else None
+    proxies=[]
+    for lm in re.finditer(r'location\\s+([^\\s{]+)\\s*\\{([^}]*)\\}', blk):
+        pp=re.search(r'proxy_pass\\s+https?://[^:/;]+:(\\d+)', lm.group(2))
+        if pp: proxies.append({'location':lm.group(1),'port':int(pp.group(1))})
+    if not proxies:
+        for pp in re.finditer(r'proxy_pass\\s+https?://[^:/;]+:(\\d+)', blk):
+            proxies.append({'location':'/','port':int(pp.group(1))})
+    if not root and not proxies: continue
+    backends=[]; seen=set()
+    for px in proxies:
+        p=px['port']
+        if p in seen: continue
+        seen.add(p)
+        info=port_proc.get(p,{}); cwd=info.get('cwd')
+        nm=None; mgr='unknown'
+        for n2,pi in pm2.items():
+            if pi.get('cwd') and cwd and os.path.normpath(pi['cwd'])==os.path.normpath(cwd): nm=n2; mgr='pm2'; break
+        backends.append({'port':p,'cwd':cwd,'cmd':info.get('cmd'),'runtime':runtime(cwd,info.get('cmd')),'manager':mgr,'name':nm,'db':db_of(cwd)})
+    dom=sorted(names)[0]
+    if dom not in sites:
+        sites[dom]={'domain':dom,'frontendRoot':root,'proxies':proxies,'backends':backends,'serverBlock':blk[:8000],'webserver':'nginx'}
+
+# Apache vhosts (static only)
+ap=sh('cat /etc/apache2/sites-enabled/* /etc/apache2/conf.d/*.conf /etc/httpd/conf.d/*.conf /etc/httpd/conf/httpd.conf /usr/local/apache/conf/httpd.conf /usr/local/directadmin/data/users/*/httpd.conf 2>/dev/null')
+for vh in re.findall(r'<VirtualHost[^>]*>([\\s\\S]*?)</VirtualHost>', ap, re.I):
+    nms=set(); sn=re.search(r'(?im)^\\s*ServerName\\s+(\\S+)', vh)
+    if sn and valid(www(sn.group(1))): nms.add(www(sn.group(1)))
+    for al in re.findall(r'(?im)^\\s*ServerAlias\\s+([^\\n]+)', vh):
+        for t in al.split():
+            if valid(www(t)): nms.add(www(t))
+    dr=re.search(r'(?im)^\\s*DocumentRoot\\s+"?([^"\\n]+?)"?\\s*$', vh)
+    if dr:
+        for d in nms:
+            if d not in sites: sites[d]={'domain':d,'frontendRoot':dr.group(1).strip(),'proxies':[],'backends':[],'serverBlock':None,'webserver':'apache'}
+# cPanel userdata
+cur=None
+for f in sh('ls /var/cpanel/userdata/*/* 2>/dev/null').split():
+    if any(x in f for x in ('cache','/main','.json','_SSL')): continue
+    base=os.path.basename(f); dm=re.search(r'documentroot:\\s*(\\S+)', read(f))
+    if dm and valid(www(base)) and www(base) not in sites:
+        sites[www(base)]={'domain':www(base),'frontendRoot':dm.group(1),'proxies':[],'backends':[],'serverBlock':None,'webserver':'cpanel'}
+# Plesk / DirectAdmin layouts
+for p in sh('ls -d /var/www/vhosts/*/httpdocs /home/*/domains/*/public_html 2>/dev/null').split():
+    m=re.search(r'/vhosts/([^/]+)/httpdocs', p) or re.search(r'/domains/([^/]+)/public_html', p)
+    if m and valid(www(m.group(1))) and www(m.group(1)) not in sites:
+        sites[www(m.group(1))]={'domain':www(m.group(1)),'frontendRoot':p,'proxies':[],'backends':[],'serverBlock':None,'webserver':'panel'}
+
+# frontend stack
+for s in sites.values():
+    r=s.get('frontendRoot'); st='static'
+    if r:
+        if os.path.exists(os.path.join(r,'index.php')) or sh(f'ls {re.escape(r)}/*.php 2>/dev/null'): st='php'
+    s['stack']=st
+    s['remotePath']=r
+
+mysql_dbs=[d for d in sh("sudo mysql -N -e 'SHOW DATABASES' 2>/dev/null").split() if d not in ('information_schema','performance_schema','mysql','sys')]
+pg_dbs=[d.strip() for d in sh("sudo -u postgres psql -tAc \\"SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres'\\" 2>/dev/null").splitlines() if d.strip()]
+# Authoritative engine: the .env heuristic can be ambiguous (e.g. discrete DB_*
+# vars with no DB_CONNECTION), so trust which server the database actually lives on.
+mset=set(mysql_dbs); pset=set(pg_dbs)
+for s in sites.values():
+    for b in s.get('backends',[]):
+        db=b.get('db')
+        if db and db.get('name'):
+            if db['name'] in pset: db['engine']='postgres'
+            elif db['name'] in mset: db['engine']='mysql'
+print(json.dumps({'sites':sorted(sites.values(), key=lambda x:x['domain']),'databases':{'mysql':mysql_dbs,'postgres':pg_dbs}}))
+PYEOF
+`;
+// Discover the websites hosted on a remote server (frontends + backends + DBs)
+// and store the structured list for the admin to choose from.
 async function handleScanServer(payload) {
     const { scanId, sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey } = payload;
     const cred = await setupSshCred(scanId, authType, sshPassword, sshKey);
     await client.query("UPDATE server_scans SET status='running' WHERE id=$1", [scanId]);
     try {
-        // 1. Gather raw config from every source we know about. nginx -T emits the
-        //    FULLY-merged config (all includes resolved), which is far more complete
-        //    than scanning a couple of directories. Apache configs are cat'd broadly,
-        //    plus cPanel userdata and Plesk/DirectAdmin path layouts.
-        const gather = `
-export LC_ALL=C
-echo '===NGINX==='
-( nginx -T 2>/dev/null || sudo -n nginx -T 2>/dev/null ) | grep -vE '^# (configuration|hidden)'
-echo '===APACHE==='
-cat /etc/apache2/sites-enabled/* /etc/apache2/vhosts.d/*.conf /etc/apache2/conf.d/*.conf \
-    /etc/httpd/conf.d/*.conf /etc/httpd/conf/httpd.conf /etc/httpd/conf.d/vhosts/*.conf \
-    /usr/local/apache/conf/httpd.conf /usr/local/apache/conf.d/*.conf /usr/local/apache/conf.d/vhosts/*.conf \
-    /usr/local/directadmin/data/users/*/httpd.conf 2>/dev/null
-echo '===CPANEL==='
-for f in /var/cpanel/userdata/*/*; do
-  [ -f "$f" ] || continue
-  case "$f" in *cache*|*/main|*.json|*_SSL) continue;; esac
-  echo "#FILE:$(basename "$f")"
-  grep -aE '^(documentroot|servername|serveralias):' "$f" 2>/dev/null
-done
-echo '===DIRS==='
-ls -d /var/www/vhosts/*/httpdocs /home/*/domains/*/public_html 2>/dev/null
-echo '===END==='
-`;
-        const raw = await sshRun(sourceHost, Number(sourcePort), sshUser, cred, gather);
-        const sec = (name) => {
-            const start = raw.indexOf(`===${name}===`);
-            if (start === -1)
-                return '';
-            const rest = raw.slice(start + name.length + 6);
-            const end = rest.search(/===[A-Z]+===/);
-            return end === -1 ? rest : rest.slice(0, end);
-        };
-        const stripWww = (d) => d.replace(/^www\./i, '').trim().toLowerCase();
-        const found = new Map(); // domain -> docroot (first wins)
-        const add = (domain, docroot) => {
-            const d = stripWww(domain);
-            if (!d || !d.includes('.') || d === '_' || d.startsWith('~') || d.startsWith('*'))
-                return;
-            if (!docroot || !docroot.startsWith('/'))
-                return;
-            if (!found.has(d))
-                found.set(d, docroot.replace(/\/$/, ''));
-        };
-        // nginx: walk balanced `server { … }` blocks; take all server_names + first server-level root.
-        const ng = sec('NGINX');
-        for (let i = 0; i < ng.length;) {
-            const m = /\bserver\b\s*\{/g;
-            m.lastIndex = i;
-            const hit = m.exec(ng);
-            if (!hit)
-                break;
-            let depth = 0, k = hit.index + hit[0].length - 1;
-            for (; k < ng.length; k++) {
-                if (ng[k] === '{')
-                    depth++;
-                else if (ng[k] === '}') {
-                    depth--;
-                    if (depth === 0) {
-                        k++;
-                        break;
-                    }
+        const out = await sshRun(sourceHost, Number(sourcePort), sshUser, cred, SERVER_DISCOVERY);
+        const jsonStart = out.indexOf('{');
+        const parsed = JSON.parse(jsonStart >= 0 ? out.slice(jsonStart) : '{"sites":[]}');
+        const sites = Array.isArray(parsed.sites) ? parsed.sites : [];
+        // Defensive: never persist any credential the discovery might surface.
+        for (const s of sites)
+            for (const b of (s.backends || [])) {
+                if (b.db) {
+                    delete b.db.user;
+                    delete b.db.pass;
+                    delete b.db.password;
                 }
             }
-            const block = ng.slice(hit.index, k);
-            i = k;
-            const names = new Set();
-            for (const sn of block.matchAll(/(?:^|\n)\s*server_name\s+([^;]+);/g))
-                sn[1].trim().split(/\s+/).forEach(n => names.add(n));
-            const rootM = block.match(/(?:^|\n)\s*root\s+([^;]+);/);
-            if (rootM)
-                for (const n of names)
-                    add(n, rootM[1].trim());
-        }
-        // apache: parse each <VirtualHost> block.
-        for (const vh of sec('APACHE').matchAll(/<VirtualHost[^>]*>([\s\S]*?)<\/VirtualHost>/gi)) {
-            const b = vh[1];
-            const names = new Set();
-            const snm = b.match(/^\s*ServerName\s+(\S+)/im);
-            if (snm)
-                names.add(snm[1]);
-            for (const al of b.matchAll(/^\s*ServerAlias\s+([^\n]+)/gim))
-                al[1].trim().split(/\s+/).forEach(n => names.add(n));
-            const drm = b.match(/^\s*DocumentRoot\s+"?([^"\n]+?)"?\s*$/im);
-            if (drm)
-                for (const n of names)
-                    add(n, drm[1].trim());
-        }
-        // cPanel userdata: "#FILE:domain" followed by documentroot:/servername:/serveralias:
-        let curDom = '';
-        for (const line of sec('CPANEL').split('\n')) {
-            const fm = line.match(/^#FILE:(.+)/);
-            if (fm) {
-                curDom = fm[1].trim();
-                continue;
-            }
-            const dm = line.match(/documentroot:\s*(\S+)/i);
-            if (dm && curDom)
-                add(curDom, dm[1]);
-        }
-        // Plesk (/var/www/vhosts/<domain>/httpdocs) and DirectAdmin (/home/<u>/domains/<domain>/public_html).
-        for (const p of sec('DIRS').split('\n')) {
-            const path = p.trim();
-            if (!path)
-                continue;
-            const pm = path.match(/\/vhosts\/([^/]+)\/httpdocs/) || path.match(/\/domains\/([^/]+)\/public_html/);
-            if (pm)
-                add(pm[1], path);
-        }
-        // 2. Detect each site's stack by inspecting its docroot on the remote.
-        const docroots = [...new Set([...found.values()])];
-        const stackByRoot = new Map();
-        if (docroots.length) {
-            const quoted = docroots.map(d => `'${d.replace(/'/g, `'\\''`)}'`).join(' ');
-            const detect = `
-for d in ${quoted}; do
-  if [ -f "$d/package.json" ]; then st=node
-  elif [ -f "$d/manage.py" ] || [ -f "$d/requirements.txt" ] || [ -f "$d/wsgi.py" ]; then st=python
-  elif [ -f "$d/index.php" ] || ls "$d"/*.php >/dev/null 2>&1; then st=php
-  else st=static; fi
-  printf '%s\\t%s\\n' "$d" "$st"
-done
-`;
-            const det = await sshRun(sourceHost, Number(sourcePort), sshUser, cred, detect);
-            for (const line of det.split('\n')) {
-                const t = line.split('\t');
-                if (t.length >= 2)
-                    stackByRoot.set(t[0].trim(), t[1].trim());
-            }
-        }
-        const sites = [...found.entries()]
-            .map(([domain, remotePath]) => ({ domain, remotePath, stack: stackByRoot.get(remotePath) || 'static' }))
-            .sort((a, b) => a.domain.localeCompare(b.domain));
         await client.query("UPDATE server_scans SET status='completed', sites=$1, completed_at=NOW() WHERE id=$2", [JSON.stringify(sites), scanId]);
-        console.log(`[ServerScan ${scanId}] discovered ${sites.length} site(s) on ${sourceHost}`);
+        const nBack = sites.reduce((n, s) => n + (s.backends?.length || 0), 0);
+        console.log(`[ServerScan ${scanId}] ${sites.length} site(s), ${nBack} backend(s) on ${sourceHost}`);
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -3917,7 +3947,262 @@ with open(path, 'w') as f: f.write(c)
         await fs.unlink(tmp).catch(() => { });
     }
 }
+// Read DB credentials out of a synced backend's .env (kept locally, root-readable).
+async function detectDbFromDir(dir) {
+    const envPath = path.join(dir, '.env');
+    let env = '';
+    try {
+        env = await fs.readFile(envPath, 'utf8');
+    }
+    catch {
+        return null;
+    }
+    const url = env.match(/^DATABASE_URL=["']?([^"'\r\n]+)/m);
+    if (url) {
+        const mm = url[1].match(/(\w+):\/\/([^:]+):([^@]*)@([^:/]+)(?::\d+)?\/([^?\s]+)/);
+        if (mm) {
+            const eng = mm[1].toLowerCase();
+            const engine = eng.startsWith('postg') ? 'postgres' : (eng.includes('mysql') || eng.includes('maria') ? 'mysql' : eng);
+            return { engine, user: mm[2], pass: mm[3], host: mm[4], name: mm[5], style: 'url', envPath };
+        }
+    }
+    const g = (k) => { const m = env.match(new RegExp('^' + k + '=["\']?([^"\'\\r\\n]*)', 'm')); return m ? m[1].trim() : undefined; };
+    const name = g('DB_DATABASE') || g('DB_NAME') || g('PGDATABASE');
+    if (name) {
+        const conn = (g('DB_CONNECTION') || '').toLowerCase();
+        const engine = (conn.includes('pg') || conn.includes('postg') || g('PGDATABASE')) ? 'postgres' : 'mysql';
+        return { engine, name, ...(g('DB_USERNAME') || g('DB_USER') || g('PGUSER') ? { user: g('DB_USERNAME') || g('DB_USER') || g('PGUSER') } : {}),
+            ...(g('DB_PASSWORD') || g('PGPASSWORD') ? { pass: g('DB_PASSWORD') || g('PGPASSWORD') } : {}),
+            host: g('DB_HOST') || g('PGHOST') || 'localhost', style: 'discrete', envPath };
+    }
+    return null;
+}
+// Stream a remote PostgreSQL dump straight into a fresh local database.
+async function importRemotePgDb(host, port, remoteUser, cred, dbHost, dbUser, dbPass, remoteDb, localDb) {
+    return new Promise((resolve, reject) => {
+        const dump = `PGPASSWORD=${shellEscape(dbPass)} pg_dump --no-owner --no-privileges -h ${shellEscape(dbHost || 'localhost')} -U ${shellEscape(dbUser || 'postgres')} -d ${shellEscape(remoteDb)}`;
+        const sshArgs = [...sshBaseArgs(port, cred)];
+        const env = cred.type === 'password' ? { ...process.env, SSHPASS: cred.password } : { ...process.env };
+        const cmd = cred.type === 'password' ? 'sshpass' : 'ssh';
+        const args = cred.type === 'password' ? ['-e', 'ssh', ...sshArgs, `${remoteUser}@${host}`, dump] : [...sshArgs, `${remoteUser}@${host}`, dump];
+        const dumpProc = spawn(cmd, args, { env });
+        const importProc = spawn('sudo', ['-u', 'postgres', 'psql', '-q', '-d', localDb]);
+        dumpProc.stdout.pipe(importProc.stdin);
+        let e1 = '', e2 = '';
+        dumpProc.stderr.on('data', (d) => e1 += d.toString());
+        importProc.stderr.on('data', (d) => e2 += d.toString());
+        dumpProc.on('error', reject);
+        importProc.on('error', reject);
+        importProc.on('close', (code) => code !== 0 ? reject(new Error(`PG import failed: ${(e1 + e2).slice(0, 300)}`)) : resolve());
+    });
+}
+// Create a local Postgres role+db, pull the remote data in, return new creds.
+async function migratePostgresDb(sshHost, sshPort, sshUser, cred, userId, username, db) {
+    const rnd = crypto.randomBytes(2).toString('hex');
+    const base = mysqlSafe(db.name).slice(0, 20);
+    const localDb = validateMysqlIdentifier(`${mysqlSafe(username).slice(0, 30)}_${base}`.slice(0, 58) + `_${rnd}`, 'localDb');
+    const localUser = validateMysqlIdentifier(`${mysqlSafe(username).slice(0, 8)}_${base.slice(0, 12)}`.slice(0, 26) + `_${rnd}`, 'localUser');
+    const localPass = crypto.randomBytes(16).toString('base64').replace(/[+/=]/g, '').slice(0, 20);
+    const pwEsc = localPass.replace(/'/g, "''");
+    await execPromise(`sudo -u postgres psql -v ON_ERROR_STOP=0 -c ${shellEscape(`CREATE ROLE ${localUser} LOGIN PASSWORD '${pwEsc}';`)}`).catch(() => { });
+    await execPromise(`sudo -u postgres psql -v ON_ERROR_STOP=1 -c ${shellEscape(`CREATE DATABASE ${localDb} OWNER ${localUser};`)}`);
+    await importRemotePgDb(sshHost, sshPort, sshUser, cred, db.host || 'localhost', db.user || 'postgres', db.pass || '', db.name, localDb);
+    await execPromise(`sudo -u postgres psql -d ${shellEscape(localDb)} -c ${shellEscape(`GRANT ALL ON SCHEMA public TO ${localUser}; GRANT ALL ON ALL TABLES IN SCHEMA public TO ${localUser}; GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ${localUser};`)}`).catch(() => { });
+    return { engine: 'postgres', localDb, localUser, localPass };
+}
+// Migrate whichever engine a backend uses, returning the new local creds.
+async function migrateAnyDb(sshHost, sshPort, sshUser, cred, userId, username, info) {
+    const db = { name: info.name, ...(info.user ? { user: info.user } : {}), ...(info.pass ? { pass: info.pass } : {}), host: info.host || 'localhost' };
+    if (info.engine === 'postgres')
+        return migratePostgresDb(sshHost, sshPort, sshUser, cred, userId, username, db);
+    const local = await migrateSiteDb(sshHost, sshPort, sshUser, cred, userId, username, db); // MySQL/MariaDB
+    return { engine: 'mysql', ...local };
+}
+// Rewrite a backend's .env to point at the new local DB.
+async function rewriteEnvDb(envPath, local) {
+    let c;
+    try {
+        c = await fs.readFile(envPath, 'utf8');
+    }
+    catch {
+        return;
+    }
+    const scheme = local.engine === 'postgres' ? 'postgresql' : 'mysql';
+    const host = local.engine === 'postgres' ? 'localhost' : '127.0.0.1';
+    const port = local.engine === 'postgres' ? '5432' : '3306';
+    if (/^DATABASE_URL=/m.test(c))
+        c = c.replace(/^DATABASE_URL=.*$/m, `DATABASE_URL=${scheme}://${local.localUser}:${local.localPass}@${host}:${port}/${local.localDb}`);
+    const set = (k, v) => { if (new RegExp('^' + k + '=', 'm').test(c))
+        c = c.replace(new RegExp('^' + k + '=.*$', 'm'), `${k}=${v}`); };
+    set('DB_HOST', host);
+    set('PGHOST', host);
+    set('DB_DATABASE', local.localDb);
+    set('DB_NAME', local.localDb);
+    set('PGDATABASE', local.localDb);
+    set('DB_USERNAME', local.localUser);
+    set('DB_USER', local.localUser);
+    set('PGUSER', local.localUser);
+    set('DB_PASSWORD', local.localPass);
+    set('PGPASSWORD', local.localPass);
+    set('DB_PORT', port);
+    set('PGPORT', port);
+    await fs.writeFile(envPath, c);
+}
+// Pick a local port: reuse the backend's original port if free, else allocate.
+async function freePort(preferred) {
+    const taken = async (p) => (await client.query('SELECT 1 FROM user_apps WHERE port=$1', [p])).rowCount > 0
+        || await execPromise(`ss -ltnH 'sport = :${p}'`).then(r => r.stdout.trim().length > 0).catch(() => false);
+    if (preferred && preferred >= 1024 && preferred <= 65535 && !(await taken(preferred)))
+        return preferred;
+    const r = await client.query('SELECT gs FROM generate_series(30000,40000) gs WHERE gs NOT IN (SELECT port FROM user_apps) ORDER BY gs LIMIT 1');
+    return r.rows[0]?.gs ?? 30000;
+}
+// Derive the run command from how the process was started on the source,
+// rebased into the synced app dir (e.g. "node /old/cwd/index.js" → "node index.js").
+function deriveStart(cmd, oldCwd, runtime) {
+    if (!cmd)
+        return runtime === 'python' ? 'python3 app.py' : 'npm start';
+    const toks = cmd.trim().split(/\s+/).map(t => (oldCwd && t.startsWith(oldCwd + '/')) ? t.slice(oldCwd.length + 1) : t);
+    if (toks[0])
+        toks[0] = path.basename(toks[0]); // /usr/bin/node → node
+    return toks.join(' ');
+}
+// Rebuild an nginx vhost from the source server block: repoint root/alias to the
+// new doc-root, rewrite proxy_pass + fastcgi sockets to local, strip TLS (certbot re-adds).
+function reconstructVhost(block, domain, docRoot, portMap, frontendRoot, phpVer) {
+    let v = block || '';
+    if (!v) {
+        const proxyLocs = Object.entries(portMap).map(([, np]) => `    location /api { proxy_pass http://127.0.0.1:${np}; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; }`).join('\n');
+        return `server {\n    listen 80;\n    listen [::]:80;\n    server_name ${domain} www.${domain};\n${docRoot ? `    root ${docRoot};\n    index index.html;\n` : ''}${proxyLocs}\n    location / { try_files $uri $uri/ /index.html; }\n}\n`;
+    }
+    if (frontendRoot && docRoot)
+        v = v.split(frontendRoot).join(docRoot);
+    v = v.replace(/(proxy_pass\s+https?:\/\/)([^:/;\s]+)(?::(\d+))?/g, (_m, p1, _host, port) => {
+        const np = port && portMap[Number(port)] ? portMap[Number(port)] : port;
+        return `${p1}127.0.0.1${np ? ':' + np : ''}`;
+    });
+    v = v.replace(/(fastcgi_pass\s+unix:)[^;]*php[\d.]+-fpm\.sock/g, `$1/run/php/php${phpVer}-fpm.sock`);
+    // strip TLS / listen — we serve :80 and let certbot re-add SSL later
+    v = v.replace(/^[ \t]*listen[^\n;]*;[ \t]*$/gim, '')
+        .replace(/^[ \t]*ssl_[^\n;]*;[ \t]*$/gim, '')
+        .replace(/^[ \t]*include\s+\/etc\/letsencrypt[^\n;]*;[ \t]*$/gim, '');
+    v = v.replace(/server\s*\{/, 'server {\n    listen 80;\n    listen [::]:80;');
+    return v;
+}
+async function handleFullstackPull(payload) {
+    const { migrationId, sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey, userId, username: rawUser, domainName: rawDomain, domainId, frontendRoot, serverBlock, backends = [], phpVersion } = payload;
+    const username = validateUsername(rawUser);
+    const domain = validateDomainName(rawDomain);
+    const docRoot = `/home/${username}/public_html/${domain}`;
+    const cred = await setupSshCred(migrationId, authType, sshPassword, sshKey);
+    await client.query("UPDATE site_migrations SET status='running' WHERE id=$1", [migrationId]);
+    const migratedDbs = [];
+    let frontendType = '';
+    try {
+        await siteLog(migrationId, `Connecting to ${sshUser}@${sourceHost}:${sourcePort} …`);
+        await sshRun(sourceHost, Number(sourcePort), sshUser, cred, 'echo ok');
+        const portMap = {};
+        // 1. Backends (each: sync project → install deps → migrate its DB → env rewrite → PM2).
+        for (const b of backends) {
+            if (!b.cwd) {
+                await siteLog(migrationId, `Backend on :${b.port} isn't running on the source — skipped (start it and resume).`);
+                continue;
+            }
+            const appName = mysqlSafe(b.name || `${domain}-${b.port}`).replace(/_/g, '-').slice(0, 40) || `app-${b.port}`;
+            const appDir = `/home/${username}/apps/${appName}`;
+            await siteLog(migrationId, `Backend "${appName}" (${b.runtime}) ← ${b.cwd}`);
+            await execPromise(`sudo mkdir -p ${shellEscape(appDir)}`);
+            await rsyncFromRemote(sourceHost, Number(sourcePort), sshUser, cred, String(b.cwd).replace(/\/?$/, '/'), appDir + '/', ['--exclude=node_modules', '--exclude=.git']);
+            await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(appDir)}`);
+            await execPromise(`sudo setfacl -R -m user:jonathan:rwx ${shellEscape(appDir)}`).catch(() => { });
+            const dbInfo = await detectDbFromDir(appDir);
+            if (dbInfo?.name) {
+                const h = (dbInfo.host || 'localhost').toLowerCase();
+                if (['localhost', '127.0.0.1', '', '::1'].includes(h)) {
+                    try {
+                        await siteLog(migrationId, `  Migrating ${dbInfo.engine} database "${dbInfo.name}"…`);
+                        const local = await migrateAnyDb(sourceHost, Number(sourcePort), sshUser, cred, userId, username, dbInfo);
+                        await rewriteEnvDb(dbInfo.envPath, local);
+                        await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(dbInfo.envPath)}`).catch(() => { });
+                        migratedDbs.push({ engine: local.engine, name: local.localDb, user: local.localUser });
+                        await siteLog(migrationId, `  DB → ${local.localDb} (${local.engine}); .env rewired.`);
+                    }
+                    catch (e) {
+                        await siteLog(migrationId, `  DB migration warning: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+                else {
+                    await siteLog(migrationId, `  Backend uses external DB host ${dbInfo.host} — left as-is.`);
+                }
+            }
+            // install deps
+            if (b.runtime === 'python') {
+                await execPromise(`sudo -u ${shellEscape(username)} bash -lc ${shellEscape(`cd ${appDir} && [ -f requirements.txt ] && pip3 install --user -r requirements.txt || true`)}`, { timeout: 15 * 60 * 1000 }).catch(() => { });
+            }
+            else {
+                await execPromise(`sudo -u ${shellEscape(username)} bash -lc ${shellEscape(`cd ${appDir} && [ -f package.json ] && npm install || true`)}`, { timeout: 15 * 60 * 1000 }).catch(() => { });
+            }
+            // run under PM2 on a local port (prefer original)
+            const port = await freePort(Number(b.port));
+            portMap[Number(b.port)] = port;
+            const startCmd = deriveStart(b.cmd, b.cwd, b.runtime);
+            const appRes = await client.query(`INSERT INTO user_apps (user_id, domain_id, name, type, port, startup_script, status) VALUES ($1,$2,$3,$4,$5,$6,'running') RETURNING id`, [userId, domainId ?? null, appName, b.runtime === 'python' ? 'python' : 'node', port, startCmd]);
+            const launcher = `${appDir}/.superhost-start.sh`;
+            await fs.writeFile('/tmp/.superhost-start.sh', `#!/bin/bash\ncd ${appDir}\nexport PORT=${port}\nexec ${startCmd}\n`);
+            await execPromise(`sudo mv /tmp/.superhost-start.sh ${shellEscape(launcher)}`);
+            await execPromise(`sudo chown ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(launcher)} && sudo chmod 755 ${shellEscape(launcher)}`);
+            await execPromise(`sudo -u ${shellEscape(username)} pm2 start ${shellEscape(launcher)} --name app_${appRes.rows[0].id} --interpreter bash --cwd ${shellEscape(appDir)}`).catch((e) => siteLog(migrationId, `  PM2 warning: ${e.message}`));
+            await execPromise(`sudo -u ${shellEscape(username)} pm2 save --force`).catch(() => { });
+            await siteLog(migrationId, `  Started on :${port} (${startCmd})`);
+        }
+        // 2. Frontend files (+ its own DB if it's WordPress/Laravel/etc.).
+        if (frontendRoot) {
+            await execPromise(`sudo mkdir -p ${shellEscape(docRoot)}`);
+            await rsyncFromRemote(sourceHost, Number(sourcePort), sshUser, cred, String(frontendRoot).replace(/\/?$/, '/'), docRoot + '/', ['--exclude=node_modules', '--exclude=.git']);
+            await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(docRoot)}`);
+            await execPromise(`sudo setfacl -R -m user:jonathan:rwx ${shellEscape(docRoot)}`).catch(() => { });
+            await siteLog(migrationId, 'Frontend files synced.');
+            const appInfo = await detectSiteApp(docRoot);
+            frontendType = appInfo.type;
+            if (appInfo.db?.name && appInfo.configFile && ['localhost', '127.0.0.1', ''].includes((appInfo.db.host || 'localhost').toLowerCase())) {
+                try {
+                    const local = await migrateSiteDb(sourceHost, Number(sourcePort), sshUser, cred, userId, username, { name: appInfo.db.name, ...(appInfo.db.user ? { user: appInfo.db.user } : {}), ...(appInfo.db.pass ? { pass: appInfo.db.pass } : {}), host: appInfo.db.host || 'localhost' });
+                    await rewriteSiteDbConfig(appInfo.type, appInfo.configFile, local.localDb, local.localUser, local.localPass);
+                    migratedDbs.push({ engine: 'mysql', name: local.localDb, user: local.localUser });
+                    await siteLog(migrationId, `Frontend DB (${appInfo.type}) → ${local.localDb}.`);
+                }
+                catch (e) {
+                    await siteLog(migrationId, `Frontend DB warning: ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+        }
+        // 3. nginx vhost reconstructed from the source's own routing.
+        const ver = resolvePhpVersion(validatePhpVersion(phpVersion || '8.3'));
+        const vhost = reconstructVhost(serverBlock ?? null, domain, frontendRoot ? docRoot : null, portMap, frontendRoot ?? null, ver);
+        await fs.writeFile(`/tmp/${domain}.vhost`, vhost);
+        await execPromise(`sudo mv ${shellEscape(`/tmp/${domain}.vhost`)} /etc/nginx/sites-available/${shellEscape(domain)}`);
+        await execPromise(`sudo ln -sf /etc/nginx/sites-available/${shellEscape(domain)} /etc/nginx/sites-enabled/${shellEscape(domain)}`);
+        await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+        const detected = backends.length > 0 ? 'fullstack' : (frontendType || 'static');
+        await client.query("UPDATE site_migrations SET status='completed', completed_at=NOW(), detected_type=$5, migrated_db=$2, migrated_db_name=$3, migrated_dbs=$4 WHERE id=$1", [migrationId, migratedDbs.length > 0, migratedDbs[0]?.name ?? null, JSON.stringify(migratedDbs), detected]);
+        await siteLog(migrationId, `✓ Full-stack migration complete (${backends.length} backend(s), ${migratedDbs.length} database(s)). Run SSL when DNS points here.`);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await client.query("UPDATE site_migrations SET status='failed', error_message=$1, migrated_dbs=$2 WHERE id=$3", [msg, JSON.stringify(migratedDbs), migrationId]);
+        await siteLog(migrationId, `ERROR: ${msg}`);
+        throw err;
+    }
+    finally {
+        if (cred.type === 'key')
+            await fs.unlink(cred.keyPath).catch(() => { });
+    }
+}
 async function handleMigrateSite(payload) {
+    // Full-stack pull (nginx server block and/or proxied backends) → dedicated path.
+    if (payload.direction !== 'push' && (payload.serverBlock || (Array.isArray(payload.backends) && payload.backends.length > 0))) {
+        return handleFullstackPull(payload);
+    }
     const { migrationId, direction, sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey, remotePath, userId, username: rawUser, domainName: rawDomain, domainId, stack, appPort, installCommand, buildCommand, startCommand, phpVersion } = payload;
     const username = validateUsername(rawUser);
     const domain = validateDomainName(rawDomain);
@@ -4091,10 +4376,13 @@ async function handleCleanupSiteMigration(payload) {
     const domain = mig.domain_name;
     await siteLog(migrationId, `Cleaning up migration of ${domain}…`);
     // 1. App: stop & remove any PM2 process + user_apps row tied to this domain.
-    const apps = await client.query('SELECT id FROM user_apps WHERE domain_id=$1', [mig.domain_id]);
+    const apps = await client.query('SELECT id, name FROM user_apps WHERE domain_id=$1', [mig.domain_id]);
+    const appNames = [];
     for (const a of apps.rows) {
         if (username)
             await execPromise(`sudo -u ${shellEscape(username)} pm2 delete app_${a.id}`).catch(() => { });
+        if (a.name)
+            appNames.push(a.name);
         await client.query('DELETE FROM user_apps WHERE id=$1', [a.id]);
     }
     // Only persist PM2 state if the user actually had apps — otherwise `pm2 save`
@@ -4104,13 +4392,27 @@ async function handleCleanupSiteMigration(payload) {
     // 2. nginx vhost.
     await execPromise(`sudo rm -f /etc/nginx/sites-enabled/${shellEscape(domain)} /etc/nginx/sites-available/${shellEscape(domain)}`).catch(() => { });
     await execPromise('sudo nginx -t && sudo systemctl reload nginx').catch(() => { });
-    // 3. Migrated database (drop the exact DB we created, plus its panel row).
-    if (mig.migrated_db_name) {
-        const dbRow = await client.query('SELECT db_user FROM databases WHERE db_name=$1', [mig.migrated_db_name]);
-        const dbUser = dbRow.rows[0]?.db_user;
-        if (dbUser)
-            await handleDeleteDatabase({ dbName: mig.migrated_db_name, dbUser }).catch((e) => siteLog(migrationId, `DB drop warning: ${e.message}`));
-        await client.query('DELETE FROM databases WHERE db_name=$1', [mig.migrated_db_name]);
+    // 3. Migrated databases — drop each one we created, MySQL or PostgreSQL.
+    const dbs = Array.isArray(mig.migrated_dbs) && mig.migrated_dbs.length
+        ? mig.migrated_dbs
+        : (mig.migrated_db_name ? [{ engine: 'mysql', name: mig.migrated_db_name }] : []);
+    for (const d of dbs) {
+        try {
+            if (d.engine === 'postgres') {
+                await execPromise(`sudo -u postgres psql -c ${shellEscape(`DROP DATABASE IF EXISTS ${validateMysqlIdentifier(d.name)};`)}`).catch(() => { });
+                if (d.user)
+                    await execPromise(`sudo -u postgres psql -c ${shellEscape(`DROP ROLE IF EXISTS ${validateMysqlIdentifier(d.user)};`)}`).catch(() => { });
+            }
+            else {
+                const dbUser = d.user || (await client.query('SELECT db_user FROM databases WHERE db_name=$1', [d.name])).rows[0]?.db_user;
+                if (dbUser)
+                    await handleDeleteDatabase({ dbName: d.name, dbUser });
+            }
+            await client.query('DELETE FROM databases WHERE db_name=$1', [d.name]);
+        }
+        catch (e) {
+            await siteLog(migrationId, `DB drop warning (${d.name}): ${e instanceof Error ? e.message : String(e)}`);
+        }
     }
     // 4. Files + domain row — or the whole user if requested and it owns nothing else.
     let didRemoveUser = false;
@@ -4143,8 +4445,11 @@ async function handleCleanupSiteMigration(payload) {
         }
     }
     if (!didRemoveUser) {
-        if (username)
+        if (username) {
             await execPromise(`sudo rm -rf /home/${shellEscape(username)}/public_html/${shellEscape(domain)}`).catch(() => { });
+            for (const name of appNames)
+                await execPromise(`sudo rm -rf /home/${shellEscape(username)}/apps/${shellEscape(name)}`).catch(() => { });
+        }
         if (mig.domain_id)
             await client.query('DELETE FROM domains WHERE id=$1', [mig.domain_id]).catch(() => { });
     }

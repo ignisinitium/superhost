@@ -129,9 +129,13 @@ router.post('/scan-import', async (req, res) => {
         const migrated = [], skipped = [];
         for (const s of sites) {
             const dom = String(s?.domainName ?? s?.domain ?? '').toLowerCase().trim();
-            const rp = String(s?.remotePath ?? '');
-            const st = STACKS.includes(s?.stack) ? s.stack : 'static';
-            if (!DOMAIN_RE.test(dom) || !rp.startsWith('/')) {
+            const frontendRoot = String(s?.frontendRoot ?? s?.remotePath ?? '');
+            const serverBlock = typeof s?.serverBlock === 'string' ? s.serverBlock : null;
+            const backends = Array.isArray(s?.backends) ? s.backends : [];
+            const hasFrontend = frontendRoot.startsWith('/');
+            const st = backends.length ? 'fullstack' : (STACKS.includes(s?.stack) ? s.stack : 'static');
+            // Valid if it has a domain and at least one of: doc-root, backend, or server block.
+            if (!DOMAIN_RE.test(dom) || (!hasFrontend && backends.length === 0 && !serverBlock)) {
                 skipped.push(dom || '(invalid)');
                 continue;
             }
@@ -140,20 +144,17 @@ router.post('/scan-import', async (req, res) => {
                 skipped.push(dom);
                 continue;
             }
-            const cmds = st === 'node' ? { installCommand: 'npm install', startCommand: 'npm start' }
-                : st === 'python' ? { installCommand: 'pip3 install -r requirements.txt', startCommand: 'python3 app.py' }
-                    : { installCommand: null, startCommand: null };
             const mig = await query(`INSERT INTO site_migrations
            (direction, source_host, source_port, ssh_user, remote_path, target_user_id, domain_name, stack,
-            install_command, start_command)
-         VALUES ('pull',$1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, [host, port, sshUser, rp, userId, dom, st, cmds.installCommand, cmds.startCommand]);
+            server_block, frontend_root, backends)
+         VALUES ('pull',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, [host, port, sshUser, hasFrontend ? frontendRoot : '', userId, dom, st, serverBlock, hasFrontend ? frontendRoot : null, JSON.stringify(backends)]);
             const migrationId = mig.rows[0].id;
             const docRoot = `/home/${uname}/public_html/${dom}`;
             const domRes = await query(`INSERT INTO domains (user_id, domain_name, document_root, php_version) VALUES ($1,$2,$3,'8.3') RETURNING id`, [userId, dom, docRoot]);
             await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['MIGRATE_SITE', {
                     migrationId, direction: 'pull', sourceHost: host, sourcePort: port, sshUser, authType: authType || 'key', sshPassword, sshKey,
-                    remotePath: rp, userId, username: uname, domainName: dom, domainId: domRes.rows[0].id, stack: st,
-                    installCommand: cmds.installCommand, startCommand: cmds.startCommand, phpVersion: '8.3',
+                    remotePath: hasFrontend ? frontendRoot : '', userId, username: uname, domainName: dom, domainId: domRes.rows[0].id, stack: st,
+                    frontendRoot: hasFrontend ? frontendRoot : null, serverBlock, backends, phpVersion: '8.3',
                 }]);
             migrated.push(dom);
         }
@@ -277,6 +278,8 @@ router.post('/:id/resume', async (req, res) => {
                 domainName: m.domain_name, domainId: d.rows[0]?.id ?? null, stack: m.stack,
                 appPort: m.app_port, installCommand: m.install_command, buildCommand: m.build_command,
                 startCommand: m.start_command, phpVersion: '8.3',
+                // full-stack context (rebuilds the multi-component path on resume)
+                frontendRoot: m.frontend_root, serverBlock: m.server_block, backends: m.backends ?? [],
             }]);
         await logAudit(req, 'site.migrate_resume', { targetType: 'domain', targetId: m.domain_name });
         res.json({ ok: true });

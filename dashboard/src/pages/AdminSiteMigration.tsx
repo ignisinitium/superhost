@@ -1,12 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import api from '../api/client';
 import toast from 'react-hot-toast';
-import { ServerCog, Loader2, CheckCircle2, XCircle, Clock, RefreshCw, Plug, ArrowDownToLine, ArrowUpFromLine, Search, UserPlus, Users, Database, RotateCcw, Trash2, X } from 'lucide-react';
+import { ServerCog, Loader2, CheckCircle2, XCircle, Clock, RefreshCw, Plug, ArrowDownToLine, ArrowUpFromLine, Search, UserPlus, Users, Database, RotateCcw, Trash2, X, Server } from 'lucide-react';
 
 interface User { id: number; username: string; }
 interface Migration {
   id: number; direction: string; source_host: string; ssh_user: string; remote_path: string; domain_name: string;
   stack: string; detected_type?: string; migrated_db?: boolean; status: string; error_message?: string; created_at: string; target_user?: string;
+}
+interface Backend { port: number; runtime: string; name?: string; cwd?: string; db?: { engine: string; name: string } | null }
+interface ScanSite {
+  domain: string; remotePath?: string; frontendRoot?: string; stack: string;
+  backends?: Backend[]; proxies?: { location: string; port: number }[]; serverBlock?: string | null;
 }
 
 const STACKS = [
@@ -30,7 +35,7 @@ const AdminSiteMigration: React.FC = () => {
 
   // Scan + import-account flow
   const [scanning, setScanning] = useState(false);
-  const [scan, setScan] = useState<{ id: number; status: string; sites: { domain: string; remotePath: string; stack: string }[] } | null>(null);
+  const [scan, setScan] = useState<{ id: number; status: string; sites: ScanSite[] } | null>(null);
   const [sel, setSel] = useState<Record<number, boolean>>({});
   const [acct, setAcct] = useState({ mode: 'new', username: '', email: '', password: '' });
   const [importing, setImporting] = useState(false);
@@ -147,7 +152,10 @@ const AdminSiteMigration: React.FC = () => {
         authType: f.authType, sshPassword: f.sshPassword, sshKey: f.sshKey,
         createUser: acct.mode === 'new', username: acct.username, email: acct.email, password: acct.password,
         targetUserId: f.targetUserId,
-        sites: chosen.map(s => ({ domainName: s.domain, remotePath: s.remotePath, stack: s.stack })),
+        sites: chosen.map(s => ({
+          domainName: s.domain, frontendRoot: s.frontendRoot ?? s.remotePath, stack: s.stack,
+          serverBlock: s.serverBlock ?? null, backends: s.backends ?? [], proxies: s.proxies ?? [],
+        })),
       });
       toast.success(`Migrating ${data.migrated.length} site(s) into ${data.username}`);
       if (data.skipped?.length) toast(`Skipped ${data.skipped.length} (already hosted / invalid)`);
@@ -286,19 +294,29 @@ const AdminSiteMigration: React.FC = () => {
                 <button onClick={() => setSel({})} className="text-slate-500 font-bold hover:underline">Clear</button>
               </div>
               <div className="divide-y divide-slate-100 max-h-72 overflow-y-auto">
-                {scan.sites.map((s, i) => (
+                {scan.sites.map((s, i) => {
+                  const dbEngines = [...new Set((s.backends || []).map(b => b.db?.engine).filter(Boolean))];
+                  return (
                   <label key={i} className="flex items-center gap-3 px-5 py-2.5 hover:bg-slate-50 cursor-pointer">
                     <input type="checkbox" checked={!!sel[i]} onChange={e => setSel(p => ({ ...p, [i]: e.target.checked }))} className="accent-emerald-600" />
-                    <span className="font-medium text-slate-800 w-56 truncate">{s.domain}</span>
-                    <span className="text-slate-400 text-xs flex-1 truncate font-mono">{s.remotePath}</span>
-                    <select value={s.stack}
-                      onChange={e => setScan(sc => sc ? { ...sc, sites: sc.sites.map((x, j) => j === i ? { ...x, stack: e.target.value } : x) } : sc)}
-                      onClick={e => e.preventDefault()}
-                      className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-1">
-                      {STACKS.map(st => <option key={st.v} value={st.v}>{st.label}</option>)}
-                    </select>
+                    <span className="font-medium text-slate-800 w-52 truncate">{s.domain}</span>
+                    <span className="text-slate-400 text-xs flex-1 truncate font-mono">{s.frontendRoot ?? s.remotePath ?? '(proxy only)'}</span>
+                    {(s.backends?.length ?? 0) > 0 ? (
+                      <span className="flex items-center gap-1.5 text-xs">
+                        <span className="bg-violet-50 text-violet-700 px-1.5 py-0.5 rounded font-bold flex items-center gap-1"><Server size={11} />{s.backends!.length} service{s.backends!.length > 1 ? 's' : ''}</span>
+                        {dbEngines.map(e => <span key={e} className="bg-sky-50 text-sky-700 px-1.5 py-0.5 rounded font-bold flex items-center gap-1"><Database size={11} />{e}</span>)}
+                      </span>
+                    ) : (
+                      <select value={s.stack}
+                        onChange={e => setScan(sc => sc ? { ...sc, sites: sc.sites.map((x, j) => j === i ? { ...x, stack: e.target.value } : x) } : sc)}
+                        onClick={e => e.preventDefault()}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-1">
+                        {STACKS.map(st => <option key={st.v} value={st.v}>{st.label}</option>)}
+                      </select>
+                    )}
                   </label>
-                ))}
+                  );
+                })}
               </div>
 
               {/* Account target */}
