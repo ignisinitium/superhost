@@ -1858,10 +1858,18 @@ async function handleSyncDnsZone(payload) {
         const recordLines = records.map((r) => {
             const type = validateDnsType(r.type);
             const rawName = sanitizeZoneField(r.name, 'record name');
-            const name = rawName === '@' ? '' : rawName;
+            // Always emit an explicit owner ('@' for the apex). A blank owner makes
+            // BIND inherit the PREVIOUS record's owner, which silently attaches apex
+            // MX/TXT to whatever name came before them (e.g. www).
+            const name = rawName;
             const priority = r.priority ? `\t${parseInt(r.priority, 10)}` : '';
             const ttl = r.ttl ? `\t${parseInt(r.ttl, 10)}` : '';
             let content = sanitizeZoneField(r.content, 'record content');
+            // FQDN targets must end with a dot, or BIND appends the zone origin
+            // (turning mail.example.com into mail.example.com.example.com).
+            if (['MX', 'CNAME', 'NS', 'PTR'].includes(type) && content.includes('.') && !content.endsWith('.')) {
+                content += '.';
+            }
             if (type === 'TXT') {
                 // Strip outer quotes, escape embedded backslashes/quotes, then re-quote
                 // and split into ≤255-byte chunks for BIND.
@@ -5368,16 +5376,35 @@ async function handleMigrateCwp(payload) {
                     }
                     // Provision the Dovecot mailbox directory
                     await handleProvisionMailbox({ email: emailAddr });
-                    // Rsync Maildir if available on remote
+                    // Copy the existing mail. CWP/Dovecot installs vary in where Maildirs
+                    // live, so probe the known layouts and sync from whichever exists.
                     const [localPart] = emailAddr.split('@');
-                    const remoteMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
                     const localMaildir = `/var/mail/vhosts/${emailDomain}/${localPart}/`;
+                    const candidates = [
+                        `/var/vmail/${emailDomain}/${localPart}`,
+                        `/var/mail/vhosts/${emailDomain}/${localPart}`,
+                        `/home/${username}/mail/${emailDomain}/${localPart}`,
+                        `/home/vmail/${emailDomain}/${localPart}`,
+                    ];
+                    const probe = `for p in ${candidates.map(p => `'${p.replace(/'/g, `'\\''`)}'`).join(' ')}; do [ -d "$p/cur" ] && { echo "$p"; break; }; done`;
+                    let remoteMaildir = '';
                     try {
-                        await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred, remoteMaildir, localMaildir);
-                        await cwpLog(migrationId, `  [${username}] Email ${emailAddr} + Maildir synced`);
+                        remoteMaildir = (await sshRun(remoteHost, remotePort, remoteUser, cred, probe)).trim().split('\n').filter(Boolean)[0] || '';
                     }
-                    catch {
-                        await cwpLog(migrationId, `  [${username}] Email ${emailAddr} created (no remote Maildir found)`);
+                    catch { /* probe failed → treat as none */ }
+                    if (remoteMaildir) {
+                        try {
+                            // Skip stale index files so Dovecot rebuilds them; keep dovecot-uidlist (preserves UIDs + read/unread flags).
+                            await rsyncFromRemote(remoteHost, remotePort, remoteUser, cred, remoteMaildir + '/', localMaildir, ['--exclude=dovecot.index*', '--exclude=dovecot.list.index*', '--exclude=dovecot-uidvalidity*']);
+                            await execPromise(`sudo chown -R vmail:vmail ${shellEscape(localMaildir)}`);
+                            await cwpLog(migrationId, `  [${username}] Maildir synced for ${emailAddr} (from ${remoteMaildir})`);
+                        }
+                        catch (e) {
+                            await cwpLog(migrationId, `  [${username}] Maildir sync failed for ${emailAddr}: ${e instanceof Error ? e.message : String(e)}`);
+                        }
+                    }
+                    else {
+                        await cwpLog(migrationId, `  [${username}] Email ${emailAddr} created (no mailbox contents found on source)`);
                     }
                 }
                 catch (e) {

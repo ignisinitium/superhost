@@ -711,6 +711,34 @@ const MigrationPage: React.FC = () => {
             </div>
           </div>
 
+          {/* SSH credentials aren't stored — re-enter them here if missing (e.g. after
+              reopening a discovered migration or reloading) so the migration can run. */}
+          {((authType === 'password' && !password) || (authType === 'key' && !sshKey.trim())) && (
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-2">
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-amber-700">
+                Re-enter SSH {authType === 'password' ? 'password' : 'key'} to start the migration
+              </label>
+              <p className="text-xs text-amber-700">Credentials aren’t stored, so they’re needed again to migrate {host}.</p>
+              {authType === 'password' ? (
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full bg-white border border-slate-200 rounded-xl py-2.5 px-4 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-indigo-500/40 transition-all"
+                />
+              ) : (
+                <textarea
+                  value={sshKey}
+                  onChange={(e) => setSshKey(e.target.value)}
+                  placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;..."
+                  rows={4}
+                  className="w-full bg-white border border-slate-200 rounded-xl py-2.5 px-4 text-xs font-mono text-slate-800 outline-none focus:ring-2 focus:ring-indigo-500/40 resize-none transition-all"
+                />
+              )}
+            </div>
+          )}
+
           <div className="flex gap-3">
             <button
               onClick={() => { setStep('connect'); setMigId(null); setMigration(null); }}
