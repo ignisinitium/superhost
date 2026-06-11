@@ -10,6 +10,17 @@ const DOMAIN_RE = /^(?!-)[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})+$/i;
 const HOST_RE = /^(?!-)[a-z0-9.-]{1,253}$|^(\d{1,3}\.){3}\d{1,3}$/i;
 const USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
 const STACKS = ['node', 'python', 'static', 'php'];
+// Derive a hosting username from a domain (drop www + TLD, sanitize).
+// e.g. www.pgturnerbooks.com -> pgturnerbooks ; shop.example.co.uk -> shop_example_co
+function deriveUsername(domain) {
+    const noWww = domain.replace(/^www\./i, '');
+    const parts = noWww.split('.');
+    const base = (parts.length > 1 ? parts.slice(0, -1) : parts).join('_');
+    let u = base.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 32);
+    if (!/^[a-z_]/.test(u))
+        u = 'u' + u;
+    return u.slice(0, 32) || 'site';
+}
 // Create a local user (mirrors POST /api/users) and queue its provisioning.
 // Returns { id, username } with the conflict-resolved final username.
 async function createUserInline(username, email, password, packageId) {
@@ -22,8 +33,11 @@ async function createUserInline(username, email, password, packageId) {
     }
     const homeDir = `/home/${finalUsername}`;
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
+    // users.email is NOT NULL — synthesise a placeholder when none was supplied
+    // (the admin can edit it later). finalUsername is unique, so this is too.
+    const finalEmail = email && email.trim() ? email.trim() : `${finalUsername}@imported.local`;
     const r = await query(`INSERT INTO users (username, email, home_dir, password_hash, disk_limit_mb, bandwidth_limit_mb, package_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, username`, [finalUsername, email ?? null, homeDir, passwordHash, 1024, 5120, packageId ?? null]);
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, username`, [finalUsername, finalEmail, homeDir, passwordHash, 1024, 5120, packageId ?? null]);
     await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CREATE_USER', { username: finalUsername }]);
     return r.rows[0];
 }
@@ -98,11 +112,14 @@ router.get('/scan/:id', async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
-// Import discovered sites: optionally create a new user, then queue a pull per site.
+// Import discovered sites. Default: one hosting account per site (username
+// derived from the domain). Or assign all sites to one existing user.
 router.post('/scan-import', async (req, res) => {
-    const { sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey, createUser, username, email, password, package_id, targetUserId, sites, } = req.body ?? {};
+    const { sourceHost, sourcePort, sshUser, authType, sshPassword, sshKey, accountMode, targetUserId, sites, } = req.body ?? {};
     const host = String(sourceHost ?? '').trim();
     const port = parseInt(sourcePort ?? 22, 10) || 22;
+    // 'per-site' (default) = a new user per site; 'existing' = all into targetUserId.
+    const mode = accountMode === 'existing' ? 'existing' : 'per-site';
     try {
         if (!HOST_RE.test(host))
             return res.status(400).json({ message: 'Invalid remote host' });
@@ -110,21 +127,14 @@ router.post('/scan-import', async (req, res) => {
             return res.status(400).json({ message: 'SSH user is required' });
         if (!Array.isArray(sites) || sites.length === 0)
             return res.status(400).json({ message: 'Select at least one site' });
-        let userId, uname;
-        if (createUser) {
-            const uReq = String(username ?? '').toLowerCase().trim();
-            if (!USERNAME_RE.test(uReq))
-                return res.status(400).json({ message: 'Invalid username' });
-            const u = await createUserInline(uReq, email, password, package_id ? parseInt(package_id, 10) : undefined);
-            userId = u.id;
-            uname = u.username;
-        }
-        else {
+        // For 'existing', resolve the single shared user once.
+        let sharedUserId = 0, sharedUname = '';
+        if (mode === 'existing') {
             const u = await query('SELECT id, username FROM users WHERE id = $1', [targetUserId]);
             if (u.rows.length === 0)
                 return res.status(404).json({ message: 'Target user not found' });
-            userId = u.rows[0].id;
-            uname = u.rows[0].username;
+            sharedUserId = u.rows[0].id;
+            sharedUname = u.rows[0].username;
         }
         const migrated = [], skipped = [];
         for (const s of sites) {
@@ -144,6 +154,17 @@ router.post('/scan-import', async (req, res) => {
                 skipped.push(dom);
                 continue;
             }
+            // Resolve the user for THIS site.
+            let userId, uname;
+            if (mode === 'existing') {
+                userId = sharedUserId;
+                uname = sharedUname;
+            }
+            else {
+                const u = await createUserInline(deriveUsername(dom), `admin@${dom}`); // dedupes; provisions Linux user
+                userId = u.id;
+                uname = u.username;
+            }
             const mig = await query(`INSERT INTO site_migrations
            (direction, source_host, source_port, ssh_user, remote_path, target_user_id, domain_name, stack,
             server_block, frontend_root, backends)
@@ -156,10 +177,10 @@ router.post('/scan-import', async (req, res) => {
                     remotePath: hasFrontend ? frontendRoot : '', userId, username: uname, domainName: dom, domainId: domRes.rows[0].id, stack: st,
                     frontendRoot: hasFrontend ? frontendRoot : null, serverBlock, backends, phpVersion: '8.3',
                 }]);
-            migrated.push(dom);
+            migrated.push({ domain: dom, user: uname });
         }
-        await logAudit(req, 'site.migrate_account', { targetType: 'user', targetId: userId, metadata: { remoteHost: host, migrated, skipped } });
-        res.status(201).json({ userId, username: uname, migrated, skipped });
+        await logAudit(req, 'site.migrate_account', { targetType: 'domain', targetId: host, metadata: { remoteHost: host, mode, migrated, skipped } });
+        res.status(201).json({ mode, migrated, skipped });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

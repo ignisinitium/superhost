@@ -4090,10 +4090,15 @@ function reconstructVhost(block, domain, docRoot, portMap, frontendRoot, phpVer)
         return `${p1}127.0.0.1${np ? ':' + np : ''}`;
     });
     v = v.replace(/(fastcgi_pass\s+unix:)[^;]*php[\d.]+-fpm\.sock/g, `$1/run/php/php${phpVer}-fpm.sock`);
-    // strip TLS / listen — we serve :80 and let certbot re-add SSL later
-    v = v.replace(/^[ \t]*listen[^\n;]*;[ \t]*$/gim, '')
-        .replace(/^[ \t]*ssl_[^\n;]*;[ \t]*$/gim, '')
-        .replace(/^[ \t]*include\s+\/etc\/letsencrypt[^\n;]*;[ \t]*$/gim, '');
+    // Strip TLS/listen/Certbot lines (we serve :80; certbot re-adds SSL later).
+    // Done line-by-line so a trailing "# managed by Certbot" comment doesn't
+    // defeat an end-anchored regex and leave a dangling ssl_certificate.
+    v = v.split('\n').filter(line => {
+        const t = line.trim();
+        return !/^listen\b/.test(t)
+            && !/^ssl_/.test(t)
+            && !/^include\s+\/etc\/letsencrypt/.test(t);
+    }).join('\n');
     v = v.replace(/server\s*\{/, 'server {\n    listen 80;\n    listen [::]:80;');
     return v;
 }
@@ -4190,7 +4195,16 @@ async function handleFullstackPull(payload) {
         await fs.writeFile(`/tmp/${domain}.vhost`, vhost);
         await execPromise(`sudo mv ${shellEscape(`/tmp/${domain}.vhost`)} /etc/nginx/sites-available/${shellEscape(domain)}`);
         await execPromise(`sudo ln -sf /etc/nginx/sites-available/${shellEscape(domain)} /etc/nginx/sites-enabled/${shellEscape(domain)}`);
-        await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+        // If the vhost is bad, REMOVE it before throwing — otherwise it stays in
+        // sites-enabled and breaks `nginx -t` (and reloads) for every other site.
+        try {
+            await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+        }
+        catch (e) {
+            await execPromise(`sudo rm -f /etc/nginx/sites-enabled/${shellEscape(domain)} /etc/nginx/sites-available/${shellEscape(domain)}`).catch(() => { });
+            await execPromise('sudo systemctl reload nginx').catch(() => { });
+            throw new Error(`nginx rejected the vhost for ${domain}: ${e instanceof Error ? e.message : String(e)}`);
+        }
         const detected = backends.length > 0 ? 'fullstack' : (frontendType || 'static');
         await client.query("UPDATE site_migrations SET status='completed', completed_at=NOW(), detected_type=$5, migrated_db=$2, migrated_db_name=$3, migrated_dbs=$4 WHERE id=$1", [migrationId, migratedDbs.length > 0, migratedDbs[0]?.name ?? null, JSON.stringify(migratedDbs), detected]);
         await siteLog(migrationId, `✓ Full-stack migration complete (${backends.length} backend(s), ${migratedDbs.length} database(s)). Run SSL when DNS points here.`);

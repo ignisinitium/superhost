@@ -37,7 +37,7 @@ const AdminSiteMigration: React.FC = () => {
   const [scanning, setScanning] = useState(false);
   const [scan, setScan] = useState<{ id: number; status: string; sites: ScanSite[] } | null>(null);
   const [sel, setSel] = useState<Record<number, boolean>>({});
-  const [acct, setAcct] = useState({ mode: 'new', username: '', email: '', password: '' });
+  const [acct, setAcct] = useState({ mode: 'per-site', username: '', email: '', password: '' });
   const [importing, setImporting] = useState(false);
   const setA = (k: string, v: string) => setAcct(p => ({ ...p, [k]: v }));
 
@@ -143,23 +143,24 @@ const AdminSiteMigration: React.FC = () => {
     if (!scan) return;
     const chosen = scan.sites.filter((_, i) => sel[i]);
     if (!chosen.length) return toast.error('Select at least one site');
-    if (acct.mode === 'new' && !acct.username) return toast.error('Enter a username for the new account');
     if (acct.mode === 'existing' && !f.targetUserId) return toast.error('Pick an existing user');
+    if (f.authType === 'password' && !f.sshPassword) return toast.error('SSH password is required (re-enter it in the source section)');
+    if (f.authType === 'key' && !f.sshKey) return toast.error('SSH key is required (re-enter it in the source section)');
     setImporting(true);
     try {
       const { data } = await api.post('/admin/site-migrations/scan-import', {
         sourceHost: f.sourceHost, sourcePort: Number(f.sourcePort), sshUser: f.sshUser,
         authType: f.authType, sshPassword: f.sshPassword, sshKey: f.sshKey,
-        createUser: acct.mode === 'new', username: acct.username, email: acct.email, password: acct.password,
+        accountMode: acct.mode,          // 'per-site' (a user each) or 'existing'
         targetUserId: f.targetUserId,
         sites: chosen.map(s => ({
           domainName: s.domain, frontendRoot: s.frontendRoot ?? s.remotePath, stack: s.stack,
           serverBlock: s.serverBlock ?? null, backends: s.backends ?? [], proxies: s.proxies ?? [],
         })),
       });
-      toast.success(`Migrating ${data.migrated.length} site(s) into ${data.username}`);
+      toast.success(`Migrating ${data.migrated.length} site(s)${acct.mode === 'per-site' ? ' — one account each' : ''}`);
       if (data.skipped?.length) toast(`Skipped ${data.skipped.length} (already hosted / invalid)`);
-      setScan(null); setAcct({ mode: 'new', username: '', email: '', password: '' });
+      setScan(null); setAcct({ mode: 'per-site', username: '', email: '', password: '' });
       loadMigrations();
     } catch (e: any) { toast.error(e.response?.data?.message || 'Import failed'); }
     finally { setImporting(false); }
@@ -322,19 +323,27 @@ const AdminSiteMigration: React.FC = () => {
               {/* Account target */}
               <div className="p-5 border-t border-slate-100 bg-slate-50/40 space-y-4">
                 <div className="flex gap-1 bg-slate-100 p-1 rounded-xl w-fit">
-                  <button type="button" onClick={() => setA('mode', 'new')} className={pill(acct.mode === 'new')}><UserPlus size={15} /> Create new user</button>
-                  <button type="button" onClick={() => setA('mode', 'existing')} className={pill(acct.mode === 'existing')}><Users size={15} /> Existing user</button>
+                  <button type="button" onClick={() => setA('mode', 'per-site')} className={pill(acct.mode === 'per-site')}><UserPlus size={15} /> A user per site</button>
+                  <button type="button" onClick={() => setA('mode', 'existing')} className={pill(acct.mode === 'existing')}><Users size={15} /> One existing user</button>
                 </div>
-                {acct.mode === 'new' ? (
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <input value={acct.username} onChange={e => setA('username', e.target.value.toLowerCase())} placeholder="new username" className={input} />
-                    <input value={acct.email} onChange={e => setA('email', e.target.value)} placeholder="email (optional)" className={input} />
-                    <input type="password" value={acct.password} onChange={e => setA('password', e.target.value)} placeholder="password (optional)" className={input} />
-                  </div>
+                {acct.mode === 'per-site' ? (
+                  <p className="text-sm text-slate-500">
+                    A separate hosting account is created for each selected site, with the username derived from its domain
+                    (e.g. <span className="font-mono text-slate-700">pgturnerbooks.com → pgturnerbooks</span>). Conflicts get a short suffix.
+                  </p>
                 ) : (
                   <select value={f.targetUserId} onChange={e => set('targetUserId', e.target.value)} className={`${input} md:w-72`}>
                     <option value="">Select user…</option>{users.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
                   </select>
+                )}
+                {/* SSH creds aren't stored — if cleared (e.g. reload), re-enter here so the migration can run. */}
+                {((f.authType === 'password' && !f.sshPassword) || (f.authType === 'key' && !f.sshKey)) && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 space-y-1.5">
+                    <label className="block text-xs font-bold text-amber-700">Re-enter SSH {f.authType === 'password' ? 'password' : 'key'} to migrate (not stored)</label>
+                    {f.authType === 'password'
+                      ? <input type="password" value={f.sshPassword} onChange={e => set('sshPassword', e.target.value)} placeholder="SSH password" className={input} />
+                      : <textarea value={f.sshKey} onChange={e => set('sshKey', e.target.value)} rows={3} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" className={`${input} font-mono text-xs`} />}
+                  </div>
                 )}
                 <button onClick={importSelected} disabled={importing}
                   className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-5 py-2.5 rounded-xl disabled:opacity-50">
