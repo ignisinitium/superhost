@@ -1899,38 +1899,35 @@ async function handleSyncDnsZone(payload) {
         // would otherwise break named's reload for every domain.
         await execPromise(`named-checkzone ${safeDomain} ${shellEscape(tmpZone)}`);
         await execPromise(`sudo mv ${shellEscape(tmpZone)} ${shellEscape(zoneFilePath)}`);
-        // 6. Ensure zone entry exists in named.conf.zones — but ONLY if the zone
-        //    isn't already declared anywhere named includes. A duplicate zone (e.g.
-        //    qc.fyi also declared in named.conf.local) makes named refuse to start,
-        //    taking down DNS for every hosted domain. So check both files first.
+        // 6. Rebuild named.conf.zones from every zone file on disk. Rebuilding the
+        //    whole file (rather than read-append-write through a shared temp path)
+        //    is idempotent and safe when several syncs run at once — the previous
+        //    approach raced on /tmp/named.conf.zones.new and could corrupt the file
+        //    to empty, wiping DNS for every hosted domain. Zones declared in
+        //    named.conf.local are excluded so we never double-declare one.
         const zonesConfPath = '/etc/bind/named.conf.zones';
-        const zoneDecl = `zone "${domainName}"`;
-        let zonesConf = '';
-        try {
-            zonesConf = await fs.readFile(zonesConfPath, 'utf8');
-        }
-        catch { /* file may not exist yet */ }
         let localConf = '';
         try {
             localConf = await fs.readFile('/etc/bind/named.conf.local', 'utf8');
         }
         catch { /* optional */ }
-        if (!zonesConf.includes(zoneDecl) && !localConf.includes(zoneDecl)) {
-            const zoneEntry = `zone "${domainName}" { type master; file "/etc/bind/zones/db.${domainName}"; };\n`;
-            // Back up so we can roll back if the result fails validation.
-            await execPromise(`sudo cp -p ${zonesConfPath} ${zonesConfPath}.bak`).catch(() => { });
-            const tmpZonesConf = '/tmp/named.conf.zones.new';
-            await fs.writeFile(tmpZonesConf, zonesConf + (zonesConf.endsWith('\n') || !zonesConf ? '' : '\n') + zoneEntry);
-            await execPromise(`sudo mv ${shellEscape(tmpZonesConf)} ${zonesConfPath}`);
-            // Validate the whole BIND config; if it's now broken, roll back rather
-            // than leave named unable to start.
-            try {
-                await execPromise('sudo named-checkconf');
-            }
-            catch (cfgErr) {
-                await execPromise(`sudo mv ${zonesConfPath}.bak ${zonesConfPath}`).catch(() => { });
-                throw new Error(`named-checkconf failed after adding zone ${domainName}; rolled back: ${cfgErr.message}`);
-            }
+        const zoneFiles = (await fs.readdir('/etc/bind/zones')).filter(f => f.startsWith('db.'));
+        const entries = zoneFiles
+            .map(f => f.slice(3))
+            .filter(z => z && !localConf.includes(`zone "${z}"`))
+            .sort()
+            .map(z => `zone "${z}" { type master; file "/etc/bind/zones/db.${z}"; };`);
+        const content = entries.join('\n') + '\n';
+        const tmpZonesConf = `/tmp/named.conf.zones.${crypto.randomBytes(6).toString('hex')}`;
+        await execPromise(`sudo cp -p ${zonesConfPath} ${zonesConfPath}.bak`).catch(() => { });
+        await fs.writeFile(tmpZonesConf, content);
+        await execPromise(`sudo mv ${shellEscape(tmpZonesConf)} ${zonesConfPath}`);
+        try {
+            await execPromise('sudo named-checkconf');
+        }
+        catch (cfgErr) {
+            await execPromise(`sudo mv ${zonesConfPath}.bak ${zonesConfPath}`).catch(() => { });
+            throw new Error(`named-checkconf failed rebuilding named.conf.zones; rolled back: ${cfgErr.message}`);
         }
         // 7. Reload Bind
         await execPromise(`sudo rndc reload ${safeDomain}`).catch(async () => {
