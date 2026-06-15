@@ -892,7 +892,7 @@ www     IN      A       ${serverIp}
             const certbotEmail = process.env.CERTBOT_EMAIL;
             if (!certbotEmail)
                 throw new Error('CERTBOT_EMAIL not set');
-            await execPromise(`sudo certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
+            await execPromise(`sudo certbot --nginx ${await certbotDomainArgs(domainName)} --expand --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
             await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
             console.log(`SSL certificate issued for ${domainName}`);
             // Update WordPress siteurl/home to https if present
@@ -1160,13 +1160,28 @@ async function handleKillProcess(payload) {
     await execPromise(`kill -s ${signal} ${pid}`);
     console.log(`Sent ${signal} to process ${pid}.`);
 }
+// Build certbot -d args for a base domain. Includes www. only when it actually
+// resolves to this server — otherwise certbot fails the ENTIRE cert (which is
+// why domains kept getting apex-only certs and www.<domain> broke in browsers).
+async function certbotDomainArgs(domain) {
+    let args = `-d ${shellEscape(domain)}`;
+    if (!domain.startsWith('www.')) {
+        const ip = process.env.SERVER_IP ?? '15.235.73.176';
+        const wwwResolvesHere = await execPromise(`dig +short A www.${shellEscape(domain)} @1.1.1.1`)
+            .then(r => r.stdout.split('\n').map(s => s.trim()).includes(ip))
+            .catch(() => false);
+        if (wwwResolvesHere)
+            args += ` -d www.${shellEscape(domain)}`;
+    }
+    return args;
+}
 async function handleInstallSsl(payload) {
     const domainName = validateDomainName(payload?.domainName);
     const certbotEmail = process.env.CERTBOT_EMAIL;
     if (!certbotEmail)
         throw new Error('CERTBOT_EMAIL environment variable is not set');
     // All args are validated / escaped — domainName passes DNS regex check
-    await execPromise(`certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
+    await execPromise(`certbot --nginx ${await certbotDomainArgs(domainName)} --expand --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
     await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
     console.log(`SSL installed for ${domainName}`);
 }
@@ -1178,7 +1193,7 @@ async function handleProvisionSsl(payload) {
     const certbotEmail = process.env.CERTBOT_EMAIL;
     if (!certbotEmail)
         throw new Error('CERTBOT_EMAIL environment variable is not set');
-    await execPromise(`sudo certbot --nginx -d ${shellEscape(domainName)} --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
+    await execPromise(`sudo certbot --nginx ${await certbotDomainArgs(domainName)} --expand --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`);
     await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
     console.log(`SSL provisioned (retry) for ${domainName}`);
 }
