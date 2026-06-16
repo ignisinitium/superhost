@@ -1,5 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="14" fill="#7c3aed"/>
-  <text x="32" y="34" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="800"
-        fill="#ffffff" text-anchor="middle" dominant-baseline="central" letter-spacing="-1.5">QC</text>
+  <!-- Triangular-loop mark (matches the qc.fyi OG image): 3 beam faces -->
+  <g stroke="#5b21b6" stroke-width="1" stroke-linejoin="round">
+    <polygon points="32,9 51.92,43.5 38.93,36 32,24" fill="#ffffff" fill-opacity="1"/>
+    <polygon points="51.92,43.5 12.08,43.5 25.07,36 38.93,36" fill="#ffffff" fill-opacity="0.62"/>
+    <polygon points="12.08,43.5 32,9 32,24 25.07,36" fill="#ffffff" fill-opacity="0.82"/>
+  </g>
 </svg>
