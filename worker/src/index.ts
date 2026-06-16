@@ -1619,9 +1619,13 @@ async function handleGenerateEmailDns(payload: any) {
 
     // MX record — mail for the domain routes to mail.<domain>
     await upsertRecord('MX', '@', `mail.${domainName}`, 10);
-    // A record for mail subdomain
+    // A record for mail subdomain + common client-autodiscovery hostnames, so
+    // whatever host a mail client (Apple Mail, Outlook) picks resolves to us and
+    // matches the multi-SAN mail certificate.
     const serverIp = process.env.SERVER_IP ?? '15.235.73.176';
-    await upsertRecord('A', 'mail', serverIp);
+    for (const sub of ['mail', 'imap', 'smtp', 'autodiscover', 'autoconfig']) {
+      await upsertRecord('A', sub, serverIp);
+    }
     // SPF
     await upsertRecord('TXT', '@', `v=spf1 ip4:${serverIp} mx ~all`);
     // DKIM
@@ -1659,9 +1663,15 @@ PF=/etc/postfix/vmail_sni
 : > "$DC.tmp"; : > "$PF.tmp"
 for d in /etc/letsencrypt/live/mail.*; do
   [ -d "$d" ] || continue
-  n=$(basename "$d")
-  printf 'local_name %s {\\n  ssl_server_cert_file = %s/fullchain.pem\\n  ssl_server_key_file = %s/privkey.pem\\n}\\n' "$n" "$d" "$d" >> "$DC.tmp"
-  printf '%s %s/privkey.pem %s/fullchain.pem\\n' "$n" "$d" "$d" >> "$PF.tmp"
+  # Map EVERY hostname the cert covers (mail/imap/smtp/autodiscover/autoconfig)
+  # so whatever host a client autodiscovers presents this valid cert.
+  names=$(openssl x509 -in "$d/cert.pem" -noout -ext subjectAltName 2>/dev/null | tr ',' '\\n' | sed -n 's/.*DNS://p' | tr -d ' ')
+  [ -z "$names" ] && names=$(basename "$d")
+  for n in $names; do
+    [ -n "$n" ] || continue
+    printf 'local_name %s {\\n  ssl_server_cert_file = %s/fullchain.pem\\n  ssl_server_key_file = %s/privkey.pem\\n}\\n' "$n" "$d" "$d" >> "$DC.tmp"
+    printf '%s %s/privkey.pem %s/fullchain.pem\\n' "$n" "$d" "$d" >> "$PF.tmp"
+  done
 done
 mv "$DC.tmp" "$DC"
 mv "$PF.tmp" "$PF"
@@ -1674,7 +1684,8 @@ systemctl reload postfix`;
   console.log('Mail SNI regenerated (per-domain mail certs wired into Dovecot + Postfix).');
 }
 
-async function handleProvisionWebmailVhost({ domainName }: { domainName: string }) {
+async function handleProvisionWebmailVhost(payload: { domainName: string; retry?: number }) {
+  const { domainName } = payload;
   const mailHost = `mail.${domainName}`;
   const nginxConf = `/etc/nginx/sites-available/${mailHost}`;
   const nginxLink = `/etc/nginx/sites-enabled/${mailHost}`;
@@ -1713,17 +1724,35 @@ async function handleProvisionWebmailVhost({ domainName }: { domainName: string 
   await execPromise(`sudo ln -sf ${nginxConf} ${nginxLink}`);
   await execPromise('sudo nginx -t && sudo systemctl reload nginx');
 
-  // 2. Obtain SSL certificate via certbot
+  // 2. Obtain SSL certificate via certbot — cover the mailbox host plus the
+  //    common client-autodiscovery hostnames so any mail client trusts the cert.
+  const certEmail = process.env.CERTBOT_EMAIL || `hostmaster@${domainName}`;
+  const sanHosts = ['mail', 'imap', 'smtp', 'autodiscover', 'autoconfig'].map(s => `${s}.${domainName}`);
+  const sanArgs = sanHosts.map(h => `-d ${shellEscape(h)}`).join(' ');
+  let gotCert = false;
   try {
-    const certbotRes = await execPromise(
-      `sudo certbot certonly --nginx --non-interactive --agree-tos ` +
-      `--email hostmaster@${domainName} -d ${shellEscape(mailHost)} 2>&1`
-    );
-    console.log(`Certbot for ${mailHost}:`, certbotRes.stdout.slice(0, 200));
-  } catch (certErr: any) {
-    console.warn(`Certbot failed for ${mailHost} (may need DNS to propagate):`, certErr.stderr?.slice(0, 200));
-    // Leave HTTP-only config in place; can re-run later
-    return;
+    // Multi-SAN (cert name stays mail.<domain> since it's the first -d).
+    await execPromise(`sudo certbot certonly --nginx --expand --non-interactive --agree-tos --email ${shellEscape(certEmail)} ${sanArgs} 2>&1`);
+    gotCert = true;
+  } catch {
+    // Some autodiscovery hostnames may not resolve (e.g. domain not on our
+    // nameservers) — fall back to just mail.<domain> so the mailbox host works.
+    try {
+      await execPromise(`sudo certbot certonly --nginx --expand --non-interactive --agree-tos --email ${shellEscape(certEmail)} -d ${shellEscape(mailHost)} 2>&1`);
+      gotCert = true;
+    } catch (e: any) {
+      console.warn(`Certbot failed for ${mailHost} (DNS may not have propagated yet):`, e?.stderr?.slice(0, 200));
+    }
+  }
+  if (!gotCert) {
+    // Auto-retry once DNS resolves: re-queue (capped) instead of staying stuck
+    // on the HTTP-only "Coming Soon" page forever.
+    const retry = Number(payload?.retry ?? 0);
+    if (retry < 8) {
+      await client.query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['PROVISION_WEBMAIL_VHOST', { domainName, retry: retry + 1 }]);
+    }
+    return; // leave HTTP-only for now; the retry (or a later run) will upgrade it
   }
 
   // 3. Rewrite nginx config with SSL
