@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 348 64" role="img" aria-label="Quantum Creations">
+  <!-- Mark: triangular-loop ("impossible pyramid"), matches qc.fyi / dashboard Logo.tsx -->
+  <rect width="64" height="64" rx="14" fill="#7c3aed"/>
+  <g stroke="#5b21b6" stroke-width="1.5" stroke-linejoin="round">
+    <polygon points="32,9 51.92,43.5 38.93,36 32,24" fill="#ffffff"/>
+    <polygon points="51.92,43.5 12.08,43.5 25.07,36 38.93,36" fill="#ffffff" fill-opacity="0.62"/>
+    <polygon points="12.08,43.5 32,9 32,24 25.07,36" fill="#ffffff" fill-opacity="0.82"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="80" y="41" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="29" font-weight="700" letter-spacing="-0.5" fill="#1f2433">Quantum <tspan fill="#7c3aed">Creations</tspan></text>
+</svg>
