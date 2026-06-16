@@ -135,11 +135,16 @@ const ProtectedRoute = ({ children, role }: { children: React.ReactElement; role
 // Public storefront at "/": marketing site for visitors; authenticated users
 // are bounced to their dashboard.
 const RootGate = () => {
+  // On the spam panel host (spam.<domain>) the root should be the spam filter,
+  // not the marketing storefront.
+  const isSpamHost = window.location.hostname.startsWith('spam.');
   if (!isTokenExpired()) {
     const role = getTokenRole();
     if (role === 'admin') return <Navigate to="/dashboard" replace />;
-    if (role === 'client') return <Navigate to="/client" replace />;
+    if (role === 'mail_user') return <Navigate to="/my-spam" replace />;
+    if (role === 'client') return <Navigate to={isSpamHost ? '/my-spam' : '/client'} replace />;
   }
+  if (isSpamHost) return <Navigate to="/spam-login" replace />;
   return <MarketingHome />;
 };
 
