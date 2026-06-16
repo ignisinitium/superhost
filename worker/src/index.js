@@ -2565,6 +2565,9 @@ async function ensureQuarantineMaildir(email) {
         await execPromise(`sudo mkdir -p ${shellEscape(`${base}/${sub}`)}`).catch(() => { });
     }
     await execPromise(`sudo chown -R vmail:vmail ${shellEscape(base)}`).catch(() => { });
+    // Subscribe it so it shows up in webmail / IMAP clients (they only display
+    // subscribed folders by default) — otherwise quarantined mail looks "lost".
+    await execPromise(`sudo doveadm mailbox subscribe -u ${shellEscape(email)} Quarantine`).catch(() => { });
 }
 // ── SYNC_SPAM_RULES ────────────────────────────────────────────────────────────
 async function handleSyncSpamRules(payload) {
