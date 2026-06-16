@@ -6,10 +6,11 @@ import {
   ShieldAlert, Trash2, CheckCircle, Filter,
   Mail, UserCheck, UserX, Search, X, Square,
   SquareCheck, ShieldCheck, Bell, BellOff,
-  MailOpen, Settings, Inbox, RefreshCw,
+  MailOpen, Settings, Inbox, RefreshCw, Eye,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
-import type { MailUser, MailQuarantine, MailAccessControl } from '../../../shared/types';
+import type { MailUser, MailQuarantine, MailAccessControl, QuarantineMessage } from '../../../shared/types';
+import QuarantinePreviewModal, { type QuarantineMeta } from '../components/QuarantinePreviewModal';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -214,6 +215,24 @@ const QuarantineTab: React.FC<{
     onError: (e: any) => toast.error(e.response?.data?.message || 'Bulk action failed'),
   });
 
+  const [previewItem, setPreviewItem] = useState<QuarantineMeta | null>(null);
+
+  const blockMutation = useMutation({
+    mutationFn: async (id: number) => (await api.post(`/client/email/quarantine/${id}/block`)).data,
+    onSuccess: () => {
+      toast.success('Sender blocked & message deleted');
+      queryClient.invalidateQueries({ queryKey: ['quarantine', selectedMailboxId] });
+      queryClient.invalidateQueries({ queryKey: ['access-control', selectedMailboxId] });
+    },
+    onError: (e: any) => toast.error(e.response?.data?.message || 'Failed to block sender'),
+  });
+
+  const loadMessage = useCallback(
+    async (id: number): Promise<QuarantineMessage> =>
+      (await api.get(`/client/email/quarantine/${id}/message`)).data,
+    [],
+  );
+
   const items = quarantine ?? [];
   const allIds = useMemo(() => items.map(i => i.id), [items]);
   const allSelected = allIds.length > 0 && allIds.every(id => selected.has(id));
@@ -331,6 +350,13 @@ const QuarantineTab: React.FC<{
                   </td>
                   <td className="px-4 py-3 text-right space-x-1">
                     <button
+                      onClick={() => setPreviewItem({ id: q.id, sender: q.sender, subject: q.subject, spam_score: q.spam_score, created_at: q.created_at })}
+                      title="View message"
+                      className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+                    >
+                      <Eye size={15} />
+                    </button>
+                    <button
                       onClick={() => releaseMutation.mutate({ id: q.id })}
                       disabled={releaseMutation.isPending}
                       title="Release to inbox"
@@ -370,6 +396,18 @@ const QuarantineTab: React.FC<{
           </div>
         )}
       </div>
+
+      <QuarantinePreviewModal
+        open={!!previewItem}
+        meta={previewItem}
+        load={loadMessage}
+        busy={releaseMutation.isPending || deleteQuarantineMutation.isPending || blockMutation.isPending}
+        onClose={() => setPreviewItem(null)}
+        onDeliver={(id) => { releaseMutation.mutate({ id }); setPreviewItem(null); }}
+        onDeliverAllow={(id) => { releaseMutation.mutate({ id, addToAllowlist: true }); setPreviewItem(null); }}
+        onBlock={(id) => { blockMutation.mutate(id); setPreviewItem(null); }}
+        onDelete={(id) => { deleteQuarantineMutation.mutate(id); setPreviewItem(null); }}
+      />
     </div>
   );
 };

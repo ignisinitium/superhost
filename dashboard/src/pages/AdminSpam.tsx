@@ -12,8 +12,10 @@ import {
   UserCheck, UserX, MailOpen, ShieldCheck,
   CircleAlert, Inbox, SquareCheck, Square, X, ArrowUpDown,
   Globe, Plus, CalendarRange, Undo2, ScanLine, Target, Percent,
-  Building2, Activity, Bug,
+  Building2, Activity, Bug, Eye,
 } from 'lucide-react';
+import QuarantinePreviewModal, { type QuarantineMeta } from '../components/QuarantinePreviewModal';
+import type { QuarantineMessage } from '../../../shared/types';
 import toast from 'react-hot-toast';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -628,9 +630,12 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
     setSelected(new Set());
   }, [queryClient]);
 
+  const [previewItem, setPreviewItem] = useState<QuarantineMeta | null>(null);
+
   const releaseMutation = useMutation({
-    mutationFn: async (id: number) => (await adminApi.post(`/spam/quarantine/${id}/release`)).data,
-    onSuccess: () => { toast.success('Released to inbox'); invalidate(); },
+    mutationFn: async ({ id, addToAllowlist }: { id: number; addToAllowlist?: boolean }) =>
+      (await adminApi.post(`/spam/quarantine/${id}/release`, { addToAllowlist })).data,
+    onSuccess: (_, { addToAllowlist }) => { toast.success(addToAllowlist ? 'Released & sender whitelisted' : 'Released to inbox'); invalidate(); },
     onError: (e: any) => toast.error(e.response?.data?.message || 'Release failed'),
   });
 
@@ -639,6 +644,18 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
     onSuccess: () => { toast.success('Deleted'); invalidate(); },
     onError: (e: any) => toast.error(e.response?.data?.message || 'Delete failed'),
   });
+
+  const blockMutation = useMutation({
+    mutationFn: async (id: number) => (await adminApi.post(`/spam/quarantine/${id}/block`)).data,
+    onSuccess: () => { toast.success('Sender blocked & message deleted'); invalidate(); },
+    onError: (e: any) => toast.error(e.response?.data?.message || 'Block failed'),
+  });
+
+  const loadMessage = useCallback(
+    async (id: number): Promise<QuarantineMessage> =>
+      (await adminApi.get(`/spam/quarantine/${id}/message`)).data,
+    [],
+  );
 
   const bulkMutation = useMutation({
     mutationFn: async (action: 'release' | 'delete') =>
@@ -802,7 +819,14 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
                   </td>
                   <td className="px-4 py-3 text-right space-x-1">
                     <button
-                      onClick={() => releaseMutation.mutate(q.id)}
+                      onClick={() => setPreviewItem({ id: q.id, sender: q.sender, subject: q.subject, spam_score: q.spam_score, virus_name: q.virus_name, created_at: q.created_at, mailbox_email: q.mailbox_email })}
+                      title="View message"
+                      className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+                    >
+                      <Eye size={15} />
+                    </button>
+                    <button
+                      onClick={() => releaseMutation.mutate({ id: q.id })}
                       disabled={releaseMutation.isPending}
                       title="Release to inbox"
                       className="p-1.5 text-emerald-500 hover:text-emerald-700 hover:bg-emerald-50 rounded-lg transition-colors"
@@ -824,6 +848,18 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
           </table>
         </div>
       </div>
+
+      <QuarantinePreviewModal
+        open={!!previewItem}
+        meta={previewItem}
+        load={loadMessage}
+        busy={releaseMutation.isPending || deleteMutation.isPending || blockMutation.isPending}
+        onClose={() => setPreviewItem(null)}
+        onDeliver={(id) => { releaseMutation.mutate({ id }); setPreviewItem(null); }}
+        onDeliverAllow={(id) => { releaseMutation.mutate({ id, addToAllowlist: true }); setPreviewItem(null); }}
+        onBlock={(id) => { blockMutation.mutate(id); setPreviewItem(null); }}
+        onDelete={(id) => { deleteMutation.mutate(id); setPreviewItem(null); }}
+      />
     </div>
   );
 };

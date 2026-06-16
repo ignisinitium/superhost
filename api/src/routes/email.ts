@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { query } from '../db.js';
 import { authenticateClientOrMail } from '../middleware/auth.js';
 import type { AuthRequest } from '../middleware/auth.js';
+import { runWorkerTask } from '../lib/workerTask.js';
 
 const router = express.Router();
 
@@ -491,6 +492,59 @@ router.post('/quarantine/:id/release', async (req: AuthRequest, res) => {
     }
 
     res.json({ message: 'Email release queued' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// View a quarantined message's source + parsed contents. Scope-checked here,
+// then delegated to the worker (which can read the vmail-owned Maildir file).
+router.get('/quarantine/:id/message', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  try {
+    const verifyRes = await query(`
+      SELECT q.id FROM mail_quarantine q
+      JOIN mail_users mu ON q.mail_user_id = mu.id
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE q.id = $1 AND md.user_id = $2
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [id, req.userId, req.mailUserId ?? null]);
+    if (verifyRes.rowCount === 0) return res.status(404).json({ message: 'Quarantined email not found' });
+
+    const result = await runWorkerTask('READ_QUARANTINE_MESSAGE', { quarantineId: Number(id) });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ message: (err as Error).message });
+  }
+});
+
+// Block sender: blacklist the sender for this mailbox and delete the message.
+router.post('/quarantine/:id/block', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  try {
+    const qRes = await query(`
+      SELECT q.id, q.file_path, q.sender, q.mail_user_id FROM mail_quarantine q
+      JOIN mail_users mu ON q.mail_user_id = mu.id
+      JOIN mail_domains md ON mu.domain_id = md.id
+      WHERE q.id = $1 AND md.user_id = $2 AND q.released_at IS NULL
+        AND ($3::int IS NULL OR q.mail_user_id = $3)
+    `, [id, req.userId, req.mailUserId ?? null]);
+    if (qRes.rowCount === 0) return res.status(404).json({ message: 'Quarantined email not found' });
+    const item = qRes.rows[0];
+
+    if (item.sender) {
+      await query(`
+        INSERT INTO mail_access_control (mail_user_id, sender_pattern, access_type)
+        VALUES ($1, $2, 'block')
+        ON CONFLICT (mail_user_id, sender_pattern) DO UPDATE SET access_type = 'block'
+      `, [item.mail_user_id, item.sender]);
+      await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+        ['SYNC_SPAM_RULES', { mailUserId: item.mail_user_id }]);
+    }
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)',
+      ['DELETE_QUARANTINE_FILE', { quarantineId: item.id, filePath: item.file_path }]);
+
+    res.json({ message: 'Sender blocked and message deleted', sender: item.sender });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

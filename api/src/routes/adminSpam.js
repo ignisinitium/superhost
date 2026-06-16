@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
+import { runWorkerTask } from '../lib/workerTask.js';
 const router = express.Router();
 router.use(authenticateAdmin);
 // ── Aggregate stats ────────────────────────────────────────────────────────────
@@ -243,6 +244,7 @@ router.post('/quarantine/bulk', async (req, res) => {
 // ── Quarantine: single release ─────────────────────────────────────────────────
 router.post('/quarantine/:id/release', async (req, res) => {
     const { id } = req.params;
+    const { addToAllowlist } = req.body;
     try {
         const qRes = await query(`
       SELECT mq.*, mu.email AS recipient
@@ -254,7 +256,56 @@ router.post('/quarantine/:id/release', async (req, res) => {
             return res.status(404).json({ message: 'Not found' });
         const item = qRes.rows[0];
         await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['RELEASE_QUARANTINE', { id: item.id, filePath: item.file_path, recipient: item.recipient }]);
-        res.json({ message: 'Release queued' });
+        if (addToAllowlist && item.sender) {
+            await query(`
+        INSERT INTO mail_access_control (mail_user_id, sender_pattern, access_type)
+        VALUES ($1, $2, 'allow')
+        ON CONFLICT (mail_user_id, sender_pattern) DO UPDATE SET access_type = 'allow'
+      `, [item.mail_user_id, item.sender]);
+            await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_SPAM_RULES', { mailUserId: item.mail_user_id }]);
+        }
+        res.json({ message: addToAllowlist ? 'Released & sender allowlisted' : 'Release queued' });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+// ── Quarantine: view message source + parsed contents ──────────────────────────
+// Delegates to the worker (the .eml lives in vmail-owned Maildir the API can't read).
+router.get('/quarantine/:id/message', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const exists = await query('SELECT id FROM mail_quarantine WHERE id = $1', [id]);
+        if (exists.rowCount === 0)
+            return res.status(404).json({ message: 'Not found' });
+        const result = await runWorkerTask('READ_QUARANTINE_MESSAGE', { quarantineId: Number(id) });
+        res.json(result);
+    }
+    catch (err) {
+        res.status(502).json({ message: err.message });
+    }
+});
+// ── Quarantine: block sender (blacklist + delete the message) ───────────────────
+router.post('/quarantine/:id/block', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const qRes = await query('SELECT id, file_path, sender, mail_user_id FROM mail_quarantine WHERE id = $1', [id]);
+        if (qRes.rows.length === 0)
+            return res.status(404).json({ message: 'Not found' });
+        const item = qRes.rows[0];
+        if (item.sender) {
+            await query(`
+        INSERT INTO mail_access_control (mail_user_id, sender_pattern, access_type)
+        VALUES ($1, $2, 'block')
+        ON CONFLICT (mail_user_id, sender_pattern) DO UPDATE SET access_type = 'block'
+      `, [item.mail_user_id, item.sender]);
+            await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_SPAM_RULES', { mailUserId: item.mail_user_id }]);
+        }
+        await query('DELETE FROM mail_quarantine WHERE id = $1', [id]);
+        if (item.file_path) {
+            await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['DELETE_FILE', { filePath: item.file_path }]);
+        }
+        res.json({ message: 'Sender blocked and message deleted', sender: item.sender });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

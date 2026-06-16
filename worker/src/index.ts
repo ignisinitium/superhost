@@ -9,6 +9,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import mysql from 'mysql2/promise';
+import { simpleParser } from 'mailparser';
 import type { Task } from '../../shared/types.js';
 import {
   validateUsername,
@@ -233,6 +234,9 @@ async function handleTask(task: Task) {
         break;
       case 'RELEASE_QUARANTINE':
         await handleReleaseQuarantine(task.payload);
+        break;
+      case 'READ_QUARANTINE_MESSAGE':
+        await handleReadQuarantineMessage(task.payload, task.id);
         break;
       case 'SEND_SPAM_DIGEST':
         await handleSendSpamDigest(task.payload);
@@ -3157,6 +3161,59 @@ async function handleReleaseQuarantine(payload: any) {
     console.error(`Failed to release quarantine for ${id}:`, err);
     throw err;
   }
+}
+
+// Read a quarantined message from disk and return its parsed contents + raw
+// source for the dashboard preview. The worker can read the vmail-owned Maildir
+// files (mode 0770) that the API process cannot. The result is written back into
+// the task payload so the API can return it in the originating HTTP request.
+async function handleReadQuarantineMessage(payload: any, taskId: number) {
+  const { quarantineId } = payload as { quarantineId?: number };
+  if (!quarantineId) throw new Error('quarantineId required');
+
+  const row = await client.query('SELECT file_path FROM mail_quarantine WHERE id = $1', [quarantineId]);
+  const filePath: string | undefined = row.rows[0]?.file_path;
+  if (!filePath) throw new Error('Quarantine entry not found');
+  // The path comes from our own DB, but guard against traversal/tampering before
+  // handing it to a shell — only ever read inside the mail spool.
+  if (!filePath.startsWith('/var/mail/vhosts/') || filePath.includes('..') || /[\r\n\x00]/.test(filePath)) {
+    throw new Error('Refusing to read message outside the mail spool');
+  }
+
+  // sudo cat so we can read it regardless of the worker's own group membership.
+  const { stdout } = await execPromise(
+    `sudo cat ${shellEscape(filePath)}`,
+    { maxBuffer: 25 * 1024 * 1024, encoding: 'buffer' } as any,
+  );
+  const rawBuf: Buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout as string);
+
+  const parsed = await simpleParser(rawBuf);
+
+  const MAX_RAW = 1024 * 1024; // 1 MB cap on the source we ship to the browser
+  const truncated = rawBuf.length > MAX_RAW;
+
+  const result = {
+    from: parsed.from?.text ?? '',
+    to: Array.isArray(parsed.to) ? parsed.to.map(a => a.text).join(', ') : (parsed.to?.text ?? ''),
+    subject: parsed.subject ?? '',
+    date: parsed.date ? parsed.date.toISOString() : null,
+    headers: parsed.headerLines.map(h => h.line),
+    text: parsed.text ?? '',
+    html: typeof parsed.html === 'string' ? parsed.html : '',
+    attachments: (parsed.attachments ?? []).map(a => ({
+      filename: a.filename ?? '(unnamed)',
+      contentType: a.contentType ?? 'application/octet-stream',
+      size: a.size ?? 0,
+    })),
+    raw: rawBuf.subarray(0, MAX_RAW).toString('utf8'),
+    truncated,
+    size: rawBuf.length,
+  };
+
+  await client.query(
+    "UPDATE tasks SET status = 'completed', payload = payload || $1, updated_at = NOW() WHERE id = $2",
+    [JSON.stringify({ result }), taskId],
+  );
 }
 
 /**

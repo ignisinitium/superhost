@@ -119,6 +119,23 @@ export interface MailQuarantine {
     released_at: string | null;
     expires_at: string;
 }
+export interface QuarantineMessage {
+    from: string;
+    to: string;
+    subject: string;
+    date: string | null;
+    headers: string[];
+    text: string;
+    html: string;
+    attachments: {
+        filename: string;
+        contentType: string;
+        size: number;
+    }[];
+    raw: string;
+    truncated: boolean;
+    size: number;
+}
 export interface MailGlobalRule {
     id: number;
     sender_pattern: string;
