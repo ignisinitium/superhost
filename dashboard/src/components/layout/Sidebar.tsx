@@ -2,6 +2,7 @@ import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import api from '../../api/client';
 import { BRAND } from '../../brand';
+import Logo from '../Logo';
 import {
   LayoutDashboard, Users, Package, Briefcase, Palette,
   Power, Download, Layers, BarChart2,
@@ -175,9 +176,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
       <div className="h-14 flex items-center px-5 border-b border-slate-800 bg-slate-950 flex-shrink-0">
         {isClient ? (
           <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center shadow-lg shadow-violet-500/20 flex-shrink-0 text-white text-[11px] font-extrabold tracking-tight">
-              {BRAND.short}
-            </div>
+            <Logo className="w-7 h-7 rounded-lg shadow-lg shadow-violet-500/20 flex-shrink-0" />
             <span className="text-lg font-bold text-violet-300 tracking-tight">
               {BRAND.name}
             </span>
