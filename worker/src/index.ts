@@ -1626,6 +1626,14 @@ async function handleGenerateEmailDns(payload: any) {
     for (const sub of ['mail', 'imap', 'smtp', 'autodiscover', 'autoconfig']) {
       await upsertRecord('A', sub, serverIp);
     }
+
+    // RFC 6186 service-discovery SRV records — mail clients (Apple Mail, etc.)
+    // read these to auto-configure, so the user only enters email + password.
+    // Full "priority weight port target" lives in content (priority col left
+    // null) so the leading 0 priority renders correctly.
+    await upsertRecord('SRV', '_imaps._tcp', `0 1 993 mail.${domainName}.`);
+    await upsertRecord('SRV', '_submission._tcp', `0 1 587 mail.${domainName}.`);
+    await upsertRecord('SRV', '_pop3s._tcp', `0 1 995 mail.${domainName}.`);
     // SPF
     await upsertRecord('TXT', '@', `v=spf1 ip4:${serverIp} mx ~all`);
     // DKIM
