@@ -6147,6 +6147,11 @@ async function handleMigrateCwp(payload: any): Promise<void> {
       await cwpLog(migrationId, `  [${username}] ✓ Migration complete`);
     }
 
+    // Generate the per-mailbox spam-filter sieve for every migrated mailbox —
+    // otherwise SpamAssassin tags spam but nothing files it into Quarantine.
+    await cwpLog(migrationId, 'Applying spam-filter rules to migrated mailboxes…');
+    await handleSyncSpamRules({}).catch((e) => cwpLog(migrationId, `Spam-rule sync warning: ${e?.message ?? e}`));
+
     await client.query(
       `UPDATE cwp_migrations SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [migrationId]
