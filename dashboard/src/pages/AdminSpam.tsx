@@ -59,6 +59,7 @@ interface QuarantineItem {
   spam_score: number | null;
   virus_name?: string | null;
   created_at: string;
+  message_date?: string | null;
   file_path?: string;
   mail_user_id: number;
   mailbox_email: string;
@@ -531,7 +532,7 @@ const OverviewTab: React.FC = () => {
                   </div>
                   <div className="text-right shrink-0">
                     <span className="text-[10px] text-slate-400 whitespace-nowrap">
-                      {new Date(q.created_at).toLocaleDateString()}
+                      {new Date(q.message_date ?? q.created_at).toLocaleDateString()}
                     </span>
                     {q.domain_name && (
                       <p className="text-[9px] text-slate-400 font-mono">{q.domain_name}</p>
@@ -815,7 +816,7 @@ const QuarantineTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }
                     <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold">{q.owner}</span>
                   </td>
                   <td className="px-4 py-3 text-[11px] text-slate-400 whitespace-nowrap">
-                    {new Date(q.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    {new Date(q.message_date ?? q.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td className="px-4 py-3 text-right space-x-1">
                     <button

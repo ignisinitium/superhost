@@ -38,14 +38,14 @@ router.get('/stats', async (_req, res) => {
         ORDER BY MIN(spam_score)
       `),
             query(`
-        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at,
+        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at, mq.message_date,
                mu.email AS mailbox_email, md.domain_name, u.username AS owner
         FROM mail_quarantine mq
         JOIN mail_users mu ON mq.mail_user_id = mu.id
         JOIN mail_domains md ON mu.domain_id = md.id
         JOIN users u ON md.user_id = u.id
         WHERE mq.released_at IS NULL
-        ORDER BY mq.created_at DESC
+        ORDER BY COALESCE(mq.message_date, mq.created_at) DESC
         LIMIT 8
       `),
             query(`
@@ -181,14 +181,14 @@ router.get('/quarantine', async (req, res) => {
         const where = `WHERE ${wheres.join(' AND ')}`;
         const [rows, countRow] = await Promise.all([
             query(`
-        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at, mq.file_path,
+        SELECT mq.id, mq.sender, mq.subject, mq.spam_score, mq.virus_name, mq.created_at, mq.message_date, mq.file_path,
                mq.mail_user_id, mu.email AS mailbox_email, md.domain_name, u.username AS owner
         FROM mail_quarantine mq
         JOIN mail_users mu ON mq.mail_user_id = mu.id
         JOIN mail_domains md ON mu.domain_id = md.id
         JOIN users u ON md.user_id = u.id
         ${where}
-        ORDER BY mq.created_at DESC
+        ORDER BY COALESCE(mq.message_date, mq.created_at) DESC
         LIMIT $${p} OFFSET $${p + 1}
       `, [...params, limit, offset]),
             query(`

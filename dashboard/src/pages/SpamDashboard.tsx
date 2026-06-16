@@ -346,7 +346,7 @@ const QuarantineTab: React.FC<{
                     {q.subject || <span className="italic text-slate-400">no subject</span>}
                   </td>
                   <td className="px-4 py-3 text-[11px] text-slate-400 whitespace-nowrap">
-                    {new Date(q.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    {new Date(q.message_date ?? q.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td className="px-4 py-3 text-right space-x-1">
                     <button

@@ -357,7 +357,7 @@ router.get('/:mailUserId/quarantine', async (req, res) => {
             sql += ' AND (sender ILIKE $2 OR subject ILIKE $2)';
             params.push(`%${search.trim()}%`);
         }
-        sql += ' ORDER BY created_at DESC';
+        sql += ' ORDER BY COALESCE(message_date, created_at) DESC';
         const result = await query(sql, params);
         res.json(result.rows);
     }

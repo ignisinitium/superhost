@@ -129,6 +129,7 @@ export interface MailQuarantine {
   spam_score: number;
   file_path: string;
   created_at: string;
+  message_date: string | null;
   released_at: string | null;
   expires_at: string;
 }

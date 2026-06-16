@@ -3077,6 +3077,7 @@ async function handleScanQuarantineFolders(payload: any) {
           if ((existing.rowCount ?? 0) > 0) continue;
 
           let sender = '', subject = '', spamScore: number | null = null;
+          let messageDate: string | null = null;
           try {
             const { stdout } = await execPromise(`sudo head -150 ${shellEscape(filePath)}`);
             const angleMatch = stdout.match(/^From:\s*.*?<([^>]+)>/mi);
@@ -3089,7 +3090,25 @@ async function handleScanQuarantineFolders(payload: any) {
             const scoreMatch = stdout.match(/^X-Spam-Score:\s*([\d.-]+)/mi)
               ?? stdout.match(/score=([\d.-]+)/i);
             if (scoreMatch) spamScore = parseFloat(scoreMatch[1]!);
+
+            // The email's own Date: header — what the user expects to see, vs the
+            // created_at scan time which is identical for a whole scan batch.
+            const dateMatch = stdout.match(/^Date:\s*(.+?)(?=\r?\n[^\s]|\r?\n\r?\n|$)/mis);
+            if (dateMatch) {
+              const d = new Date(dateMatch[1]!.replace(/\r?\n\s+/g, ' ').trim());
+              if (!isNaN(d.getTime())) messageDate = d.toISOString();
+            }
           } catch { /* unreadable — still record it */ }
+
+          // Fallback: the Maildir filename starts with the unix delivery time.
+          if (!messageDate) {
+            const ts = filename.match(/^(\d{9,13})\./);
+            if (ts) {
+              const ms = ts[1]!.length > 10 ? Number(ts[1]) : Number(ts[1]) * 1000;
+              const d = new Date(ms);
+              if (!isNaN(d.getTime())) messageDate = d.toISOString();
+            }
+          }
 
           // ClamAV scan — clamdscan returns exit 1 if infected, stdout: "file: VIRUS.NAME FOUND"
           let virusName: string | null = null;
@@ -3102,10 +3121,10 @@ async function handleScanQuarantineFolders(payload: any) {
           } catch { /* clamd unavailable — skip */ }
 
           await client.query(`
-            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, virus_name, file_path)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO mail_quarantine (mail_user_id, sender, subject, spam_score, virus_name, file_path, message_date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT DO NOTHING
-          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, virusName, filePath]);
+          `, [mailbox.id, sender || 'unknown', subject || null, spamScore, virusName, filePath, messageDate]);
 
           found++;
         }
@@ -3137,6 +3156,57 @@ async function handleUpdateAutoresponder(payload: any) {
   console.log(`Auto-responder updated for ${email}`);
 }
 
+// Resolve a quarantine file_path that may have gone stale. Dovecot relocates
+// Maildir files between new/ and cur/ and rewrites the `:2,flags` and `,S=/,W=`
+// size tokens after we recorded the path, so the exact stored path often no
+// longer exists. Locate the file by its stable unique id (time.M…P….host) in
+// both new/ and cur/. Returns the current path, or null if it's truly gone.
+async function resolveMaildirPath(filePath: string): Promise<string | null> {
+  const exists = await execPromise(`sudo test -f ${shellEscape(filePath)} && echo ok`)
+    .then(r => r.stdout.includes('ok')).catch(() => false);
+  if (exists) return filePath;
+
+  const core = path.basename(filePath).split(':')[0]!.split(',')[0]!; // drop flags + size tokens
+  if (!core) return null;
+  const qDir = path.dirname(path.dirname(filePath)); // .../.Quarantine
+  for (const sub of ['cur', 'new']) {
+    try {
+      const { stdout } = await execPromise(`sudo ls -1 ${shellEscape(`${qDir}/${sub}`)} 2>/dev/null`);
+      const hit = stdout.split('\n').find(f => f.startsWith(core));
+      if (hit) return `${qDir}/${sub}/${hit}`;
+    } catch { /* dir missing — try the other */ }
+  }
+  return null;
+}
+
+// Strip the spam markers SpamAssassin/sieve stamped on a quarantined message so
+// that a released (confirmed false-positive) message arrives in the inbox as a
+// clean, normal delivery. Otherwise the lingering `X-Spam-Flag: YES` and the
+// `[SPAM]` subject prefix make mail clients (Apple Mail, Outlook, Gmail) keep
+// treating it as junk / "from a blocked sender". Operates on the raw bytes via
+// latin1 so the (possibly binary) body is preserved exactly.
+function cleanReleasedMessage(buf: Buffer): Buffer {
+  const text = buf.toString('latin1');
+  const m = text.match(/\r?\n\r?\n/);
+  if (!m || m.index === undefined) return buf; // no header/body boundary — leave as-is
+  const head = text.slice(0, m.index);
+  const rest = text.slice(m.index); // keeps the blank-line separator + body intact
+  const eol = head.includes('\r\n') ? '\r\n' : '\n';
+
+  const out: string[] = [];
+  let droppingFolded = false;
+  for (const line of head.split(/\r?\n/)) {
+    const isFolded = /^[ \t]/.test(line);
+    if (droppingFolded && isFolded) continue;        // drop continuation of a removed header
+    droppingFolded = false;
+    if (/^X-Spam-/i.test(line)) { droppingFolded = true; continue; }
+    const subj = line.match(/^(Subject:\s*)\[SPAM\]\s*(.*)$/i);
+    if (subj) { out.push(`${subj[1]}${subj[2]}`); continue; }
+    out.push(line);
+  }
+  return Buffer.from(out.join(eol) + rest, 'latin1');
+}
+
 async function handleReleaseQuarantine(payload: any) {
   const { id, filePath, recipient } = payload;
   if (!filePath || !recipient) throw new Error('filePath and recipient are required');
@@ -3144,19 +3214,51 @@ async function handleReleaseQuarantine(payload: any) {
   try {
     const [user, domain] = recipient.split('@');
     const destDir = `/var/mail/vhosts/${domain}/${user}/new`;
-    const fileName = path.basename(filePath);
 
-    await execPromise(`sudo mkdir -p ${destDir}`);
-    await execPromise(`sudo mv ${shellEscape(filePath)} ${shellEscape(destDir + '/' + fileName)}`);
-    await execPromise(`sudo chown vmail:vmail ${shellEscape(destDir + '/' + fileName)}`);
+    // The stored path may be stale (Dovecot moved the file) — find where it lives now.
+    const srcPath = await resolveMaildirPath(filePath);
+    if (!srcPath) {
+      // Not in new/ or cur/ anymore — already delivered or gone. Clear it from the
+      // queue rather than failing the task so the user isn't left with a phantom row.
+      await client.query('UPDATE mail_quarantine SET released_at = NOW() WHERE id = $1', [id]);
+      console.warn(`Release ${id}: source file not found (already moved/delivered?) — marked released.`);
+      return;
+    }
+
+    // Drop the Maildir size hints (S=/W=) from the name — header stripping changes
+    // the byte count, so let Dovecot recompute rather than trust a stale value.
+    const destName = path.basename(srcPath).replace(/,[SW]=\d+/g, '');
+    const destPath = `${destDir}/${destName}`;
+
+    await execPromise(`sudo mkdir -p ${shellEscape(destDir)}`);
+
+    // Read → strip spam markers → write clean copy into the inbox.
+    let cleaned = false;
+    try {
+      const { stdout } = await execPromise(
+        `sudo cat ${shellEscape(srcPath)}`,
+        { maxBuffer: 50 * 1024 * 1024, encoding: 'buffer' } as any,
+      );
+      const rawBuf: Buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout as string);
+      const tmp = `/tmp/release_${id}_${Date.now()}.eml`;
+      await fs.writeFile(tmp, cleanReleasedMessage(rawBuf));
+      await execPromise(`sudo mv ${shellEscape(tmp)} ${shellEscape(destPath)}`);
+      await execPromise(`sudo rm -f ${shellEscape(srcPath)}`).catch(() => {});
+      cleaned = true;
+    } catch (e) {
+      // Fall back to a plain move so a parse/IO hiccup never strands the message.
+      console.warn(`Release clean-up failed for ${id}, moving as-is: ${(e as Error).message}`);
+      await execPromise(`sudo mv ${shellEscape(srcPath)} ${shellEscape(destPath)}`);
+    }
+    await execPromise(`sudo chown vmail:vmail ${shellEscape(destPath)}`);
 
     // Mark as released (keep for FP stats; purge job cleans up after 7 days)
     await client.query('UPDATE mail_quarantine SET released_at = NOW() WHERE id = $1', [id]);
 
     // A released message is a confirmed false-positive → teach Bayes it's ham.
-    await learnMessage(destDir + '/' + fileName, 'ham');
+    await learnMessage(destPath, 'ham');
 
-    console.log(`Released quarantined email ${id} to ${recipient}.`);
+    console.log(`Released quarantined email ${id} to ${recipient}${cleaned ? ' (spam markers stripped)' : ''}.`);
   } catch (err) {
     console.error(`Failed to release quarantine for ${id}:`, err);
     throw err;
@@ -3179,10 +3281,13 @@ async function handleReadQuarantineMessage(payload: any, taskId: number) {
   if (!filePath.startsWith('/var/mail/vhosts/') || filePath.includes('..') || /[\r\n\x00]/.test(filePath)) {
     throw new Error('Refusing to read message outside the mail spool');
   }
+  // The stored path may be stale (Dovecot moved the file) — resolve to its
+  // current location so the preview doesn't 502 on a moved message.
+  const realPath = (await resolveMaildirPath(filePath)) ?? filePath;
 
   // sudo cat so we can read it regardless of the worker's own group membership.
   const { stdout } = await execPromise(
-    `sudo cat ${shellEscape(filePath)}`,
+    `sudo cat ${shellEscape(realPath)}`,
     { maxBuffer: 25 * 1024 * 1024, encoding: 'buffer' } as any,
   );
   const rawBuf: Buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout as string);
