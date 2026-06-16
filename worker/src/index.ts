@@ -1634,6 +1634,8 @@ async function handleGenerateEmailDns(payload: any) {
     await upsertRecord('SRV', '_imaps._tcp', `0 1 993 mail.${domainName}.`);
     await upsertRecord('SRV', '_submission._tcp', `0 1 587 mail.${domainName}.`);
     await upsertRecord('SRV', '_pop3s._tcp', `0 1 995 mail.${domainName}.`);
+    // Outlook Autodiscover discovery (points at autodiscover.<domain>:443).
+    await upsertRecord('SRV', '_autodiscover._tcp', `0 0 443 autodiscover.${domainName}.`);
     // SPF
     await upsertRecord('TXT', '@', `v=spf1 ip4:${serverIp} mx ~all`);
     // DKIM
@@ -1690,6 +1692,54 @@ systemctl reload dovecot
 systemctl reload postfix`;
   await execPromise(`sudo bash -c ${shellEscape(script)}`);
   console.log('Mail SNI regenerated (per-domain mail certs wired into Dovecot + Postfix).');
+}
+
+// Serve mail-client autoconfiguration XML at autoconfig.<domain> (Thunderbird /
+// Mozilla) and autodiscover.<domain> (Outlook). Uses the multi-SAN mail cert,
+// which already covers both hostnames. Backed by /var/www/mailconfig/index.php.
+async function provisionMailconfigVhost(domainName: string): Promise<void> {
+  const d = validateDomainName(domainName);
+  const certBase = `/etc/letsencrypt/live/mail.${d}`;
+  const hasCert = await execPromise(`sudo test -f ${shellEscape(`${certBase}/fullchain.pem`)}`).then(() => true).catch(() => false);
+  if (!hasCert) return; // the mail cert (covering autoconfig/autodiscover SANs) must exist first
+
+  // Ensure the autoconfig/autodiscover responder is installed (from repo asset).
+  await execPromise('sudo mkdir -p /var/www/mailconfig');
+  await execPromise(`sudo cp ${shellEscape(path.join(process.cwd(), 'assets/mailconfig.php'))} /var/www/mailconfig/index.php`).catch(() => {});
+  await execPromise('sudo chown -R www-data:www-data /var/www/mailconfig').catch(() => {});
+
+  const conf = `server {
+    listen 80;
+    server_name autoconfig.${d} autodiscover.${d};
+    location ^~ /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://$host$request_uri; }
+}
+server {
+    listen 443 ssl;
+    server_name autoconfig.${d} autodiscover.${d};
+    ssl_certificate ${certBase}/fullchain.pem;
+    ssl_certificate_key ${certBase}/privkey.pem;
+    root /var/www/mailconfig;
+    location ~* ^/(mail/config-v1\\.1\\.xml|\\.well-known/autoconfig/mail/config-v1\\.1\\.xml|autodiscover/autodiscover\\.(xml|json))$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME /var/www/mailconfig/index.php;
+        fastcgi_pass unix:/run/php/php8.5-fpm.sock;
+    }
+    location / { return 404; }
+}
+`;
+  const file = `/etc/nginx/sites-available/autoconfig.${d}`;
+  await fs.writeFile(`/tmp/autoconfig.${d}.nginx`, conf);
+  await execPromise(`sudo mv ${shellEscape(`/tmp/autoconfig.${d}.nginx`)} ${shellEscape(file)}`);
+  await execPromise(`sudo ln -sf ${shellEscape(file)} /etc/nginx/sites-enabled/autoconfig.${d}`);
+  try {
+    await execPromise('sudo nginx -t && sudo systemctl reload nginx');
+  } catch (e) {
+    await execPromise(`sudo rm -f ${shellEscape(file)} /etc/nginx/sites-enabled/autoconfig.${d}`).catch(() => {});
+    await execPromise('sudo systemctl reload nginx').catch(() => {});
+    throw new Error(`mailconfig vhost rejected for ${d}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  console.log(`Autoconfig/autodiscover vhost provisioned for ${d}`);
 }
 
 async function handleProvisionWebmailVhost(payload: { domainName: string; retry?: number }) {
@@ -1810,6 +1860,8 @@ server {
   // Wire the freshly-issued mail.<domain> cert into the mail server's SNI so
   // IMAP/POP/SMTP present it (not just the webmail vhost). Non-fatal.
   await regenerateMailSni().catch((e) => console.warn(`Mail SNI regen failed for ${mailHost}:`, e?.message));
+  // Serve autoconfig/autodiscover XML so Thunderbird/Outlook set up automatically.
+  await provisionMailconfigVhost(domainName).catch((e) => console.warn(`Mailconfig vhost for ${domainName}:`, e?.message));
 }
 
 async function handleProvisionSpamVhost({ domainName }: { domainName: string }) {
