@@ -180,6 +180,9 @@ async function handleTask(task: Task) {
       case 'GENERATE_EMAIL_DNS':
         await handleGenerateEmailDns(task.payload);
         break;
+      case 'REGENERATE_MAIL_SNI':
+        await regenerateMailSni();
+        break;
       case 'PROVISION_WEBMAIL_VHOST':
         await handleProvisionWebmailVhost(task.payload);
         break;
@@ -1645,6 +1648,32 @@ async function handleGenerateEmailDns(payload: any) {
   }
 }
 
+// Rebuild Dovecot + Postfix SNI from every mail.<domain> Let's Encrypt cert
+// present, so each mailbox host (mail.<domain>) presents ITS OWN valid cert over
+// IMAP/POP/SMTP instead of the server's default — no more cert-name mismatch in
+// mail clients. Idempotent and safe to re-run; rebuilds from what's on disk.
+async function regenerateMailSni(): Promise<void> {
+  const script = `set -e
+DC=/etc/dovecot/conf.d/93-superhost-sni.conf
+PF=/etc/postfix/vmail_sni
+: > "$DC.tmp"; : > "$PF.tmp"
+for d in /etc/letsencrypt/live/mail.*; do
+  [ -d "$d" ] || continue
+  n=$(basename "$d")
+  printf 'local_name %s {\\n  ssl_server_cert_file = %s/fullchain.pem\\n  ssl_server_key_file = %s/privkey.pem\\n}\\n' "$n" "$d" "$d" >> "$DC.tmp"
+  printf '%s %s/privkey.pem %s/fullchain.pem\\n' "$n" "$d" "$d" >> "$PF.tmp"
+done
+mv "$DC.tmp" "$DC"
+mv "$PF.tmp" "$PF"
+postmap -F hash:"$PF"
+postconf -e 'tls_server_sni_maps = hash:/etc/postfix/vmail_sni'
+doveconf > /dev/null
+systemctl reload dovecot
+systemctl reload postfix`;
+  await execPromise(`sudo bash -c ${shellEscape(script)}`);
+  console.log('Mail SNI regenerated (per-domain mail certs wired into Dovecot + Postfix).');
+}
+
 async function handleProvisionWebmailVhost({ domainName }: { domainName: string }) {
   const mailHost = `mail.${domainName}`;
   const nginxConf = `/etc/nginx/sites-available/${mailHost}`;
@@ -1740,6 +1769,10 @@ server {
   await execPromise(`sudo mv /tmp/${mailHost}.nginx ${nginxConf}`);
   await execPromise('sudo nginx -t && sudo systemctl reload nginx');
   console.log(`Webmail vhost provisioned: https://${mailHost}`);
+
+  // Wire the freshly-issued mail.<domain> cert into the mail server's SNI so
+  // IMAP/POP/SMTP present it (not just the webmail vhost). Non-fatal.
+  await regenerateMailSni().catch((e) => console.warn(`Mail SNI regen failed for ${mailHost}:`, e?.message));
 }
 
 async function handleProvisionSpamVhost({ domainName }: { domainName: string }) {
