@@ -1,7 +1,7 @@
 import React from 'react';
 import { BRAND } from '../brand';
 
-// The Quality Creations wordmark: a "QC" monogram + name. Used across the
+// The Quantum Creations wordmark: a "QC" monogram + name. Used across the
 // customer-facing storefront (marketing, order, login).
 const SIZES = {
   sm: { box: 'w-7 h-7 text-xs', text: 'text-base' },

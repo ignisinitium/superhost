@@ -144,7 +144,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, userRole }) => {
         .filter(g => g.items.length > 0);
     }
   }
-  // Customers see the "Quality Creations" brand (violet); admins see the
+  // Customers see the "Quantum Creations" brand (violet); admins see the
   // "Superhost" engine brand (orange).
   const isClient = userRole === 'client';
   const activeCls = isClient

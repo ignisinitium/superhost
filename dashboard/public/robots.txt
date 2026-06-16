@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /login
+Disallow: /client
+Disallow: /dashboard
+
+Sitemap: https://qc.fyi/sitemap.xml
