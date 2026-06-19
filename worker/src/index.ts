@@ -2494,6 +2494,86 @@ async function applyMailSpamInfraConfig() {
   }
 }
 
+// Configure Postfix postscreen — a pre-queue filter on port 25 that blocks
+// botnet/zombie senders at connect time (weighted DNSBL + pregreet test) before
+// they ever reach smtpd/SpamAssassin. Conservative: pregreet + DNSBL only (no
+// after-220 tests that could delay legit mail), with list.dnswl.org as a
+// negative-weight whitelist to protect known-good senders. Submission (587) is
+// left as plain smtpd, so authenticated users are never subject to postscreen.
+// Idempotent — postconf -M/-e just re-assert the same values on re-run.
+async function configurePostscreen() {
+  // master.cf: front port 25 with postscreen + its required helper services.
+  const services = [
+    'smtp/inet=smtp inet n - n - 1 postscreen',
+    'smtpd/pass=smtpd pass - - n - - smtpd',
+    'dnsblog/unix=dnsblog unix - - n - 0 dnsblog',
+    'tlsproxy/unix=tlsproxy unix - - n - 0 tlsproxy',
+  ];
+  for (const svc of services) {
+    await execPromise(`sudo postconf -Me ${shellEscape(svc)}`).catch((e) =>
+      console.warn('postscreen master.cf service failed:', (e as Error).message));
+  }
+  // main.cf: zen alone reaches the threshold (weight 2); spamcop contributes.
+  // The DNSWL whitelist syntax allows only ONE [0..255] range octet per pattern.
+  const params = [
+    'postscreen_access_list = permit_mynetworks',
+    'postscreen_blacklist_action = enforce',
+    'postscreen_greet_action = enforce',
+    'postscreen_dnsbl_threshold = 2',
+    'postscreen_dnsbl_action = enforce',
+    'postscreen_dnsbl_sites = zen.spamhaus.org*2 bl.spamcop.net*1 ' +
+      'list.dnswl.org=127.0.[0..255].0*-2 list.dnswl.org=127.0.[0..255].1*-3 ' +
+      'list.dnswl.org=127.0.[0..255].2*-4 list.dnswl.org=127.0.[0..255].3*-5',
+  ];
+  for (const p of params) {
+    await execPromise(`sudo postconf -e ${shellEscape(p)}`).catch((e) =>
+      console.warn('postscreen param failed:', (e as Error).message));
+  }
+}
+
+// Install + initialise Pyzor and Razor2 collaborative spam-fingerprint checks.
+// SpamAssassin loads the plugins, but without the client binaries and per-user
+// config they silently do nothing. spamd's --helper-home-dir is pinned to a
+// fixed path so the configs are found regardless of which user spamd runs scans
+// as. Idempotent — initialisation is skipped if the configs already exist.
+async function configureSpamNetworkChecks() {
+  const helperHome = '/var/lib/spamassassin';
+  await execPromise('sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pyzor razor')
+    .catch((e) => console.warn('pyzor/razor install skipped:', (e as Error).message));
+
+  // Pin spamd's --helper-home-dir (a bare flag resolves to the run-user's home,
+  // typically /root, which the scan user can't read → razor/pyzor silently fail).
+  try {
+    const def = '/etc/default/spamd';
+    let content = await fs.readFile(def, 'utf8');
+    const alreadyPinned = new RegExp(`--helper-home-dir\\s+${helperHome.replace(/\//g, '\\/')}(\\s|"|$)`).test(content);
+    if (!alreadyPinned) {
+      content = /--helper-home-dir/.test(content)
+        ? content.replace(/--helper-home-dir(\s+[^\s"]+)?/, `--helper-home-dir ${helperHome}`)
+        : content.replace(/^OPTIONS="/m, `OPTIONS="--helper-home-dir ${helperHome} `);
+      const tmp = '/tmp/superhost-spamd-default';
+      await fs.writeFile(tmp, content);
+      await execPromise(`sudo mv ${shellEscape(tmp)} ${def}`);
+      await execPromise(`sudo chown root:root ${def}`);
+      await execPromise(`sudo chmod 644 ${def}`);
+    }
+  } catch (e) {
+    console.warn('Could not pin spamd helper-home-dir:', (e as Error).message);
+  }
+
+  // Initialise Razor (create + register identity) and Pyzor once, as the spamd
+  // helper user; make the configs readable by whatever user runs the scans.
+  const exists = (p: string) => fs.access(p).then(() => true).catch(() => false);
+  if (!(await exists(`${helperHome}/.razor`))) {
+    await execPromise(`sudo -u debian-spamd env HOME=${helperHome} razor-admin -home=${helperHome}/.razor -create`).catch(() => {});
+    await execPromise(`sudo -u debian-spamd env HOME=${helperHome} razor-admin -home=${helperHome}/.razor -register`).catch(() => {});
+  }
+  if (!(await exists(`${helperHome}/.pyzor`))) {
+    await execPromise(`sudo -u debian-spamd env HOME=${helperHome} pyzor ping`).catch(() => {});
+  }
+  await execPromise(`sudo chmod -R a+rX ${helperHome}/.razor ${helperHome}/.pyzor`).catch(() => {});
+}
+
 // Configure Postfix to relay inbound mail for customer "spam filter" domains to
 // their real mail server. DB-driven pgsql maps so adding/removing a relay domain
 // in the panel takes effect without rewriting files. Additive + validated:
@@ -2715,6 +2795,9 @@ async function handleConfigureMailServer() {
     //     attachment blocking) driven by server_settings keys (migration 021).
     await applyMailSpamInfraConfig();
 
+    // 2c. postscreen — always-on pre-queue botnet filter on port 25.
+    await configurePostscreen();
+
     // 3. Deploy Dovecot 2.4 SQL auth config (auth-sql.conf.ext)
     //    Correct Dovecot 2.4 format: sql_driver at top level, named pgsql block,
     //    BLF-CRYPT scheme (Dovecot's name for bcrypt / Blowfish-Crypt).
@@ -2846,6 +2929,9 @@ bayes_auto_learn 1
     await fs.writeFile(tempSa, saLocalCf);
     await execPromise(`sudo mv ${tempSa} /etc/spamassassin/local.cf`).catch((e) =>
       console.warn('Could not write SpamAssassin local.cf:', (e as Error).message));
+    // Install + initialise Pyzor/Razor2 before (re)starting spamd so the
+    // collaborative checks actually run (the plugins are loaded by default).
+    await configureSpamNetworkChecks();
     // The SpamAssassin daemon unit is `spamd` on this distro (`spamassassin` was
     // the older Debian name). Try spamd first, fall back to the legacy name so
     // this works across distros — without a working restart, local.cf changes
