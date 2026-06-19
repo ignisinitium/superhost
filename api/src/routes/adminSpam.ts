@@ -179,6 +179,73 @@ router.get('/stats', async (_req, res) => {
   }
 });
 
+// ── Mail activity log (delivered / quarantined / blocked / virus) ───────────────
+
+router.get('/activity', async (req, res) => {
+  const { search, userId, disposition, dateFrom, dateTo, limit = '100', offset = '0' } = req.query;
+  try {
+    const params: unknown[] = [];
+    const wheres: string[] = [];
+    let p = 1;
+
+    if (userId) {
+      wheres.push(`md.user_id = $${p++}`);
+      params.push(userId);
+    }
+    if (disposition && typeof disposition === 'string' && disposition !== 'all') {
+      wheres.push(`ma.disposition = $${p++}`);
+      params.push(disposition);
+    }
+    if (search && typeof search === 'string' && search.trim()) {
+      wheres.push(`(ma.sender ILIKE $${p} OR ma.recipient ILIKE $${p} OR ma.subject ILIKE $${p})`);
+      params.push(`%${search.trim()}%`);
+      p++;
+    }
+    if (dateFrom && typeof dateFrom === 'string') {
+      wheres.push(`ma.occurred_at >= $${p++}`);
+      params.push(dateFrom);
+    }
+    if (dateTo && typeof dateTo === 'string') {
+      wheres.push(`ma.occurred_at <= $${p++}`);
+      params.push(dateTo);
+    }
+
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+
+    const [rows, countRow, counts] = await Promise.all([
+      query(`
+        SELECT ma.id, ma.occurred_at, ma.disposition, ma.sender, ma.recipient, ma.subject,
+               ma.spam_score, ma.virus_name, ma.reason, ma.mail_user_id,
+               md.domain_name, u.username AS owner
+        FROM mail_activity ma
+        LEFT JOIN mail_domains md ON ma.domain_id = md.id
+        LEFT JOIN users u ON md.user_id = u.id
+        ${where}
+        ORDER BY ma.occurred_at DESC
+        LIMIT $${p} OFFSET $${p + 1}
+      `, [...params, limit, offset]),
+      query(`
+        SELECT COUNT(*)::int AS total
+        FROM mail_activity ma
+        LEFT JOIN mail_domains md ON ma.domain_id = md.id
+        ${where}
+      `, params),
+      // Disposition tallies over the last 24h / 7d for the summary cards.
+      query(`
+        SELECT disposition,
+               COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '24 hours')::int AS day,
+               COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '7 days')::int  AS week
+        FROM mail_activity
+        GROUP BY disposition
+      `),
+    ]);
+
+    res.json({ items: rows.rows, total: countRow.rows[0].total, summary: counts.rows });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // ── Quarantine: list all (admin) ───────────────────────────────────────────────
 
 router.get('/quarantine', async (req, res) => {
@@ -503,6 +570,7 @@ router.post('/digest/:mailUserId', async (req, res) => {
 const INFRA_KEYS = [
   'greylisting_enabled', 'rbl_enabled', 'mail_rbls',
   'attachment_blocking_enabled', 'blocked_attachment_extensions',
+  'spf_enforce_enabled',
 ] as const;
 
 router.get('/settings', async (_req, res) => {
@@ -543,6 +611,87 @@ router.put('/settings', async (req, res) => {
     // Re-apply mail config so changes take effect.
     await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['CONFIGURE_MAIL_SERVER', {}]);
     res.json({ message: 'Spam infrastructure settings updated' });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// ── RBL catalog (individually toggleable DNS blocklists) ────────────────────────
+
+const RBL_ZONE_RE = /^[a-zA-Z0-9.\-]+$/;
+
+// Re-apply RBL/greylisting/attachment config via a lightweight worker task.
+async function queueInfraApply() {
+  await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['APPLY_MAIL_SPAM_INFRA', {}]);
+}
+
+router.get('/rbls', async (_req, res) => {
+  try {
+    const result = await query(
+      'SELECT id, zone, name, description, enabled, is_custom FROM mail_rbls ORDER BY sort_order, name'
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.post('/rbls', async (req, res) => {
+  const { zone, name, description } = req.body as { zone?: string; name?: string; description?: string };
+  const z = (zone ?? '').trim().toLowerCase();
+  if (!RBL_ZONE_RE.test(z)) {
+    return res.status(400).json({ message: 'Zone must be a valid DNS hostname (e.g. zen.spamhaus.org)' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO mail_rbls (zone, name, description, enabled, is_custom, sort_order)
+       VALUES ($1, $2, $3, TRUE, TRUE, 500)
+       ON CONFLICT (zone) DO UPDATE SET enabled = TRUE
+       RETURNING id, zone, name, description, enabled, is_custom`,
+      [z, (name ?? z).trim().slice(0, 120), (description ?? '').trim().slice(0, 500) || null]
+    );
+    await queueInfraApply();
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.patch('/rbls/:id', async (req, res) => {
+  const id = parseInt(req.params.id as string, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid id' });
+  const { enabled, name, description } = req.body as { enabled?: boolean; name?: string; description?: string };
+  try {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    let p = 1;
+    if (typeof enabled === 'boolean') { sets.push(`enabled = $${p++}`); params.push(enabled); }
+    if (typeof name === 'string')     { sets.push(`name = $${p++}`); params.push(name.trim().slice(0, 120)); }
+    if (typeof description === 'string') { sets.push(`description = $${p++}`); params.push(description.trim().slice(0, 500) || null); }
+    if (!sets.length) return res.status(400).json({ message: 'Nothing to update' });
+    params.push(id);
+    const result = await query(
+      `UPDATE mail_rbls SET ${sets.join(', ')} WHERE id = $${p}
+       RETURNING id, zone, name, description, enabled, is_custom`,
+      params
+    );
+    if (!result.rows.length) return res.status(404).json({ message: 'RBL not found' });
+    if (typeof enabled === 'boolean') await queueInfraApply();
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+router.delete('/rbls/:id', async (req, res) => {
+  const id = parseInt(req.params.id as string, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid id' });
+  try {
+    const result = await query('DELETE FROM mail_rbls WHERE id = $1 RETURNING enabled', [id]);
+    if (!result.rows.length) return res.status(404).json({ message: 'RBL not found' });
+    // Only need to re-apply Postfix if the removed RBL was active.
+    if (result.rows[0].enabled) await queueInfraApply();
+    res.json({ message: 'RBL removed' });
   } catch (err) {
     res.status(500).json({ message: (err as Error).message });
   }

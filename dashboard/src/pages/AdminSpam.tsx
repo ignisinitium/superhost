@@ -15,7 +15,7 @@ import {
   Building2, Activity, Bug, Eye,
 } from 'lucide-react';
 import QuarantinePreviewModal, { type QuarantineMeta } from '../components/QuarantinePreviewModal';
-import type { QuarantineMessage } from '../../../shared/types';
+import type { QuarantineMessage, MailRbl } from '../../../shared/types';
 import toast from 'react-hot-toast';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -126,15 +126,36 @@ function EmptyState({ icon: Icon, text }: { icon: React.ElementType; text: strin
 
 // ── Main Page ──────────────────────────────────────────────────────────────────
 
-type Tab = 'overview' | 'quarantine' | 'mailboxes' | 'rules' | 'infra';
+type Tab = 'overview' | 'activity' | 'quarantine' | 'mailboxes' | 'rules' | 'infra';
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: 'overview',   label: 'Overview',   icon: TrendingDown },
+  { id: 'activity',   label: 'Activity',   icon: Activity },
   { id: 'quarantine', label: 'Quarantine', icon: ShieldAlert },
   { id: 'mailboxes',  label: 'Mailboxes',  icon: Mail },
   { id: 'rules',      label: 'Rules',      icon: Filter },
   { id: 'infra',      label: 'Infrastructure', icon: ShieldCheck },
 ];
+
+// Visual treatment per message disposition in the activity log.
+const ADMIN_DISPOSITIONS: Record<string, { label: string; icon: React.ElementType; cls: string }> = {
+  delivered:   { label: 'Delivered',   icon: Inbox,        cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  quarantined: { label: 'Quarantined', icon: ShieldAlert,  cls: 'bg-orange-50 text-orange-700 border-orange-200' },
+  blocked:     { label: 'Blocked',     icon: CircleAlert,  cls: 'bg-red-50 text-red-700 border-red-200' },
+  virus:       { label: 'Virus',       icon: Bug,          cls: 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200' },
+  spam:        { label: 'Spam',        icon: ShieldAlert,  cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  deferred:    { label: 'Deferred',    icon: RefreshCw,    cls: 'bg-slate-50 text-slate-600 border-slate-200' },
+};
+
+function AdminDispositionBadge({ d }: { d: string }) {
+  const cfg = ADMIN_DISPOSITIONS[d] ?? { label: d, icon: Mail, cls: 'bg-slate-50 text-slate-600 border-slate-200' };
+  const Icon = cfg.icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${cfg.cls}`}>
+      <Icon size={10} />{cfg.label}
+    </span>
+  );
+}
 
 const AdminSpam: React.FC = () => {
   const queryClient = useQueryClient();
@@ -176,10 +197,117 @@ const AdminSpam: React.FC = () => {
       </div>
 
       {activeTab === 'overview'   && <OverviewTab />}
+      {activeTab === 'activity'   && <ActivityTab />}
       {activeTab === 'quarantine' && <QuarantineTab queryClient={queryClient} />}
       {activeTab === 'mailboxes'  && <MailboxesTab  queryClient={queryClient} />}
       {activeTab === 'rules'      && <RulesTab       queryClient={queryClient} />}
       {activeTab === 'infra'      && <InfraTab       queryClient={queryClient} />}
+    </div>
+  );
+};
+
+// ── RBL catalog: individually toggleable DNS blocklists ─────────────────────────
+
+const RblManager: React.FC<{ masterEnabled: boolean; queryClient: ReturnType<typeof useQueryClient> }> = ({ masterEnabled, queryClient }) => {
+  const { data: rbls, isLoading } = useQuery<MailRbl[]>({
+    queryKey: ['adminSpamRbls'],
+    queryFn: async () => (await adminApi.get('/spam/rbls')).data,
+  });
+
+  const [zone, setZone] = useState('');
+  const [name, setName] = useState('');
+
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ['adminSpamRbls'] });
+
+  const toggleMutation = useMutation({
+    mutationFn: async ({ id, enabled }: { id: number; enabled: boolean }) =>
+      (await adminApi.patch(`/spam/rbls/${id}`, { enabled })).data,
+    onSuccess: (_d, v) => { toast.success(v.enabled ? 'Blocklist enabled' : 'Blocklist disabled'); invalidate(); },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to update'),
+  });
+
+  const addMutation = useMutation({
+    mutationFn: async () => (await adminApi.post('/spam/rbls', { zone, name: name || zone })).data,
+    onSuccess: () => { toast.success('Custom blocklist added'); setZone(''); setName(''); invalidate(); },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to add'),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (id: number) => (await adminApi.delete(`/spam/rbls/${id}`)).data,
+    onSuccess: () => { toast.success('Blocklist removed'); invalidate(); },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to remove'),
+  });
+
+  return (
+    <div className={masterEnabled ? '' : 'opacity-60'}>
+      <div className="flex items-center justify-between mb-3">
+        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">DNS blocklists</label>
+        {!masterEnabled && <span className="text-[11px] text-amber-600 font-semibold">Enable the master switch above to activate</span>}
+      </div>
+
+      {isLoading ? (
+        <div className="text-slate-400 text-sm py-4">Loading blocklists…</div>
+      ) : (
+        <div className="space-y-1.5">
+          {rbls?.map(rbl => (
+            <div key={rbl.id} className="flex items-start justify-between gap-3 py-2.5 px-3 rounded-xl bg-slate-50 border border-slate-100">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-slate-800 text-sm">{rbl.name}</span>
+                  <span className="font-mono text-[11px] text-slate-500">{rbl.zone}</span>
+                  {rbl.is_custom && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-100">Custom</span>}
+                </div>
+                {rbl.description && <div className="text-slate-500 text-xs mt-0.5">{rbl.description}</div>}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => toggleMutation.mutate({ id: rbl.id, enabled: !rbl.enabled })}
+                  disabled={toggleMutation.isPending}
+                  title={rbl.enabled ? 'Disable' : 'Enable'}
+                  className={`w-11 h-6 rounded-full transition-colors ${rbl.enabled ? 'bg-green-500' : 'bg-slate-300'}`}
+                >
+                  <span className={`block w-5 h-5 bg-white rounded-full shadow transform transition-transform mt-0.5 ${rbl.enabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                </button>
+                {rbl.is_custom && (
+                  <button
+                    onClick={() => deleteMutation.mutate(rbl.id)}
+                    title="Remove"
+                    className="text-slate-300 hover:text-red-500 transition-colors"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add custom blocklist */}
+      <div className="flex gap-2 mt-3">
+        <input
+          className="flex-1 bg-white border border-slate-200 rounded-xl py-2 px-3 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          value={zone}
+          onChange={(e) => setZone(e.target.value)}
+          placeholder="custom.blocklist.example.org"
+          onKeyDown={(e) => { if (e.key === 'Enter' && zone.trim()) addMutation.mutate(); }}
+        />
+        <input
+          className="w-40 bg-white border border-slate-200 rounded-xl py-2 px-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Display name"
+          onKeyDown={(e) => { if (e.key === 'Enter' && zone.trim()) addMutation.mutate(); }}
+        />
+        <button
+          onClick={() => addMutation.mutate()}
+          disabled={addMutation.isPending || !zone.trim()}
+          className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl font-bold text-sm disabled:opacity-40"
+        >
+          <Plus size={15} />Add
+        </button>
+      </div>
+      <p className="text-[11px] text-slate-400 mt-2">Enabling or disabling a blocklist applies immediately (reloads Postfix). Listings still require the master switch above to be on.</p>
     </div>
   );
 };
@@ -226,16 +354,11 @@ const InfraTab: React.FC<{ queryClient: ReturnType<typeof useQueryClient> }> = (
   return (
     <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 max-w-3xl space-y-2">
       <Toggle k="greylisting_enabled" label="Greylisting" desc="Temporarily defer mail from unknown senders; legitimate servers retry, most spambots don't. (Installs postgrey.)" />
-      <Toggle k="rbl_enabled" label="DNS blocklists (RBL)" desc="Reject connections from IPs listed on the blocklists below at SMTP time." />
-      <div className="py-3 border-b border-slate-100">
-        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">RBL zones (comma-separated)</label>
-        <input
-          className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
-          value={s['mail_rbls'] ?? ''}
-          onChange={(e) => set('mail_rbls', e.target.value)}
-          placeholder="zen.spamhaus.org,bl.spamcop.net"
-        />
+      <Toggle k="rbl_enabled" label="DNS blocklists (RBL)" desc="Master switch — reject connections from IPs on the enabled blocklists below at SMTP time. (Applies on Save & Apply.)" />
+      <div className="py-4 border-b border-slate-100">
+        <RblManager masterEnabled={s['rbl_enabled'] === 'true'} queryClient={queryClient} />
       </div>
+      <Toggle k="spf_enforce_enabled" label="SPF hard-fail rejection" desc="Reject mail only when the sender's domain publishes a strict SPF policy (-all) and the sending IP isn't authorized. Missing SPF, SoftFail and Neutral are never rejected — they stay score-only — so legitimate senders aren't affected. (Installs policyd-spf.)" />
       <Toggle k="attachment_blocking_enabled" label="Dangerous attachment blocking" desc="Reject messages whose attachments use risky extensions before they are delivered." />
       <div className="py-3">
         <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Blocked extensions (comma-separated)</label>
@@ -310,6 +433,173 @@ function LeaderBar({ value, max, color = 'orange' }: { value: number; max: numbe
     </div>
   );
 }
+
+// ── Activity tab (server-wide mail disposition log) ─────────────────────────────
+interface ActivityRow {
+  id: number;
+  occurred_at: string;
+  disposition: string;
+  sender: string | null;
+  recipient: string | null;
+  subject: string | null;
+  spam_score: number | null;
+  virus_name: string | null;
+  reason: string | null;
+  domain_name: string | null;
+  owner: string | null;
+}
+interface ActivityResponse {
+  items: ActivityRow[];
+  total: number;
+  summary: { disposition: string; day: number; week: number }[];
+}
+
+const ACTIVITY_FILTERS = ['all', 'delivered', 'quarantined', 'blocked', 'virus'];
+
+const ActivityTab: React.FC = () => {
+  const [disposition, setDisposition] = useState('all');
+  const [search, setSearch] = useState('');
+  const [debounced, setDebounced] = useState('');
+  const [userFilter, setUserFilter] = useState('');
+
+  React.useEffect(() => {
+    const t = setTimeout(() => setDebounced(search), 350);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const { data: users } = useQuery<User[]>({
+    queryKey: ['users'],
+    queryFn: async () => (await api.get('/users')).data,
+  });
+
+  const { data, isLoading } = useQuery<ActivityResponse>({
+    queryKey: ['admin-mail-activity', disposition, debounced, userFilter],
+    queryFn: async () => {
+      const params = new URLSearchParams({ disposition, limit: '300' });
+      if (debounced.trim()) params.set('search', debounced.trim());
+      if (userFilter) params.set('userId', userFilter);
+      return (await adminApi.get(`/spam/activity?${params}`)).data;
+    },
+    refetchInterval: 30_000,
+  });
+
+  const summary = useMemo(() => {
+    const map = new Map((data?.summary ?? []).map(s => [s.disposition, s]));
+    return ['delivered', 'quarantined', 'blocked', 'virus'].map(d => ({
+      d, day: map.get(d)?.day ?? 0, week: map.get(d)?.week ?? 0,
+    }));
+  }, [data]);
+
+  const items = data?.items ?? [];
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {summary.map(({ d, day, week }) => {
+          const cfg = ADMIN_DISPOSITIONS[d]!;
+          const Icon = cfg.icon;
+          return (
+            <div key={d} className={`rounded-2xl border p-4 ${cfg.cls}`}>
+              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide opacity-80">
+                <Icon size={14} />{cfg.label}
+              </div>
+              <div className="mt-2 text-2xl font-extrabold">{day.toLocaleString()}</div>
+              <div className="text-[11px] opacity-70">last 24h · {week.toLocaleString()} in 7d</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex flex-col lg:flex-row gap-3 lg:items-center justify-between">
+        <div className="flex flex-wrap gap-1 bg-slate-100 p-1 rounded-xl w-fit">
+          {ACTIVITY_FILTERS.map(f => (
+            <button
+              key={f}
+              onClick={() => setDisposition(f)}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold capitalize transition-all ${disposition === f ? 'bg-white text-orange-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <select
+            value={userFilter}
+            onChange={e => setUserFilter(e.target.value)}
+            className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:ring-2 focus:ring-orange-500/20"
+          >
+            <option value="">All customers</option>
+            {users?.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+          </select>
+          <div className="relative">
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search sender, recipient, subject…"
+              className="pl-9 pr-3 py-2 w-full sm:w-72 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-orange-500/20"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+        {isLoading ? (
+          <div className="p-12 text-center text-slate-400">Loading activity…</div>
+        ) : items.length === 0 ? (
+          <div className="p-12 text-center text-slate-400 flex flex-col items-center gap-3">
+            <Activity className="opacity-20" size={48} />
+            <p>No mail activity recorded for this selection yet.</p>
+          </div>
+        ) : (
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="text-[11px] uppercase tracking-wide text-slate-400 border-b border-slate-100">
+                <th className="px-4 py-3 font-bold">When</th>
+                <th className="px-4 py-3 font-bold">Status</th>
+                <th className="px-4 py-3 font-bold">From</th>
+                <th className="px-4 py-3 font-bold">To</th>
+                <th className="px-4 py-3 font-bold">Customer</th>
+                <th className="px-4 py-3 font-bold">Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map(row => (
+                <tr key={row.id} className="border-b border-slate-50 hover:bg-slate-50/50">
+                  <td className="px-4 py-2.5 whitespace-nowrap text-slate-500 text-xs">
+                    {new Date(row.occurred_at).toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2.5"><AdminDispositionBadge d={row.disposition} /></td>
+                  <td className="px-4 py-2.5 max-w-[200px] truncate text-slate-700" title={row.sender ?? ''}>
+                    {row.sender ?? '—'}
+                  </td>
+                  <td className="px-4 py-2.5 max-w-[180px] truncate text-slate-600" title={row.recipient ?? ''}>
+                    {row.recipient ?? '—'}
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-slate-500">{row.owner ?? '—'}</td>
+                  <td className="px-4 py-2.5 text-xs text-slate-500">
+                    {row.virus_name
+                      ? <span className="text-fuchsia-700 font-semibold">{row.virus_name}</span>
+                      : row.reason
+                        ? <span className="text-red-600">{row.reason}</span>
+                        : row.spam_score != null
+                          ? <span className="font-mono text-orange-600 font-bold">{row.spam_score.toFixed(1)}</span>
+                          : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {data && data.total > items.length && (
+        <p className="text-center text-xs text-slate-400">
+          Showing {items.length} of {data.total.toLocaleString()} events. Refine with filters or search.
+        </p>
+      )}
+    </div>
+  );
+};
 
 const OverviewTab: React.FC = () => {
   const { data: stats, isLoading } = useQuery<SpamStats>({

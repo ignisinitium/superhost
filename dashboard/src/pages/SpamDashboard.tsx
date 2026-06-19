@@ -7,14 +7,35 @@ import {
   Mail, UserCheck, UserX, Search, X, Square,
   SquareCheck, ShieldCheck, Bell, BellOff,
   MailOpen, Settings, Inbox, RefreshCw, Eye,
+  Activity, ShieldX, Bug,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
-import type { MailUser, MailQuarantine, MailAccessControl, QuarantineMessage } from '../../../shared/types';
+import type { MailUser, MailQuarantine, MailAccessControl, QuarantineMessage, MailActivityResponse } from '../../../shared/types';
 import QuarantinePreviewModal, { type QuarantineMeta } from '../components/QuarantinePreviewModal';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-type Tab = 'quarantine' | 'access' | 'settings';
+type Tab = 'quarantine' | 'activity' | 'access' | 'settings';
+
+// Visual treatment for each message disposition in the activity log.
+const DISPOSITIONS: Record<string, { label: string; icon: React.ElementType; cls: string }> = {
+  delivered:   { label: 'Delivered',   icon: Inbox,    cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  quarantined: { label: 'Quarantined', icon: ShieldAlert, cls: 'bg-orange-50 text-orange-700 border-orange-200' },
+  blocked:     { label: 'Blocked',     icon: ShieldX,  cls: 'bg-red-50 text-red-700 border-red-200' },
+  virus:       { label: 'Virus',       icon: Bug,      cls: 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200' },
+  spam:        { label: 'Spam',        icon: ShieldAlert, cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  deferred:    { label: 'Deferred',    icon: RefreshCw, cls: 'bg-slate-50 text-slate-600 border-slate-200' },
+};
+
+function DispositionBadge({ d }: { d: string }) {
+  const cfg = DISPOSITIONS[d] ?? { label: d, icon: Mail, cls: 'bg-slate-50 text-slate-600 border-slate-200' };
+  const Icon = cfg.icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${cfg.cls}`}>
+      <Icon size={10} />{cfg.label}
+    </span>
+  );
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -111,6 +132,7 @@ const SpamDashboard: React.FC<{ mailUserIdOverride?: number | null }> = ({ mailU
 
   const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
     { id: 'quarantine', label: 'Quarantine', icon: ShieldAlert },
+    { id: 'activity',   label: 'Activity', icon: Activity },
     { id: 'access',     label: 'Access Control', icon: Filter },
     { id: 'settings',   label: 'Settings', icon: Settings },
   ];
@@ -165,6 +187,9 @@ const SpamDashboard: React.FC<{ mailUserIdOverride?: number | null }> = ({ mailU
               queryClient={queryClient}
             />
           )}
+          {activeTab === 'activity' && (
+            <ActivityTab selectedMailboxId={selectedMailboxId} />
+          )}
           {activeTab === 'access' && (
             <AccessControlTab selectedMailboxId={selectedMailboxId} queryClient={queryClient} />
           )}
@@ -172,6 +197,144 @@ const SpamDashboard: React.FC<{ mailUserIdOverride?: number | null }> = ({ mailU
             <SettingsTab mailbox={selectedMailbox} queryClient={queryClient} />
           )}
         </div>
+      )}
+    </div>
+  );
+};
+
+// ── Activity tab ─────────────────────────────────────────────────────────────
+const ACTIVITY_FILTERS: { id: string; label: string }[] = [
+  { id: 'all',         label: 'All' },
+  { id: 'delivered',   label: 'Delivered' },
+  { id: 'quarantined', label: 'Quarantined' },
+  { id: 'blocked',     label: 'Blocked' },
+  { id: 'virus',       label: 'Virus' },
+];
+
+const ActivityTab: React.FC<{ selectedMailboxId: string }> = ({ selectedMailboxId }) => {
+  const [disposition, setDisposition] = useState('all');
+  const [search, setSearch] = useState('');
+  const [debounced, setDebounced] = useState('');
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(search), 350);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const { data, isLoading } = useQuery<MailActivityResponse>({
+    queryKey: ['mail-activity', selectedMailboxId, disposition, debounced],
+    queryFn: async () => {
+      const params = new URLSearchParams({ mailUserId: selectedMailboxId, disposition, limit: '200' });
+      if (debounced.trim()) params.set('search', debounced.trim());
+      return (await api.get(`/client/email/activity?${params}`)).data;
+    },
+    refetchInterval: 30_000,
+  });
+
+  const summary = useMemo(() => {
+    const map = new Map((data?.summary ?? []).map(s => [s.disposition, s]));
+    return ['delivered', 'quarantined', 'blocked', 'virus'].map(d => ({
+      d, day: map.get(d)?.day ?? 0, week: map.get(d)?.week ?? 0,
+    }));
+  }, [data]);
+
+  const items = data?.items ?? [];
+
+  return (
+    <div className="space-y-5">
+      {/* Summary cards (last 24h / 7d) */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {summary.map(({ d, day, week }) => {
+          const cfg = DISPOSITIONS[d]!;
+          const Icon = cfg.icon;
+          return (
+            <div key={d} className={`rounded-2xl border p-4 ${cfg.cls}`}>
+              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide opacity-80">
+                <Icon size={14} />{cfg.label}
+              </div>
+              <div className="mt-2 text-2xl font-extrabold">{day}</div>
+              <div className="text-[11px] opacity-70">last 24h · {week} in 7d</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Filters */}
+      <div className="flex flex-col sm:flex-row gap-3 sm:items-center justify-between">
+        <div className="flex flex-wrap gap-1 bg-slate-200/50 p-1 rounded-xl w-fit">
+          {ACTIVITY_FILTERS.map(f => (
+            <button
+              key={f.id}
+              onClick={() => setDisposition(f.id)}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all ${disposition === f.id ? 'bg-white text-orange-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <div className="relative">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search sender, recipient, subject…"
+            className="pl-9 pr-3 py-2 w-full sm:w-72 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-orange-500/20"
+          />
+        </div>
+      </div>
+
+      {/* Table */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+        {isLoading ? (
+          <div className="p-12 text-center text-slate-400">Loading activity…</div>
+        ) : items.length === 0 ? (
+          <div className="p-12 text-center text-slate-400 flex flex-col items-center gap-3">
+            <Activity className="opacity-20" size={48} />
+            <p>No mail activity yet for this selection.</p>
+          </div>
+        ) : (
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="text-[11px] uppercase tracking-wide text-slate-400 border-b border-slate-100">
+                <th className="px-4 py-3 font-bold">When</th>
+                <th className="px-4 py-3 font-bold">Status</th>
+                <th className="px-4 py-3 font-bold">From</th>
+                <th className="px-4 py-3 font-bold">To</th>
+                <th className="px-4 py-3 font-bold">Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map(row => (
+                <tr key={row.id} className="border-b border-slate-50 hover:bg-slate-50/50">
+                  <td className="px-4 py-2.5 whitespace-nowrap text-slate-500 text-xs">
+                    {new Date(row.occurred_at).toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2.5"><DispositionBadge d={row.disposition} /></td>
+                  <td className="px-4 py-2.5 max-w-[200px] truncate text-slate-700" title={row.sender ?? ''}>
+                    {row.sender ?? '—'}
+                  </td>
+                  <td className="px-4 py-2.5 max-w-[180px] truncate text-slate-600" title={row.recipient ?? ''}>
+                    {row.recipient ?? '—'}
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-slate-500">
+                    {row.virus_name
+                      ? <span className="text-fuchsia-700 font-semibold">{row.virus_name}</span>
+                      : row.reason
+                        ? <span className="text-red-600">{row.reason}</span>
+                        : row.spam_score != null
+                          ? <ScoreBadge score={row.spam_score} />
+                          : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {data && data.total > items.length && (
+        <p className="text-center text-xs text-slate-400">
+          Showing {items.length} of {data.total} events. Refine with filters or search.
+        </p>
       )}
     </div>
   );

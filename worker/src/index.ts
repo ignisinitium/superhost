@@ -253,6 +253,16 @@ async function handleTask(task: Task) {
       case 'REFRESH_MAIL_STATS':
         await handleRefreshMailStats();
         break;
+      case 'REFRESH_MAIL_ACTIVITY':
+        await handleRefreshMailActivity();
+        break;
+      case 'APPLY_MAIL_SPAM_INFRA':
+        // Lightweight re-apply of greylisting / RBL / attachment config —
+        // reloads Postfix rather than restarting the full mail stack.
+        await applyMailSpamInfraConfig();
+        await execPromise('sudo postfix reload').catch((e) =>
+          console.warn('postfix reload after infra change failed:', (e as Error).message));
+        break;
       case 'PROVISION_MAILBOX':
         await handleProvisionMailbox(task.payload);
         break;
@@ -2388,7 +2398,7 @@ async function handleRemoveDnsZone(payload: any) {
 async function applyMailSpamInfraConfig() {
   const settingsRes = await client.query(
     `SELECT key, value FROM server_settings WHERE key IN
-     ('greylisting_enabled','rbl_enabled','mail_rbls','attachment_blocking_enabled','blocked_attachment_extensions')`
+     ('greylisting_enabled','rbl_enabled','mail_rbls','attachment_blocking_enabled','blocked_attachment_extensions','spf_enforce_enabled')`
   ).catch(() => ({ rows: [] as { key: string; value: string }[] }));
   const s: Record<string, string> = {};
   for (const row of settingsRes.rows) s[row.key] = row.value;
@@ -2400,16 +2410,66 @@ async function applyMailSpamInfraConfig() {
     await execPromise('sudo systemctl enable --now postgrey').catch(() => {});
   }
 
+  // ── SPF enforcement via policyd-spf (HARD FAIL only) ──────────────────────
+  // Rejects only when the sender domain publishes "-all" and the connecting IP
+  // is unauthorised. Missing SPF (None), SoftFail (~all), Neutral and SPF
+  // errors all pass through — those stay score-only in SpamAssassin so we never
+  // block the large population of legitimate domains without strict SPF.
+  const spfEnforce = s['spf_enforce_enabled'] === 'true';
+  if (spfEnforce) {
+    await execPromise('sudo apt-get install -y postfix-policyd-spf-python').catch(() => {});
+    const spfConf = [
+      '# Superhost-managed — hard-fail-only SPF enforcement. Do not edit by hand.',
+      'debugLevel = 1',
+      // Counterintuitive: TestOnly = 1 ENFORCES (rejects); TestOnly = 0 is
+      // test/seed mode that only adds headers and never rejects. We want enforcement.
+      'TestOnly = 1',
+      // Never reject on HELO SPF; only evaluate the envelope MAIL FROM.
+      'HELO_reject = False',
+      // Reject ONLY a hard Fail (-all). Not SoftFail/Neutral/None.
+      'Mail_From_reject = Fail',
+      // Be lenient on malformed records and transient DNS errors — accept, don't block.
+      'PermError_reject = False',
+      'TempError_Defer = False',
+      // Never SPF-check loopback / our own submissions.
+      'skip_addresses = 127.0.0.0/8,::ffff:127.0.0.0/104,::1',
+    ].join('\n');
+    const tmpSpf = '/tmp/superhost-policyd-spf.conf';
+    await fs.writeFile(tmpSpf, spfConf + '\n');
+    await execPromise('sudo mkdir -p /etc/postfix-policyd-spf-python').catch(() => {});
+    await execPromise(`sudo mv ${shellEscape(tmpSpf)} /etc/postfix-policyd-spf-python/policyd-spf.conf`).catch((e) =>
+      console.warn('Could not write policyd-spf.conf:', (e as Error).message));
+    // Register the spawn service in master.cf (idempotent) and set its time limit.
+    await execPromise(
+      `sudo postconf -M ${shellEscape('policyd-spf/unix=policyd-spf unix - n n - 0 spawn user=policyd-spf argv=/usr/bin/policyd-spf')}`
+    ).catch((e) => console.warn('Could not register policyd-spf master.cf service:', (e as Error).message));
+    await execPromise('sudo postconf -e policyd-spf_time_limit=3600').catch(() => {});
+  }
+
   // ── RBL / DNSBL rejection ─────────────────────────────────────────────────
+  // Master switch gates everything; individual zones come from the mail_rbls
+  // catalog (enabled rows). Falls back to the legacy comma-separated setting if
+  // the catalog table is unavailable, so the config never silently loses RBLs.
   const rblEnabled = s['rbl_enabled'] === 'true';
-  const rblZones = (s['mail_rbls'] ?? '')
-    .split(',').map(z => z.trim())
-    .filter(z => /^[a-zA-Z0-9.\-]+$/.test(z)); // reject anything non-hostname
+  let rblZones: string[];
+  const catalogRes = await client.query<{ zone: string }>(
+    'SELECT zone FROM mail_rbls WHERE enabled = true ORDER BY sort_order'
+  ).catch(() => null);
+  if (catalogRes) {
+    rblZones = catalogRes.rows.map(r => r.zone);
+  } else {
+    rblZones = (s['mail_rbls'] ?? '').split(',').map(z => z.trim());
+  }
+  // Defence in depth: only ever emit syntactically valid hostnames into Postfix.
+  rblZones = rblZones.filter(z => /^[a-zA-Z0-9.\-]+$/.test(z));
 
   // Build smtpd_recipient_restrictions in a fixed, safe order.
+  // permit_mynetworks + permit_sasl_authenticated come first so our own and
+  // authenticated mail bypass every reject below (including SPF).
   const restrictions = ['permit_mynetworks', 'permit_sasl_authenticated'];
   if (greylist) restrictions.push('check_policy_service inet:127.0.0.1:10023');
   if (rblEnabled) for (const z of rblZones) restrictions.push(`reject_rbl_client ${z}`);
+  if (spfEnforce) restrictions.push('check_policy_service unix:private/policyd-spf');
   restrictions.push('permit');
   await execPromise(`sudo postconf -e ${shellEscape('smtpd_recipient_restrictions = ' + restrictions.join(', '))}`);
 
@@ -2727,9 +2787,12 @@ sieve_script personal {
   path = ~/.dovecot.sieve
 }
 
-# editheader lets per-user "tag" rules prepend [SPAM] to the Subject.
-# variables is enabled by default but we list it for clarity.
-sieve_extensions = +editheader +variables
+# Pigeonhole 2.4 dropped the "+ext"/"-ext" toggle syntax: a "+editheader" token
+# is parsed as a literal (unknown) extension name and ignored, AND assigning the
+# setting at all REPLACES the default extension set — so the defaults (fileinto,
+# envelope, …) vanish and every generated script fails to compile, causing spam to
+# fall through to the inbox. List the full absolute set the scripts actually use.
+sieve_extensions = fileinto envelope vacation editheader variables
 `;
     const tempQuota = '/tmp/91-superhost-plugins.conf';
     await fs.writeFile(tempQuota, dovecotPlugins);
@@ -2783,9 +2846,15 @@ bayes_auto_learn 1
     await fs.writeFile(tempSa, saLocalCf);
     await execPromise(`sudo mv ${tempSa} /etc/spamassassin/local.cf`).catch((e) =>
       console.warn('Could not write SpamAssassin local.cf:', (e as Error).message));
-    await execPromise('sudo systemctl enable spamassassin').catch(() => {});
-    await execPromise('sudo systemctl restart spamassassin').catch(() =>
-      execPromise('sudo systemctl start spamassassin').catch(() => {}));
+    // The SpamAssassin daemon unit is `spamd` on this distro (`spamassassin` was
+    // the older Debian name). Try spamd first, fall back to the legacy name so
+    // this works across distros — without a working restart, local.cf changes
+    // (and resolver changes) never reach the running scanner.
+    await execPromise('sudo systemctl enable spamd').catch(() =>
+      execPromise('sudo systemctl enable spamassassin').catch(() => {}));
+    await execPromise('sudo systemctl restart spamd').catch(() =>
+      execPromise('sudo systemctl restart spamassassin').catch(() =>
+        execPromise('sudo systemctl start spamassassin').catch(() => {})));
     await execPromise('sudo systemctl restart spamass-milter').catch(() => {});
 
     // 7. Restart services
@@ -3498,6 +3567,196 @@ async function handleRefreshMailStats() {
   console.log(`Mail stats refreshed: ${totalReceived} received today (${today})`);
 }
 
+// ── REFRESH_MAIL_ACTIVITY ──────────────────────────────────────────────────────
+// Parse /var/log/mail.log into per-message disposition rows: delivered,
+// quarantined, blocked (rejected at SMTP time) and virus. Idempotent via a
+// natural event_key (re-parsing overlapping windows is safe), pruned to 30 days.
+//
+// Dovecot's LMTP log already tells us the final disposition directly, e.g.
+//   dovecot: lmtp(user@dom)<pid><SESSION>: sieve: msgid=<..>: stored mail into mailbox 'Quarantine'
+// so a quarantined message (a successful LMTP delivery as far as Postfix is
+// concerned) is correctly separated from one delivered to the inbox. Sender and
+// spam score aren't in that line, so we correlate them by Message-ID using the
+// Postfix cleanup/qmgr lines and the spamd result line.
+async function handleRefreshMailActivity() {
+  const LOG = '/var/log/mail.log';
+
+  // Cursor: only consider lines newer than our most recent event, minus a 5-min
+  // overlap so cross-line correlation isn't lost at the boundary. First run
+  // (empty table) parses the whole current log.
+  const curRes = await client.query<{ max: string | null }>(
+    'SELECT MAX(occurred_at) AS max FROM mail_activity'
+  );
+  const sinceMs = curRes.rows[0]?.max
+    ? new Date(curRes.rows[0].max as string).getTime() - 5 * 60 * 1000
+    : 0;
+
+  const pattern =
+    "stored mail into mailbox|postfix/cleanup\\[[0-9]+\\]: [0-9A-F]+: message-id=|" +
+    "postfix/qmgr\\[[0-9]+\\]: [0-9A-F]+: from=|NOQUEUE: reject:|spamd: result:";
+  let stdout = '';
+  try {
+    const r = await execPromise(
+      `sudo grep -aE ${shellEscape(pattern)} ${LOG} 2>/dev/null || true`,
+      { maxBuffer: 128 * 1024 * 1024 }
+    );
+    stdout = r.stdout;
+  } catch (e) {
+    console.warn('Mail activity: log read failed:', (e as Error).message);
+    return;
+  }
+  const lines = stdout.split('\n');
+
+  const tsOf = (line: string): number => {
+    const sp = line.indexOf(' ');
+    if (sp < 0) return NaN;
+    return Date.parse(line.slice(0, sp));
+  };
+
+  // Pass 1 — correlation maps (these lines precede the delivery line).
+  const queueToMsgid = new Map<string, string>();
+  const queueToFrom  = new Map<string, string>();
+  const msgidToScore = new Map<string, { score: number; isSpam: boolean }>();
+  for (const line of lines) {
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/postfix\/cleanup\[\d+\]: ([0-9A-F]+): message-id=<([^>]*)>/))) {
+      queueToMsgid.set(m[1]!, m[2]!);
+    } else if ((m = line.match(/postfix\/qmgr\[\d+\]: ([0-9A-F]+): from=<([^>]*)>/))) {
+      queueToFrom.set(m[1]!, m[2]!);
+    } else if ((m = line.match(/spamd: result: (\S+)\s+(-?\d+(?:\.\d+)?) .*?mid=<([^>]*)>/))) {
+      msgidToScore.set(m[3]!, { score: parseFloat(m[2]!), isSpam: m[1] === 'Y' });
+    }
+  }
+  const msgidToFrom = new Map<string, string>();
+  for (const [queue, msgid] of queueToMsgid) {
+    const from = queueToFrom.get(queue);
+    if (from) msgidToFrom.set(msgid, from);
+  }
+
+  // Pass 2 — emit events.
+  type Ev = {
+    key: string; at: Date; disposition: string;
+    sender: string | null; recipient: string | null; messageId: string | null;
+    score: number | null; reason: string | null;
+  };
+  const events: Ev[] = [];
+  for (const line of lines) {
+    const ms = tsOf(line);
+    if (Number.isNaN(ms) || ms < sinceMs) continue;
+    const at = new Date(ms);
+    const isoTs = line.slice(0, line.indexOf(' '));
+    let m: RegExpMatchArray | null;
+
+    if ((m = line.match(/dovecot: lmtp\(([^)]+)\)<\d+><([^>]+)>:.*stored mail into mailbox '([^']+)'/))) {
+      const recipient = m[1]!, session = m[2]!, mailbox = m[3]!;
+      const midM = line.match(/msgid=<([^>]*)>/);
+      const messageId = midM ? midM[1]! : null;
+      const sc = messageId ? msgidToScore.get(messageId) : undefined;
+      events.push({
+        key: `lmtp:${session}:${recipient}:${mailbox}`,
+        at,
+        disposition: mailbox === 'Quarantine' ? 'quarantined' : 'delivered',
+        sender: messageId ? (msgidToFrom.get(messageId) ?? null) : null,
+        recipient,
+        messageId,
+        score: sc ? sc.score : null,
+        reason: mailbox !== 'INBOX' && mailbox !== 'Quarantine' ? `filed into ${mailbox}` : null,
+      });
+    } else if ((m = line.match(/NOQUEUE: reject: \w+ from \S+: (\d{3} .*?)(?:; from=<([^>]*)> to=<([^>]*)>|$)/))) {
+      const recipient = (m[3] ?? null);
+      events.push({
+        key: `reject:${isoTs}:${recipient ?? ''}`,
+        at,
+        disposition: 'blocked',
+        sender: m[2] ?? null,
+        recipient,
+        messageId: null,
+        score: null,
+        reason: m[1]!.trim(),
+      });
+    }
+  }
+
+  // Resolve recipient → mailbox / domain.
+  const recips = [...new Set(events.map(e => e.recipient).filter(Boolean) as string[])];
+  const userMap = new Map<string, { id: number; domain_id: number }>();
+  const domMap  = new Map<string, number>();
+  if (recips.length) {
+    const lower = recips.map(r => r.toLowerCase());
+    const ur = await client.query<{ id: number; email: string; domain_id: number }>(
+      'SELECT id, lower(email) AS email, domain_id FROM mail_users WHERE lower(email) = ANY($1)',
+      [lower]
+    );
+    for (const row of ur.rows) userMap.set(row.email, { id: row.id, domain_id: row.domain_id });
+    const domains = [...new Set(lower.map(r => r.split('@')[1]).filter(Boolean) as string[])];
+    if (domains.length) {
+      const dr = await client.query<{ id: number; d: string }>(
+        'SELECT id, lower(domain_name) AS d FROM mail_domains WHERE lower(domain_name) = ANY($1)',
+        [domains]
+      );
+      for (const row of dr.rows) domMap.set(row.d, row.id);
+    }
+  }
+
+  // Build insertable rows. Blocked events to domains we don't host are the
+  // internet's background relay-attempt noise — drop them; keep only mail
+  // aimed at a hosted domain so the log stays customer-relevant.
+  const rows: any[][] = [];
+  for (const e of events) {
+    const rl = e.recipient ? e.recipient.toLowerCase() : null;
+    const u = rl ? userMap.get(rl) : undefined;
+    const domainId = u?.domain_id ?? (rl ? domMap.get(rl.split('@')[1] ?? '') : undefined) ?? null;
+    if (e.disposition === 'blocked' && domainId == null) continue;
+    rows.push([
+      e.key, e.at.toISOString(), e.disposition, e.sender, e.recipient, null,
+      e.messageId, e.score, null, e.reason, u?.id ?? null, domainId,
+    ]);
+  }
+
+  // Virus events come straight from the quarantine table (reliable: clamav
+  // populates virus_name there), surfaced as their own disposition.
+  const virusRes = await client.query<{
+    id: number; sender: string | null; subject: string | null; virus_name: string;
+    spam_score: number | null; mail_user_id: number; domain_id: number;
+    recipient: string; occurred: string;
+  }>(`
+    SELECT mq.id, mq.sender, mq.subject, mq.virus_name, mq.spam_score, mq.mail_user_id,
+           mu.email AS recipient, mu.domain_id,
+           COALESCE(mq.message_date, mq.created_at) AS occurred
+    FROM mail_quarantine mq JOIN mail_users mu ON mq.mail_user_id = mu.id
+    WHERE mq.virus_name IS NOT NULL
+  `);
+  for (const v of virusRes.rows) {
+    rows.push([
+      `quar-virus:${v.id}`, new Date(v.occurred).toISOString(), 'virus',
+      v.sender, v.recipient, v.subject, null, v.spam_score, v.virus_name, null,
+      v.mail_user_id, v.domain_id,
+    ]);
+  }
+
+  // Batched idempotent insert.
+  let inserted = 0;
+  const COLS = 12;
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    const values = chunk
+      .map((_, r) => `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(',')})`)
+      .join(',');
+    const res = await client.query(
+      `INSERT INTO mail_activity
+         (event_key, occurred_at, disposition, sender, recipient, subject,
+          message_id, spam_score, virus_name, reason, mail_user_id, domain_id)
+       VALUES ${values}
+       ON CONFLICT (event_key) DO NOTHING`,
+      chunk.flat()
+    );
+    inserted += res.rowCount ?? 0;
+  }
+
+  await client.query("DELETE FROM mail_activity WHERE occurred_at < NOW() - INTERVAL '30 days'");
+  console.log(`Mail activity refreshed: ${inserted} new event(s) from ${rows.length} parsed.`);
+}
+
 async function handleScanMalware(payload: any, taskId: number) {
   const { username, userId } = payload;
   if (!username || !userId) throw new Error('Username and userId are required');
@@ -4089,6 +4348,14 @@ async function start() {
     catch (err) { console.error('Refresh mail stats error:', err instanceof Error ? err.message : err); }
   }, 60 * 60 * 1000);
   handleRefreshMailStats().catch(err => console.error('Initial mail stats error:', err));
+
+  // Parse the mail log into the per-message activity feed every 5 minutes
+  // (delivered / quarantined / blocked / virus), plus once shortly after start.
+  setInterval(async () => {
+    try { await handleRefreshMailActivity(); }
+    catch (err) { console.error('Refresh mail activity error:', err instanceof Error ? err.message : err); }
+  }, 5 * 60 * 1000);
+  handleRefreshMailActivity().catch(err => console.error('Initial mail activity error:', err));
 
   // Enforce quarantine retention (30-day expiry, 7-day post-release) daily,
   // plus once shortly after startup. Without this, quarantine grows forever.

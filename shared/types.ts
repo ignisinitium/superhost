@@ -134,6 +134,40 @@ export interface MailQuarantine {
   expires_at: string;
 }
 
+// One row of the per-message mail activity log (parsed from /var/log/mail.log
+// by the worker). disposition ∈ delivered | quarantined | blocked | virus | spam.
+export interface MailActivity {
+  id: number;
+  occurred_at: string;
+  disposition: 'delivered' | 'quarantined' | 'blocked' | 'virus' | 'spam' | 'deferred';
+  sender: string | null;
+  recipient: string | null;
+  subject: string | null;
+  spam_score: number | null;
+  virus_name: string | null;
+  reason: string | null;
+  mail_user_id: number | null;
+  domain_name: string | null;
+  owner?: string | null;
+}
+
+export interface MailActivityResponse {
+  items: MailActivity[];
+  total: number;
+  summary: { disposition: string; day: number; week: number }[];
+}
+
+// One DNS blocklist (RBL) in the admin-managed catalog. Each can be toggled
+// independently; the master `rbl_enabled` setting gates all of them.
+export interface MailRbl {
+  id: number;
+  zone: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  is_custom: boolean;
+}
+
 // Parsed contents + raw source of a quarantined message, returned by the
 // worker for the dashboard preview (GET .../quarantine/:id/message).
 export interface QuarantineMessage {

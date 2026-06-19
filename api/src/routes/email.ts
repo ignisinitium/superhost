@@ -391,6 +391,67 @@ router.post('/:mailUserId/autoresponder', async (req: AuthRequest, res) => {
   }
 });
 
+// --- Mail activity log (delivered / quarantined / blocked / virus) ---
+// Scoped to the caller's domains; a mail_user login sees only its own mailbox.
+router.get('/activity', async (req: AuthRequest, res) => {
+  const { search, disposition, dateFrom, dateTo, mailUserId, limit = '100', offset = '0' } = req.query;
+  try {
+    // Activity rows are linked to a mailbox/domain. Restrict to domains owned by
+    // this client (md.user_id). A mail_user login is hard-locked to its own
+    // mailbox; a full client may optionally narrow to one mailbox via ?mailUserId.
+    // The md.user_id join means an unowned mailUserId simply returns nothing.
+    const scopeMailUser = req.mailUserId ?? (mailUserId ? parseInt(mailUserId as string, 10) : null);
+    const params: unknown[] = [req.userId, scopeMailUser];
+    const wheres: string[] = [
+      'md.user_id = $1',
+      '($2::int IS NULL OR ma.mail_user_id = $2)',
+    ];
+    let p = 3;
+
+    if (disposition && typeof disposition === 'string' && disposition !== 'all') {
+      wheres.push(`ma.disposition = $${p++}`);
+      params.push(disposition);
+    }
+    if (search && typeof search === 'string' && search.trim()) {
+      wheres.push(`(ma.sender ILIKE $${p} OR ma.recipient ILIKE $${p} OR ma.subject ILIKE $${p})`);
+      params.push(`%${search.trim()}%`);
+      p++;
+    }
+    if (dateFrom && typeof dateFrom === 'string') { wheres.push(`ma.occurred_at >= $${p++}`); params.push(dateFrom); }
+    if (dateTo && typeof dateTo === 'string')   { wheres.push(`ma.occurred_at <= $${p++}`); params.push(dateTo); }
+
+    const where = `WHERE ${wheres.join(' AND ')}`;
+    const [rows, countRow, counts] = await Promise.all([
+      query(`
+        SELECT ma.id, ma.occurred_at, ma.disposition, ma.sender, ma.recipient, ma.subject,
+               ma.spam_score, ma.virus_name, ma.reason, ma.mail_user_id, md.domain_name
+        FROM mail_activity ma
+        JOIN mail_domains md ON ma.domain_id = md.id
+        ${where}
+        ORDER BY ma.occurred_at DESC
+        LIMIT $${p} OFFSET $${p + 1}
+      `, [...params, limit, offset]),
+      query(`
+        SELECT COUNT(*)::int AS total
+        FROM mail_activity ma JOIN mail_domains md ON ma.domain_id = md.id
+        ${where}
+      `, params),
+      query(`
+        SELECT ma.disposition,
+               COUNT(*) FILTER (WHERE ma.occurred_at >= NOW() - INTERVAL '24 hours')::int AS day,
+               COUNT(*) FILTER (WHERE ma.occurred_at >= NOW() - INTERVAL '7 days')::int  AS week
+        FROM mail_activity ma JOIN mail_domains md ON ma.domain_id = md.id
+        WHERE md.user_id = $1 AND ($2::int IS NULL OR ma.mail_user_id = $2)
+        GROUP BY ma.disposition
+      `, [req.userId, scopeMailUser]),
+    ]);
+
+    res.json({ items: rows.rows, total: countRow.rows[0].total, summary: counts.rows });
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // --- Spam Quarantine & Access Control ---
 
 // Get quarantined emails for a user (supports ?search=)
