@@ -2952,8 +2952,16 @@ protocol lmtp {
       await execPromise(`sudo useradd -g vmail -u 5000 vmail -d /var/mail`);
     });
     await execPromise('sudo mkdir -p /var/mail/vhosts');
-    await execPromise('sudo chown -R vmail:vmail /var/mail');
-    await execPromise('sudo chmod -R 770 /var/mail');
+    // Own ONLY the virtual-mailbox tree as vmail. Chowning all of /var/mail
+    // (the system mail spool) recursively clobbers local system mboxes like
+    // /var/mail/www-data, so Postfix refuses local delivery to them
+    // ("destination not owned by recipient") and those bounces pile up deferred.
+    await execPromise('sudo chown -R vmail:vmail /var/mail/vhosts');
+    await execPromise('sudo chmod -R 770 /var/mail/vhosts');
+    // Keep the spool directory itself at the Debian default so system-user
+    // local delivery (cron/daemon mail) keeps working.
+    await execPromise('sudo chown root:mail /var/mail').catch(() => {});
+    await execPromise('sudo chmod 2775 /var/mail').catch(() => {});
 
     // 6. SpamAssassin — managed local.cf. Crucially, add X-Spam-Level to ALL
     // mail (not just mail above the global score) so per-mailbox sieve
