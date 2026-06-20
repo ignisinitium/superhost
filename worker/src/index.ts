@@ -263,6 +263,9 @@ async function handleTask(task: Task) {
         await execPromise('sudo postfix reload').catch((e) =>
           console.warn('postfix reload after infra change failed:', (e as Error).message));
         break;
+      case 'BAYES_TRAIN':
+        await handleTrainBayes();
+        break;
       case 'PROVISION_MAILBOX':
         await handleProvisionMailbox(task.payload);
         break;
@@ -2473,6 +2476,17 @@ async function applyMailSpamInfraConfig() {
   restrictions.push('permit');
   await execPromise(`sudo postconf -e ${shellEscape('smtpd_recipient_restrictions = ' + restrictions.join(', '))}`);
 
+  // Clearer reject_rbl_client text — Postfix's default leads with the misleading
+  // "Service unavailable". $rbl_domain names the matched blocklist, so a Spamhaus
+  // hit reads "...listed on the zen.spamhaus.org DNS blocklist...". (Single-quoted
+  // string so the $macros reach Postfix literally; postscreen's own DNSBL wording
+  // is fixed by Postfix and can't be customised here.)
+  const rblReply =
+    '$rbl_code Rejected: the sending IP [$rbl_what] is listed on the $rbl_domain ' +
+    'DNS blocklist and is not permitted to deliver mail to this server' +
+    '${rbl_reason?; $rbl_reason}';
+  await execPromise(`sudo postconf -e ${shellEscape('default_rbl_reply=' + rblReply)}`).catch(() => {});
+
   // ── Attachment / dangerous-extension blocking ─────────────────────────────
   const attachEnabled = s['attachment_blocking_enabled'] === 'true';
   if (attachEnabled) {
@@ -2572,6 +2586,35 @@ async function configureSpamNetworkChecks() {
     await execPromise(`sudo -u debian-spamd env HOME=${helperHome} pyzor ping`).catch(() => {});
   }
   await execPromise(`sudo chmod -R a+rX ${helperHome}/.razor ${helperHome}/.pyzor`).catch(() => {});
+}
+
+// ── BAYES_TRAIN ─────────────────────────────────────────────────────────────
+// Train SpamAssassin's Bayes classifier from high-confidence corpora: spam from
+// every mailbox's Quarantine folder, ham from Sent folders (user-authored, so
+// never contaminated by undetected inbound spam — training inboxes as ham would
+// teach Bayes that delivered spam is legitimate). Runs as root to read the
+// vmail-owned maildirs and writes the DB spamd actually uses — spamass-milter
+// scans with `spamc -u spamass-milter`, so the live Bayes lives in that user's
+// home (/var/lib/spamass-milter/.spamassassin) — then hands ownership back so
+// the scanner can keep using it. Ham also accrues from quarantine releases (see
+// handleReleaseQuarantine) and SpamAssassin's own bayes_auto_learn. Idempotent:
+// sa-learn skips messages already learned.
+async function handleTrainBayes() {
+  const HOME = '/var/lib/spamass-milter';
+  // Glob expansion must happen as root — /var/mail/vhosts is vmail-owned 0770.
+  await execPromise(
+    `sudo bash -c '` +
+    `for d in /var/mail/vhosts/*/*/.Quarantine; do [ -d "$d" ] && HOME=${HOME} sa-learn --spam --no-sync "$d" >/dev/null 2>&1; done; ` +
+    `for d in /var/mail/vhosts/*/*/.Sent; do [ -d "$d" ] && HOME=${HOME} sa-learn --ham --no-sync "$d" >/dev/null 2>&1; done; ` +
+    `HOME=${HOME} sa-learn --sync >/dev/null 2>&1; ` +
+    `chown -R spamass-milter:spamass-milter ${HOME}/.spamassassin 2>/dev/null'`
+  ).catch((e) => console.warn('Bayes training error:', (e as Error).message));
+
+  const { stdout } = await execPromise(`sudo env HOME=${HOME} sa-learn --dump magic`)
+    .catch(() => ({ stdout: '' } as { stdout: string }));
+  const spam = stdout.match(/(\d+)\s+\d+\s+non-token data: nspam/)?.[1] ?? '?';
+  const ham  = stdout.match(/(\d+)\s+\d+\s+non-token data: nham/)?.[1] ?? '?';
+  console.log(`Bayes trained: ${spam} spam / ${ham} ham messages in DB.`);
 }
 
 // Configure Postfix to relay inbound mail for customer "spam filter" domains to
@@ -3379,6 +3422,13 @@ async function handleReleaseQuarantine(payload: any) {
       console.warn(`Release ${id}: source file not found (already moved/delivered?) — marked released.`);
       return;
     }
+
+    // A released message is a confirmed false positive → train Bayes on it as
+    // ham (run as root to read the vmail file; write the spamass-milter DB that
+    // spamd uses, then hand ownership back). Best-effort; never block the release.
+    await execPromise(`sudo env HOME=/var/lib/spamass-milter sa-learn --ham ${shellEscape(srcPath)}`)
+      .then(() => execPromise('sudo chown -R spamass-milter:spamass-milter /var/lib/spamass-milter/.spamassassin'))
+      .catch((e) => console.warn(`Bayes ham-learn on release ${id} skipped:`, (e as Error).message));
 
     // Drop the Maildir size hints (S=/W=) from the name — header stripping changes
     // the byte count, so let Dovecot recompute rather than trust a stale value.
@@ -4450,6 +4500,14 @@ async function start() {
     catch (err) { console.error('Quarantine purge error:', err instanceof Error ? err.message : err); }
   }, 24 * 60 * 60 * 1000);
   handlePurgeExpiredQuarantine().catch(err => console.error('Initial quarantine purge error:', err));
+
+  // Retrain Bayes daily (spam from Quarantine, ham from Sent) so the classifier
+  // keeps learning from accumulated mail, plus once shortly after startup.
+  setInterval(async () => {
+    try { await handleTrainBayes(); }
+    catch (err) { console.error('Bayes training error:', err instanceof Error ? err.message : err); }
+  }, 24 * 60 * 60 * 1000);
+  handleTrainBayes().catch(err => console.error('Initial Bayes training error:', err));
 
   // Purge expired token-blocklist + FIDO2 challenge rows daily so they don't
   // accumulate (the blocklist only needs entries until the token's own expiry).
