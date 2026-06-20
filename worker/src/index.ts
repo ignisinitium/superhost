@@ -422,6 +422,10 @@ async function handleCreateUser(payload: any) {
     await execPromise(`sudo chown -R ${shellEscape(username)}:${shellEscape(username)} ${shellEscape(homeDir)}`);
     // 711: owner has full access; others can traverse (needed for nginx to serve files)
     await execPromise(`sudo chmod 711 ${shellEscape(homeDir)}`);
+    // Grant jonathan access now, and a default ACL so every file created inside inherits it.
+    // Without this, chmod 711 leaves jonathan with only --x (traverse) and new files are inaccessible.
+    await execPromise(`sudo setfacl -m user:jonathan:rwx,default:user:jonathan:rwx ${shellEscape(homeDir)}`);
+    await execPromise(`sudo setfacl -m user:jonathan:rwx,default:user:jonathan:rwx ${shellEscape(publicHtml)}`);
 
     // Detect installed PHP versions instead of hardcoding
     let phpVersion = '8.3';
