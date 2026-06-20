@@ -190,6 +190,15 @@ async function handleTask(task: Task) {
       case 'PROVISION_SSL':
         await handleProvisionSsl(task.payload);
         break;
+      case 'REFRESH_SSL_CERTS':
+        await handleRefreshSslCerts(task.payload);
+        break;
+      case 'REISSUE_SSL':
+        await handleReissueSsl(task.payload);
+        break;
+      case 'RENEW_ALL_SSL':
+        await handleRenewAllSsl();
+        break;
       case 'INSTALL_WORDPRESS':
         await handleInstallWordPress(task.payload);
         break;
@@ -1383,6 +1392,7 @@ async function handleInstallSsl(payload: any) {
   );
 
   await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
+  await upsertCertRecord(domainName).catch(e => console.error('post-install cert refresh:', e instanceof Error ? e.message : e));
   console.log(`SSL installed for ${domainName}`);
 }
 
@@ -1397,7 +1407,138 @@ async function handleProvisionSsl(payload: any) {
     `sudo certbot --nginx ${await certbotDomainArgs(domainName)} --expand --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`
   );
   await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
+  await upsertCertRecord(domainName).catch(e => console.error('post-provision cert refresh:', e instanceof Error ? e.message : e));
   console.log(`SSL provisioned (retry) for ${domainName}`);
+}
+
+// ── SSL certificate inventory & lifecycle ───────────────────────────────────
+// Inspect a certbot lineage's cert.pem with openssl. Returns null if the cert
+// dir/file is absent. The worker runs as root, so it can read /etc/letsencrypt.
+async function inspectCert(certName: string): Promise<{
+  domains: string[];
+  issuer: string | null;
+  notBefore: string | null;
+  notAfter: string | null;
+  serial: string | null;
+} | null> {
+  const certPath = `/etc/letsencrypt/live/${certName}/cert.pem`;
+  if (!(await fileExists(certPath))) return null;
+
+  const { stdout } = await execPromise(
+    `openssl x509 -in ${shellEscape(certPath)} -noout -startdate -enddate -issuer -serial -ext subjectAltName`
+  );
+
+  const grab = (re: RegExp): string | null => {
+    const m = re.exec(stdout);
+    return m && m[1] !== undefined ? m[1].trim() : null;
+  };
+  const notBeforeRaw = grab(/notBefore=(.+)/);
+  const notAfterRaw = grab(/notAfter=(.+)/);
+  const issuerLine = grab(/issuer=(.+)/);
+  const serial = grab(/serial=(.+)/);
+
+  const sanLine = /DNS:.*/.exec(stdout)?.[0] ?? '';
+  const domains = sanLine
+    .split(',')
+    .map(s => s.replace(/.*DNS:/, '').trim())
+    .filter(Boolean);
+
+  const issuerCn = issuerLine ? (/CN ?= ?([^,/]+)/.exec(issuerLine)?.[1]?.trim() ?? issuerLine) : null;
+  const toIso = (d: string | null): string | null => {
+    if (!d) return null;
+    const t = new Date(d);
+    return isNaN(t.getTime()) ? null : t.toISOString();
+  };
+
+  return { domains, issuer: issuerCn, notBefore: toIso(notBeforeRaw), notAfter: toIso(notAfterRaw), serial };
+}
+
+// Read one lineage from disk and upsert its row, then reconcile the domains table
+// (is_ssl / ssl_expires_at) for every name the cert covers.
+async function upsertCertRecord(certName: string): Promise<void> {
+  const info = await inspectCert(certName);
+  if (!info) return;
+
+  let userId: number | null = null;
+  if (info.domains.length) {
+    const r = await client.query(
+      `SELECT user_id FROM domains WHERE domain_name = ANY($1::text[]) AND user_id IS NOT NULL LIMIT 1`,
+      [info.domains]
+    );
+    userId = r.rows[0]?.user_id ?? null;
+  }
+
+  await client.query(
+    `INSERT INTO ssl_certificates (cert_name, domains, issuer, not_before, not_after, serial, user_id, last_checked_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (cert_name) DO UPDATE SET
+       domains = EXCLUDED.domains, issuer = EXCLUDED.issuer, not_before = EXCLUDED.not_before,
+       not_after = EXCLUDED.not_after, serial = EXCLUDED.serial, user_id = EXCLUDED.user_id,
+       last_checked_at = NOW()`,
+    [certName, info.domains, info.issuer, info.notBefore, info.notAfter, info.serial, userId]
+  );
+
+  if (info.notAfter && info.domains.length) {
+    await client.query(
+      `UPDATE domains SET is_ssl = TRUE, ssl_expires_at = $2 WHERE domain_name = ANY($1::text[])`,
+      [info.domains, info.notAfter]
+    );
+  }
+}
+
+// Rescan all certbot lineages and sync the ssl_certificates table to disk truth.
+// payload.certName limits the refresh to a single lineage (used after issue/reissue).
+async function handleRefreshSslCerts(payload: any): Promise<void> {
+  if (payload?.certName) {
+    await upsertCertRecord(validateDomainName(payload.certName));
+    return;
+  }
+
+  let names: string[] = [];
+  try {
+    const { stdout } = await execPromise('ls -1 /etc/letsencrypt/live 2>/dev/null');
+    names = stdout.split('\n').map(s => s.trim()).filter(n => n && n !== 'README');
+  } catch {
+    names = [];
+  }
+
+  for (const name of names) {
+    try {
+      await upsertCertRecord(name);
+    } catch (e) {
+      console.error(`SSL refresh failed for ${name}:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  // Prune rows whose lineage no longer exists on disk.
+  if (names.length) {
+    await client.query(`DELETE FROM ssl_certificates WHERE cert_name <> ALL($1::text[])`, [names]);
+  } else {
+    await client.query('DELETE FROM ssl_certificates');
+  }
+  console.log(`SSL refresh complete: ${names.length} certificate(s).`);
+}
+
+// Force-reissue a certificate even when it isn't near expiry (--force-renewal).
+async function handleReissueSsl(payload: any): Promise<void> {
+  const domainName = validateDomainName(payload?.domainName);
+  const certbotEmail = process.env.CERTBOT_EMAIL;
+  if (!certbotEmail) throw new Error('CERTBOT_EMAIL environment variable is not set');
+
+  await execPromise(
+    `sudo certbot --nginx ${await certbotDomainArgs(domainName)} --expand --force-renewal --non-interactive --agree-tos --email ${shellEscape(certbotEmail)}`
+  );
+  await client.query('UPDATE domains SET is_ssl = TRUE WHERE domain_name = $1', [domainName]);
+  await upsertCertRecord(domainName).catch(e => console.error('post-reissue cert refresh:', e instanceof Error ? e.message : e));
+  console.log(`SSL reissued (forced) for ${domainName}`);
+}
+
+// Renew everything that's within certbot's renewal window, reload nginx, resync.
+async function handleRenewAllSsl(): Promise<void> {
+  await execPromise('sudo certbot renew --non-interactive');
+  await execPromise('sudo nginx -t && sudo systemctl reload nginx').catch(() => {});
+  await handleRefreshSslCerts({});
+  console.log('SSL renew-all complete.');
 }
 
 async function handleRestartService(payload: any) {
@@ -4541,6 +4682,23 @@ async function start() {
       await client.query('DELETE FROM token_blocklist WHERE expires_at < NOW()');
       await client.query('DELETE FROM fido2_challenges WHERE expires_at < NOW()').catch(() => {});
     } catch (err) { console.error('Token blocklist cleanup error:', err instanceof Error ? err.message : err); }
+  }, 24 * 60 * 60 * 1000);
+
+  // Refresh the SSL certificate inventory (expiry/SANs read from disk) hourly,
+  // plus shortly after startup so the table is populated even on a fresh boot.
+  setInterval(async () => {
+    try { await handleRefreshSslCerts({}); }
+    catch (err) { console.error('SSL refresh error:', err instanceof Error ? err.message : err); }
+  }, 60 * 60 * 1000);
+  setTimeout(() => {
+    handleRefreshSslCerts({}).catch(err => console.error('Initial SSL refresh error:', err instanceof Error ? err.message : err));
+  }, 30 * 1000);
+
+  // Run certbot renew daily so certs within the renewal window auto-renew, then
+  // reload nginx and resync the inventory.
+  setInterval(async () => {
+    try { await handleRenewAllSsl(); }
+    catch (err) { console.error('SSL renew-all error:', err instanceof Error ? err.message : err); }
   }, 24 * 60 * 60 * 1000);
 
   // Daily spam digest. Checked hourly but guarded by a stored date so it fires

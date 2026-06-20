@@ -4,10 +4,13 @@ import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import {
   Globe, Plus, Trash2, Edit2, User, Shield,
-  ChevronRight, Server, Search, Copy, CheckCheck
+  ChevronRight, Server, Search, Copy, CheckCheck,
+  Layers, AlertCircle, CheckCircle2, Loader2, XCircle, History, ChevronDown
 } from 'lucide-react';
 import toast from 'react-hot-toast';
-import type { DnsZone, DnsRecord } from '../../../shared/types';
+import type { DnsZone, DnsRecord, DnsSyncTask } from '../../../shared/types';
+import { validateRecord, hasErrors, type DnsFieldErrors } from '../lib/dnsValidation';
+import { DNS_TEMPLATES, type DnsTemplate, type TemplateRecord } from '../lib/dnsTemplates';
 
 // ── Record type metadata (same as client page) ────────────────────────────────
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA'] as const;
@@ -37,6 +40,25 @@ function CopyButton({ value }: { value: string }) {
   );
 }
 
+function timeAgo(iso: string): string {
+  const then = new Date(iso).getTime();
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 5) return 'just now';
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+const SYNC_META: Record<string, { label: string; cls: string; icon: React.ReactNode }> = {
+  completed:  { label: 'Synced',     cls: 'bg-emerald-50 text-emerald-700 border-emerald-200', icon: <CheckCircle2 size={12} /> },
+  failed:     { label: 'Sync failed', cls: 'bg-red-50 text-red-700 border-red-200',            icon: <XCircle size={12} /> },
+  processing: { label: 'Syncing…',   cls: 'bg-amber-50 text-amber-700 border-amber-200',       icon: <Loader2 size={12} className="animate-spin" /> },
+  pending:    { label: 'Queued…',    cls: 'bg-amber-50 text-amber-700 border-amber-200',       icon: <Loader2 size={12} className="animate-spin" /> },
+};
+
 // ── Component ─────────────────────────────────────────────────────────────────
 const AdminDnsManager: React.FC = () => {
   const queryClient = useQueryClient();
@@ -60,6 +82,15 @@ const AdminDnsManager: React.FC = () => {
   const [rContent, setRContent] = useState('');
   const [rPriority, setRPriority] = useState('10');
   const [rTtl, setRTtl]         = useState('3600');
+  const [showErrors, setShowErrors] = useState(false);
+
+  // Template modal
+  const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
+  const [activeTemplate, setActiveTemplate] = useState<DnsTemplate | null>(null);
+  const [templateVals, setTemplateVals] = useState<Record<string, string>>({});
+
+  // Sync history panel
+  const [showHistory, setShowHistory] = useState(false);
 
   // ── Data ──────────────────────────────────────────────────────────────────
   const { data: zones = [], isLoading: isLoadingZones } = useQuery<(DnsZone & { username?: string })[]>({
@@ -80,6 +111,26 @@ const AdminDnsManager: React.FC = () => {
     },
     enabled: !!selectedZone,
   });
+
+  // Sync status / history — polls while a sync is still pending or processing.
+  const { data: syncTasks = [] } = useQuery<DnsSyncTask[]>({
+    queryKey: ['adminDnsSync', selectedZone?.id],
+    queryFn: async () => {
+      if (!selectedZone) return [];
+      return (await api.get(`/admin/dns/zones/${selectedZone.id}/sync-status`)).data;
+    },
+    enabled: !!selectedZone,
+    refetchInterval: (q) => {
+      const latest = (q.state.data as DnsSyncTask[] | undefined)?.[0];
+      return latest && (latest.status === 'pending' || latest.status === 'processing') ? 2000 : false;
+    },
+  });
+  const latestSync = syncTasks[0] ?? null;
+
+  const refreshAfterSync = () => {
+    queryClient.invalidateQueries({ queryKey: ['adminDnsRecords', selectedZone?.id] });
+    queryClient.invalidateQueries({ queryKey: ['adminDnsSync', selectedZone?.id] });
+  };
 
   // ── Mutations ─────────────────────────────────────────────────────────────
   const addZoneMutation = useMutation({
@@ -124,7 +175,7 @@ const AdminDnsManager: React.FC = () => {
     onSuccess: () => {
       toast.success(editingRecord ? 'Record updated — syncing…' : 'Record added — syncing…');
       closeRecordModal();
-      queryClient.invalidateQueries({ queryKey: ['adminDnsRecords', selectedZone?.id] });
+      refreshAfterSync();
     },
     onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to save record'),
   });
@@ -133,10 +184,21 @@ const AdminDnsManager: React.FC = () => {
     mutationFn: async (id: number) =>
       (await api.delete(`/admin/dns/zones/${selectedZone?.id}/records/${id}`)).data,
     onSuccess: () => {
-      toast.success('Record deleted');
-      queryClient.invalidateQueries({ queryKey: ['adminDnsRecords', selectedZone?.id] });
+      toast.success('Record deleted — syncing…');
+      refreshAfterSync();
     },
     onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to delete record'),
+  });
+
+  const applyTemplateMutation = useMutation({
+    mutationFn: async (records: TemplateRecord[]) =>
+      (await api.post(`/admin/dns/zones/${selectedZone?.id}/records/bulk`, { records })).data,
+    onSuccess: (rows: DnsRecord[]) => {
+      toast.success(`Added ${rows.length} record${rows.length !== 1 ? 's' : ''} — syncing…`);
+      closeTemplateModal();
+      refreshAfterSync();
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to apply template'),
   });
 
   // Auto-select the first zone when arriving via ?user= deep link
@@ -154,16 +216,53 @@ const AdminDnsManager: React.FC = () => {
   const closeRecordModal = () => {
     setIsRecordModalOpen(false);
     setEditingRecord(null);
+    setShowErrors(false);
     setRName('@'); setRType('A'); setRContent(''); setRPriority('10'); setRTtl('3600');
   };
 
   const openEditRecord = (r: DnsRecord) => {
     setEditingRecord(r);
+    setShowErrors(false);
     setRName(r.name); setRType((r.type as RecordType) || 'A');
     setRContent(r.content); setRPriority(r.priority?.toString() ?? '10');
     setRTtl(r.ttl?.toString() ?? '3600');
     setIsRecordModalOpen(true);
   };
+
+  const closeTemplateModal = () => {
+    setIsTemplateModalOpen(false);
+    setActiveTemplate(null);
+    setTemplateVals({});
+  };
+
+  const openTemplate = (t: DnsTemplate) => {
+    setActiveTemplate(t);
+    const defaults: Record<string, string> = {};
+    t.fields.forEach((f) => { defaults[f.key] = f.default ?? ''; });
+    setTemplateVals(defaults);
+  };
+
+  const submitRecord = () => {
+    const errs = validateRecord({ name: rName, type: rType, content: rContent, priority: needsPriority ? rPriority : null });
+    if (hasErrors(errs)) { setShowErrors(true); return; }
+    saveRecordMutation.mutate();
+  };
+
+  // Live validation for the record modal.
+  const recordErrors: DnsFieldErrors = validateRecord({
+    name: rName, type: rType, content: rContent,
+    priority: (rType === 'MX' || rType === 'SRV') ? rPriority : null,
+  });
+
+  // Preview of records the active template would create (each validated).
+  const templatePreview: (TemplateRecord & { error?: string })[] = activeTemplate && selectedZone
+    ? activeTemplate.build(templateVals, { domain: selectedZone.domain_name }).map((r) => {
+        const e = validateRecord({ name: r.name, type: r.type, content: r.content, priority: r.priority });
+        const msg = e.name || e.content || e.priority;
+        return msg ? { ...r, error: msg } : { ...r };
+      })
+    : [];
+  const templateHasErrors = templatePreview.some((r) => r.error) || templatePreview.length === 0;
 
   const filtered = zones.filter(z =>
     z.domain_name.toLowerCase().includes(zoneSearch.toLowerCase()) ||
@@ -281,9 +380,33 @@ const AdminDnsManager: React.FC = () => {
                     <span className="text-[11px] text-slate-400">TTL: <strong>{selectedZone.ttl}s</strong></span>
                     <span className="text-slate-200">|</span>
                     <span className="text-[11px] text-slate-400"><strong>{records.length}</strong> record{records.length !== 1 ? 's' : ''}</span>
+                    {latestSync && (() => {
+                      const meta = SYNC_META[latestSync.status] ?? SYNC_META.pending!;
+                      return (
+                        <>
+                          <span className="text-slate-200">|</span>
+                          <button
+                            onClick={() => setShowHistory((s) => !s)}
+                            className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[10px] font-bold ${meta.cls}`}
+                            title="View sync history"
+                          >
+                            {meta.icon}
+                            {meta.label}
+                            <span className="font-normal opacity-70">· {timeAgo(latestSync.updated_at)}</span>
+                          </button>
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setIsTemplateModalOpen(true)}
+                    className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 transition-all"
+                  >
+                    <Layers size={14} className="text-indigo-500" />
+                    Templates
+                  </button>
                   <button
                     onClick={() => { closeRecordModal(); setIsRecordModalOpen(true); }}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 transition-all shadow-sm"
@@ -305,6 +428,55 @@ const AdminDnsManager: React.FC = () => {
                   </button>
                 </div>
               </div>
+
+              {/* Persistent error banner when the most recent sync failed */}
+              {latestSync?.status === 'failed' && (
+                <div className="bg-red-50 border border-red-200 rounded-2xl px-5 py-3 flex items-start gap-3">
+                  <XCircle size={16} className="text-red-500 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold text-red-700">Last DNS sync failed</p>
+                    <p className="text-xs text-red-600 font-mono break-words mt-0.5">
+                      {latestSync.error_message || 'No error detail reported.'}
+                    </p>
+                    <p className="text-[11px] text-red-400 mt-1">
+                      The zone file on the server may not reflect these records until a sync succeeds. Fix the offending record and save again to retry.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Sync history panel */}
+              {showHistory && (
+                <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                  <div className="px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex items-center gap-2">
+                    <History size={13} className="text-slate-400" />
+                    <span className="text-xs font-bold text-slate-600 uppercase tracking-widest">Sync History</span>
+                    <button onClick={() => setShowHistory(false)} className="ml-auto text-slate-300 hover:text-slate-500">
+                      <ChevronDown size={15} />
+                    </button>
+                  </div>
+                  {syncTasks.length === 0 ? (
+                    <div className="px-5 py-4 text-xs text-slate-400 italic">No sync activity recorded yet.</div>
+                  ) : (
+                    <ul className="divide-y divide-slate-50">
+                      {syncTasks.map((t) => {
+                        const meta = SYNC_META[t.status] ?? SYNC_META.pending!;
+                        return (
+                          <li key={t.id} className="px-5 py-2.5 flex items-center gap-3">
+                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[10px] font-bold ${meta.cls}`}>
+                              {meta.icon}{meta.label}
+                            </span>
+                            <span className="text-[11px] text-slate-400">{timeAgo(t.updated_at)}</span>
+                            {t.status === 'failed' && t.error_message && (
+                              <span className="text-[11px] text-red-500 font-mono truncate" title={t.error_message}>{t.error_message}</span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+              )}
 
               {/* Records */}
               {isLoadingRecords ? (
@@ -430,7 +602,7 @@ const AdminDnsManager: React.FC = () => {
               </h2>
               <button onClick={closeRecordModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">✕</button>
             </div>
-            <form onSubmit={(e) => { e.preventDefault(); saveRecordMutation.mutate(); }} className="p-6 space-y-4">
+            <form onSubmit={(e) => { e.preventDefault(); submitRecord(); }} className="p-6 space-y-4">
               {/* Type */}
               <div className="space-y-2">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Record Type</label>
@@ -452,8 +624,11 @@ const AdminDnsManager: React.FC = () => {
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Name / Host</label>
-                  <input type="text" className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-indigo-500/30 outline-none"
-                    value={rName} onChange={(e) => setRName(e.target.value)} placeholder="@ or www" required />
+                  <input type="text" className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-indigo-500/30 outline-none ${showErrors && recordErrors.name ? 'border-red-300' : 'border-slate-200'}`}
+                    value={rName} onChange={(e) => setRName(e.target.value)} placeholder="@ or www" />
+                  {showErrors && recordErrors.name && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.name}</p>
+                  )}
                 </div>
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">TTL</label>
@@ -470,16 +645,22 @@ const AdminDnsManager: React.FC = () => {
               {/* Content */}
               <div className="space-y-1">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Value / Content</label>
-                <input type="text" className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-indigo-500/30 outline-none"
-                  value={rContent} onChange={(e) => setRContent(e.target.value)} placeholder={TYPE_META[rType].placeholder} required />
+                <input type="text" className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-indigo-500/30 outline-none ${showErrors && recordErrors.content ? 'border-red-300' : 'border-slate-200'}`}
+                  value={rContent} onChange={(e) => setRContent(e.target.value)} placeholder={TYPE_META[rType].placeholder} />
+                {showErrors && recordErrors.content && (
+                  <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.content}</p>
+                )}
               </div>
 
               {/* Priority */}
               {needsPriority && (
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Priority</label>
-                  <input type="number" min="0" className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-indigo-500/30 outline-none"
+                  <input type="number" min="0" className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-indigo-500/30 outline-none ${showErrors && recordErrors.priority ? 'border-red-300' : 'border-slate-200'}`}
                     value={rPriority} onChange={(e) => setRPriority(e.target.value)} placeholder="10" />
+                  {showErrors && recordErrors.priority && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.priority}</p>
+                  )}
                 </div>
               )}
 
@@ -490,6 +671,100 @@ const AdminDnsManager: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modal: Templates / Presets ───────────────────────────────────── */}
+      {isTemplateModalOpen && selectedZone && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-200 max-h-[90vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex items-center justify-between shrink-0">
+              <h2 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                <Layers size={16} className="text-indigo-600" />
+                {activeTemplate ? activeTemplate.name : 'Record Templates'} — {selectedZone.domain_name}
+              </h2>
+              <button onClick={closeTemplateModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">✕</button>
+            </div>
+
+            {!activeTemplate ? (
+              // Template picker
+              <div className="p-6 grid grid-cols-1 sm:grid-cols-2 gap-3 overflow-y-auto">
+                {DNS_TEMPLATES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => openTemplate(t)}
+                    className="text-left p-4 rounded-xl border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 transition-all group"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Layers size={14} className="text-indigo-500" />
+                      <span className="text-sm font-bold text-slate-700 group-hover:text-indigo-700">{t.name}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-1.5 leading-relaxed">{t.description}</p>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              // Template detail: fields + preview
+              <div className="p-6 space-y-5 overflow-y-auto">
+                {activeTemplate.fields.length > 0 && (
+                  <div className="space-y-3">
+                    {activeTemplate.fields.map((f) => (
+                      <div key={f.key} className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">
+                          {f.label}{f.optional && <span className="text-slate-300 normal-case font-normal"> (optional)</span>}
+                        </label>
+                        <input
+                          type="text"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm font-mono focus:ring-2 focus:ring-indigo-500/30 outline-none"
+                          value={templateVals[f.key] ?? ''}
+                          onChange={(e) => setTemplateVals((v) => ({ ...v, [f.key]: e.target.value }))}
+                          placeholder={f.placeholder}
+                        />
+                        {f.hint && <p className="text-[11px] text-slate-400 ml-1">{f.hint}</p>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-1">
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">
+                    Will add {templatePreview.length} record{templatePreview.length !== 1 ? 's' : ''}
+                  </p>
+                  <div className="border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-50">
+                    {templatePreview.map((r, i) => (
+                      <div key={i} className="px-4 py-2 flex items-center gap-3 text-xs">
+                        <span className="font-mono font-bold text-slate-600 w-10 shrink-0">{r.type}</span>
+                        <span className="font-mono text-slate-500 w-28 truncate shrink-0">{r.name}</span>
+                        {(r.type === 'MX' || r.type === 'SRV') && (
+                          <span className="text-amber-600 font-bold w-6 shrink-0">{r.priority}</span>
+                        )}
+                        <span className="font-mono text-slate-600 truncate flex-1">{r.content || <em className="text-slate-300 not-italic">— fill fields above —</em>}</span>
+                        {r.error && <span title={r.error}><AlertCircle size={13} className="text-red-400 shrink-0" /></span>}
+                      </div>
+                    ))}
+                  </div>
+                  {templatePreview.some((r) => r.error) && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />Fill in the fields above to produce valid records.</p>
+                  )}
+                  <p className="text-[11px] text-slate-400 ml-1">These are added to existing records — they don't replace anything. Duplicates may need manual cleanup.</p>
+                </div>
+
+                <div className="flex gap-3 pt-1">
+                  <button type="button" onClick={() => setActiveTemplate(null)} className="flex-1 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 text-sm transition-all">
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    disabled={templateHasErrors || applyTemplateMutation.isPending}
+                    onClick={() => applyTemplateMutation.mutate(templatePreview.map((r) => ({ name: r.name, type: r.type, content: r.content, priority: r.priority, ttl: r.ttl })))}
+                    className="flex-1 py-3 rounded-xl font-bold text-white bg-indigo-600 hover:bg-indigo-700 text-sm transition-all shadow-md disabled:opacity-50"
+                  >
+                    {applyTemplateMutation.isPending ? 'Applying…' : `Apply ${templatePreview.length} Record${templatePreview.length !== 1 ? 's' : ''}`}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

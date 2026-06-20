@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api from '../api/client';
-import { Globe, Plus, Trash2, Edit2, Copy, CheckCheck, ChevronRight, Server } from 'lucide-react';
+import { Globe, Plus, Trash2, Edit2, Copy, CheckCheck, ChevronRight, Server, Layers, AlertCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { DnsZone, DnsRecord } from '../../../shared/types';
+import { validateRecord, hasErrors, type DnsFieldErrors } from '../lib/dnsValidation';
+import { DNS_TEMPLATES, type DnsTemplate, type TemplateRecord } from '../lib/dnsTemplates';
 
 // ── Record type metadata ──────────────────────────────────────────────────────
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA'] as const;
@@ -48,6 +50,12 @@ const ClientDnsManager: React.FC = () => {
   const [content, setContent]   = useState('');
   const [priority, setPriority] = useState('10');
   const [ttl, setTtl]           = useState('3600');
+  const [showErrors, setShowErrors] = useState(false);
+
+  // Template modal
+  const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
+  const [activeTemplate, setActiveTemplate] = useState<DnsTemplate | null>(null);
+  const [templateVals, setTemplateVals] = useState<Record<string, string>>({});
 
   // ── Data ──────────────────────────────────────────────────────────────────
   const { data: zones = [], isLoading: isLoadingZones } = useQuery<DnsZone[]>({
@@ -98,10 +106,22 @@ const ClientDnsManager: React.FC = () => {
     onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to delete record'),
   });
 
+  const applyTemplateMutation = useMutation({
+    mutationFn: async (recs: TemplateRecord[]) =>
+      (await api.post(`/client/dns/zones/${selectedZone?.id}/records/bulk`, { records: recs })).data,
+    onSuccess: (rows: DnsRecord[]) => {
+      toast.success(`Added ${rows.length} record${rows.length !== 1 ? 's' : ''} — syncing zone…`);
+      closeTemplateModal();
+      queryClient.invalidateQueries({ queryKey: ['dnsRecords', selectedZone?.id] });
+    },
+    onError: (err: any) => toast.error(err.response?.data?.message || 'Failed to apply template'),
+  });
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   const closeModal = () => {
     setIsModalOpen(false);
     setEditingRecord(null);
+    setShowErrors(false);
     setName('@'); setType('A'); setContent(''); setPriority('10'); setTtl('3600');
   };
 
@@ -109,6 +129,7 @@ const ClientDnsManager: React.FC = () => {
 
   const openEdit = (record: DnsRecord) => {
     setEditingRecord(record);
+    setShowErrors(false);
     setName(record.name);
     setType((record.type as RecordType) || 'A');
     setContent(record.content);
@@ -116,6 +137,41 @@ const ClientDnsManager: React.FC = () => {
     setTtl(record.ttl?.toString() ?? '3600');
     setIsModalOpen(true);
   };
+
+  const closeTemplateModal = () => {
+    setIsTemplateModalOpen(false);
+    setActiveTemplate(null);
+    setTemplateVals({});
+  };
+
+  const openTemplate = (t: DnsTemplate) => {
+    setActiveTemplate(t);
+    const defaults: Record<string, string> = {};
+    t.fields.forEach((f) => { defaults[f.key] = f.default ?? ''; });
+    setTemplateVals(defaults);
+  };
+
+  const submitRecord = () => {
+    const errs = validateRecord({ name, type, content, priority: (type === 'MX' || type === 'SRV') ? priority : null });
+    if (hasErrors(errs)) { setShowErrors(true); return; }
+    saveRecordMutation.mutate();
+  };
+
+  // Live validation for the record modal.
+  const recordErrors: DnsFieldErrors = validateRecord({
+    name, type, content,
+    priority: (type === 'MX' || type === 'SRV') ? priority : null,
+  });
+
+  // Preview of records the active template would create (each validated).
+  const templatePreview: (TemplateRecord & { error?: string })[] = activeTemplate && selectedZone
+    ? activeTemplate.build(templateVals, { domain: selectedZone.domain_name }).map((r) => {
+        const e = validateRecord({ name: r.name, type: r.type, content: r.content, priority: r.priority });
+        const msg = e.name || e.content || e.priority;
+        return msg ? { ...r, error: msg } : { ...r };
+      })
+    : [];
+  const templateHasErrors = templatePreview.some((r) => r.error) || templatePreview.length === 0;
 
   const confirmDelete = (record: DnsRecord) => {
     if (window.confirm(`Delete ${record.type} record "${record.name}"?`)) {
@@ -203,13 +259,22 @@ const ClientDnsManager: React.FC = () => {
                     <span className="text-[11px] text-slate-400"><strong>{records.length}</strong> record{records.length !== 1 ? 's' : ''}</span>
                   </div>
                 </div>
-                <button
-                  onClick={openAdd}
-                  className="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-xl font-bold transition-all text-sm flex items-center gap-2 shadow-sm shadow-cyan-900/10"
-                >
-                  <Plus size={15} />
-                  Add Record
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setIsTemplateModalOpen(true)}
+                    className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-xl font-bold transition-all text-sm flex items-center gap-2"
+                  >
+                    <Layers size={15} className="text-cyan-500" />
+                    Templates
+                  </button>
+                  <button
+                    onClick={openAdd}
+                    className="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-xl font-bold transition-all text-sm flex items-center gap-2 shadow-sm shadow-cyan-900/10"
+                  >
+                    <Plus size={15} />
+                    Add Record
+                  </button>
+                </div>
               </div>
 
               {/* Records grouped by type */}
@@ -292,7 +357,7 @@ const ClientDnsManager: React.FC = () => {
               <button onClick={closeModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">✕</button>
             </div>
 
-            <form onSubmit={(e) => { e.preventDefault(); saveRecordMutation.mutate(); }} className="p-6 space-y-4">
+            <form onSubmit={(e) => { e.preventDefault(); submitRecord(); }} className="p-6 space-y-4">
               {/* Type selector */}
               <div className="space-y-2">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Record Type</label>
@@ -324,12 +389,14 @@ const ClientDnsManager: React.FC = () => {
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Name / Host</label>
                   <input
                     type="text"
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                    className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all ${showErrors && recordErrors.name ? 'border-red-300' : 'border-slate-200'}`}
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     placeholder="@ or www"
-                    required
                   />
+                  {showErrors && recordErrors.name && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.name}</p>
+                  )}
                 </div>
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">TTL (seconds)</label>
@@ -351,12 +418,14 @@ const ClientDnsManager: React.FC = () => {
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Value / Content</label>
                 <input
                   type="text"
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                  className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all ${showErrors && recordErrors.content ? 'border-red-300' : 'border-slate-200'}`}
                   value={content}
                   onChange={(e) => setContent(e.target.value)}
                   placeholder={TYPE_META[type].placeholder}
-                  required
                 />
+                {showErrors && recordErrors.content && (
+                  <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.content}</p>
+                )}
               </div>
 
               {/* Priority (MX / SRV only) */}
@@ -366,11 +435,14 @@ const ClientDnsManager: React.FC = () => {
                   <input
                     type="number"
                     min="0"
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all"
+                    className={`w-full bg-slate-50 border rounded-xl py-3 px-4 text-sm focus:ring-2 focus:ring-cyan-500/30 outline-none transition-all ${showErrors && recordErrors.priority ? 'border-red-300' : 'border-slate-200'}`}
                     value={priority}
                     onChange={(e) => setPriority(e.target.value)}
                     placeholder="10"
                   />
+                  {showErrors && recordErrors.priority && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />{recordErrors.priority}</p>
+                  )}
                 </div>
               )}
 
@@ -387,6 +459,100 @@ const ClientDnsManager: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modal: Templates / Presets ───────────────────────────────────── */}
+      {isTemplateModalOpen && selectedZone && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl border border-slate-200 overflow-hidden animate-in zoom-in-95 duration-200 max-h-[90vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex items-center justify-between shrink-0">
+              <h2 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                <Layers size={16} className="text-cyan-600" />
+                {activeTemplate ? activeTemplate.name : 'Record Templates'} — {selectedZone.domain_name}
+              </h2>
+              <button onClick={closeTemplateModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">✕</button>
+            </div>
+
+            {!activeTemplate ? (
+              // Template picker
+              <div className="p-6 grid grid-cols-1 sm:grid-cols-2 gap-3 overflow-y-auto">
+                {DNS_TEMPLATES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => openTemplate(t)}
+                    className="text-left p-4 rounded-xl border border-slate-200 hover:border-cyan-300 hover:bg-cyan-50/40 transition-all group"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Layers size={14} className="text-cyan-500" />
+                      <span className="text-sm font-bold text-slate-700 group-hover:text-cyan-700">{t.name}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-1.5 leading-relaxed">{t.description}</p>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              // Template detail: fields + preview
+              <div className="p-6 space-y-5 overflow-y-auto">
+                {activeTemplate.fields.length > 0 && (
+                  <div className="space-y-3">
+                    {activeTemplate.fields.map((f) => (
+                      <div key={f.key} className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">
+                          {f.label}{f.optional && <span className="text-slate-300 normal-case font-normal"> (optional)</span>}
+                        </label>
+                        <input
+                          type="text"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm font-mono focus:ring-2 focus:ring-cyan-500/30 outline-none"
+                          value={templateVals[f.key] ?? ''}
+                          onChange={(e) => setTemplateVals((v) => ({ ...v, [f.key]: e.target.value }))}
+                          placeholder={f.placeholder}
+                        />
+                        {f.hint && <p className="text-[11px] text-slate-400 ml-1">{f.hint}</p>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-1">
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">
+                    Will add {templatePreview.length} record{templatePreview.length !== 1 ? 's' : ''}
+                  </p>
+                  <div className="border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-50">
+                    {templatePreview.map((r, i) => (
+                      <div key={i} className="px-4 py-2 flex items-center gap-3 text-xs">
+                        <span className="font-mono font-bold text-slate-600 w-10 shrink-0">{r.type}</span>
+                        <span className="font-mono text-slate-500 w-28 truncate shrink-0">{r.name}</span>
+                        {(r.type === 'MX' || r.type === 'SRV') && (
+                          <span className="text-amber-600 font-bold w-6 shrink-0">{r.priority}</span>
+                        )}
+                        <span className="font-mono text-slate-600 truncate flex-1">{r.content || <em className="text-slate-300 not-italic">— fill fields above —</em>}</span>
+                        {r.error && <span title={r.error}><AlertCircle size={13} className="text-red-400 shrink-0" /></span>}
+                      </div>
+                    ))}
+                  </div>
+                  {templatePreview.some((r) => r.error) && (
+                    <p className="text-[11px] text-red-500 flex items-center gap-1 ml-1"><AlertCircle size={11} />Fill in the fields above to produce valid records.</p>
+                  )}
+                  <p className="text-[11px] text-slate-400 ml-1">These are added to existing records — they don't replace anything. Duplicates may need manual cleanup.</p>
+                </div>
+
+                <div className="flex gap-3 pt-1">
+                  <button type="button" onClick={() => setActiveTemplate(null)} className="flex-1 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 text-sm transition-all">
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    disabled={templateHasErrors || applyTemplateMutation.isPending}
+                    onClick={() => applyTemplateMutation.mutate(templatePreview.map((r) => ({ name: r.name, type: r.type, content: r.content, priority: r.priority, ttl: r.ttl })))}
+                    className="flex-1 py-3 rounded-xl font-bold text-white bg-cyan-600 hover:bg-cyan-700 text-sm transition-all shadow-md disabled:opacity-50"
+                  >
+                    {applyTemplateMutation.isPending ? 'Applying…' : `Apply ${templatePreview.length} Record${templatePreview.length !== 1 ? 's' : ''}`}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

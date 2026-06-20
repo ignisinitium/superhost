@@ -81,6 +81,31 @@ export interface DnsRecord {
   created_at: string;
 }
 
+// A Let's Encrypt certificate as inventoried by the worker from /etc/letsencrypt.
+export interface SslCertificate {
+  id: number;
+  cert_name: string;
+  domains: string[];
+  issuer: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  serial: string | null;
+  user_id: number | null;
+  last_checked_at: string;
+  created_at: string;
+  username?: string; // joined owner, for admin view
+}
+
+// A single SYNC_DNS_ZONE task as surfaced to the admin DNS editor for status/history.
+export interface DnsSyncTask {
+  id: number;
+  command: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Database {
   id: number;
   user_id: number;

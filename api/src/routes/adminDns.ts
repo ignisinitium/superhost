@@ -55,6 +55,68 @@ router.post('/zones/:id/records', async (req: AuthRequest, res) => {
   }
 });
 
+// Bulk-add records to any zone (admin) — used by the template/preset feature.
+// Inserts all records atomically and queues a single zone sync.
+router.post('/zones/:id/records/bulk', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  const { records } = req.body as {
+    records?: Array<{ name: string; type: string; content: string; priority?: number | null; ttl?: number | null }>;
+  };
+
+  if (!Array.isArray(records) || records.length === 0) {
+    return res.status(400).json({ message: 'records must be a non-empty array' });
+  }
+  if (records.length > 100) {
+    return res.status(400).json({ message: 'Too many records in one batch (max 100)' });
+  }
+  for (const r of records) {
+    if (!r || typeof r.name !== 'string' || typeof r.type !== 'string' || typeof r.content !== 'string') {
+      return res.status(400).json({ message: 'Each record requires name, type and content' });
+    }
+  }
+
+  try {
+    const zoneRes = await query('SELECT id, domain_name FROM dns_zones WHERE id = $1', [id]);
+    if (zoneRes.rowCount === 0) return res.status(404).json({ message: 'Zone not found' });
+    const { domain_name } = zoneRes.rows[0];
+
+    // Build a parameterized multi-row INSERT (6 columns per row).
+    const values: unknown[] = [];
+    const tuples = records.map((r, i) => {
+      const b = i * 6;
+      values.push(id, r.name || '@', r.type.toUpperCase(), r.content, r.priority ?? null, r.ttl ?? null);
+      return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6})`;
+    });
+
+    const result = await query(
+      `INSERT INTO dns_records (zone_id, name, type, content, priority, ttl) VALUES ${tuples.join(', ')} RETURNING *`,
+      values
+    );
+    await query('INSERT INTO tasks (command, payload) VALUES ($1, $2)', ['SYNC_DNS_ZONE', { zoneId: id, domainName: domain_name }]);
+    res.status(201).json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
+// Recent sync history/status for a zone (admin) — surfaces BIND apply success/failure.
+router.get('/zones/:id/sync-status', async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  try {
+    const result = await query(
+      `SELECT id, command, status, error_message, created_at, updated_at
+       FROM tasks
+       WHERE command = 'SYNC_DNS_ZONE' AND payload->>'zoneId' = $1
+       ORDER BY id DESC
+       LIMIT 10`,
+      [String(id)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: (err as Error).message });
+  }
+});
+
 // Update a record in any zone (admin)
 router.put('/zones/:id/records/:recordId', async (req: AuthRequest, res) => {
   const { id, recordId } = req.params;

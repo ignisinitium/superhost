@@ -44,6 +44,7 @@ import ClientFtpManager from './pages/ClientFtpManager';
 import AdminFtpManager from './pages/AdminFtpManager';
 import ClientDnsManager from './pages/ClientDnsManager';
 import AdminDnsManager from './pages/AdminDnsManager';
+import AdminSslManager from './pages/AdminSslManager';
 import AdminNameserversPage from './pages/AdminNameservers';
 import AdminUserWebsitesPage from './pages/AdminUserWebsites';
 import AdminUserDatabasesPage from './pages/AdminUserDatabases';
@@ -294,6 +295,7 @@ const Layout = ({ role }: { role: 'admin' | 'client' }) => {
                     <Route path="cron" element={<AdminCronManager />} />
                     <Route path="ftp" element={<AdminFtpManager />} />
                     <Route path="dns" element={<AdminDnsManager />} />
+                    <Route path="ssl" element={<AdminSslManager />} />
                     <Route path="nameservers" element={<AdminNameserversPage />} />
                     <Route path="terminal" element={<TerminalPage />} />
                     <Route path="settings" element={<SettingsPage />} />

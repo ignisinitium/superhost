@@ -10,7 +10,7 @@ import {
   ShieldCheck, ShieldAlert, Mail,
   Network, Terminal, Cpu, Paintbrush, Settings,
   Zap, GitBranch, CreditCard,
-  Server, LogOut, RadioTower, UserX, ArrowDownToLine, ScrollText, ServerCog,
+  Server, LogOut, RadioTower, UserX, ArrowDownToLine, ScrollText, ServerCog, Lock,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -53,6 +53,7 @@ const adminGroups: MenuGroup[] = [
     items: [
       { label: 'Domains',        icon: Globe,     path: '/domains' },
       { label: 'DNS Zones',      icon: Network,      path: '/dns' },
+      { label: 'SSL Certs',      icon: Lock,         path: '/ssl' },
       { label: 'Nameservers',    icon: RadioTower,   path: '/nameservers' },
       { label: 'Databases',      icon: Database,  path: '/databases' },
       { label: 'FTP Manager',    icon: FolderOpen, path: '/ftp' },
