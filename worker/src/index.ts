@@ -4375,9 +4375,22 @@ async function start() {
   // --- Background Metrics Collection ---
   const collectMetrics = async () => {
     try {
-      // 1. CPU Usage
-      const { stdout: cpuOut } = await execPromise("top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\\([0-9.]*\\)%* id.*/\\1/' | awk '{print 100 - $1}'");
-      const cpu = parseFloat(cpuOut.trim()) || 0;
+      // 1. CPU Usage — computed from /proc/stat deltas over 1s. `top -bn1`'s
+      // single sample is taken over a near-zero interval and is unreliable; it
+      // was reporting ~90% on an idle box (load ~0.07). Reading the cpu line of
+      // /proc/stat twice and diffing the idle vs total jiffies is accurate.
+      const readCpuTimes = async () => {
+        const line = (await fs.readFile('/proc/stat', 'utf8')).split('\n')[0] ?? '';
+        const v = line.trim().split(/\s+/).slice(1).map(Number); // user nice system idle iowait irq softirq steal …
+        return { idle: (v[3] || 0) + (v[4] || 0), total: v.reduce((a, b) => a + (b || 0), 0) };
+      };
+      const c1 = await readCpuTimes();
+      await new Promise((r) => setTimeout(r, 1000));
+      const c2 = await readCpuTimes();
+      const totalDelta = c2.total - c1.total;
+      const cpu = totalDelta > 0
+        ? Math.max(0, Math.min(100, Math.round((1 - (c2.idle - c1.idle) / totalDelta) * 1000) / 10))
+        : 0;
 
       // 2. RAM Usage
       const { stdout: ramOut } = await execPromise("free -m | grep Mem | awk '{print $3}'");
