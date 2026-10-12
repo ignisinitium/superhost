@@ -1614,19 +1614,20 @@ async function handleUpdateResourceUsage(payload: any) {
     }
     const bandwidthUsedMb = Math.round(totalBytes / (1024 * 1024));
 
-    // 4. Update Database
+    // 4. Update Database (users has no updated_at column; setting it made this query always fail)
     await client.query(
-      'UPDATE users SET disk_used_mb = $1, bandwidth_used_mb = $2, updated_at = NOW() WHERE id = $3',
+      'UPDATE users SET disk_used_mb = $1, bandwidth_used_mb = $2 WHERE id = $3',
       [diskUsedMb, bandwidthUsedMb, userId]
     );
 
-    // 5. Enforcement Logic
-    if (diskUsedMb > disk_limit_mb) {
+    // 5. Enforcement Logic. -1 (or no limit set) means unlimited: never "over".
+    const isLimited = (limit: number | null) => limit != null && limit >= 0;
+    if (isLimited(disk_limit_mb) && diskUsedMb > disk_limit_mb) {
       console.warn(`CRITICAL: User ${username} is over disk quota! Used: ${diskUsedMb}MB / Limit: ${disk_limit_mb}MB`);
       // TODO: Implement disk suspension logic here
     }
-    
-    if (bandwidthUsedMb > bandwidth_limit_mb) {
+
+    if (isLimited(bandwidth_limit_mb) && bandwidthUsedMb > bandwidth_limit_mb) {
       console.warn(`CRITICAL: User ${username} is over bandwidth quota! Used: ${bandwidthUsedMb}MB / Limit: ${bandwidth_limit_mb}MB`);
       // TODO: Implement bandwidth suspension or aggressive traffic shaping here
     }
